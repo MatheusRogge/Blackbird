@@ -1,38 +1,41 @@
-use winit::dpi::Size;
-use winit::dpi::LogicalSize;
+use winit::window::Window;
 use winit::window::WindowBuilder;
 use winit::event_loop::EventLoop;
+use winit::event_loop::{ControlFlow};
+use winit::event::{Event,WindowEvent};
 
-const WIDTH: u32 = 800;
-const HEIGHT: u32 = 600;    
-
+#[derive(Debug)]
 pub struct Application {
-    pub event_loop: EventLoop<()>
+    pub event_loop: EventLoop<()>,
+    pub window: Window
 }
 
 impl Application {
     pub fn initialize() -> Self {
-        let event_loop = Self::init_window();
+        let event_loop = EventLoop::new();
+        let window = WindowBuilder::new().build(&event_loop).unwrap();
 
         Self {
-            event_loop: event_loop
+            event_loop,
+            window
         }
     }
 
-    fn init_window() -> EventLoop<()> {
-        let logical_size = LogicalSize {
-            width: f64::from(WIDTH),
-            height: f64::from(HEIGHT)
-        };
+    pub fn main_loop(self) {
+        let event_loop = self.event_loop;
+        let current_window_id = self.window.id();
 
-        let event_loop = EventLoop::new();
-
-        let _window = WindowBuilder::new()
-            .with_title("Vulkan")
-            
-            .with_inner_size(Size::from(logical_size))
-            .build(&event_loop);
-
-        event_loop
+        event_loop.run(move |event, _, control_flow| {
+            *control_flow = ControlFlow::Wait;
+    
+            match event {
+                Event::WindowEvent { event: WindowEvent::CloseRequested, window_id } => {
+                    if window_id == current_window_id {
+                        *control_flow = ControlFlow::Exit
+                    }
+                },
+                _ => (),
+            }
+        });
     }
 }
