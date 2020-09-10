@@ -1,22 +1,36 @@
-use winit::window::Window;
-use winit::window::WindowBuilder;
-use winit::event_loop::EventLoop;
-use winit::event_loop::{ControlFlow};
-use winit::event::{Event,WindowEvent};
+use std::sync::Arc;
+
+use winit::{
+    event::{Event,WindowEvent},
+    event_loop::{ControlFlow,EventLoop},
+    window::{Window,WindowBuilder},
+};
+
+use vulkano::{
+    instance::{ApplicationInfo,Instance,Version}
+};
+
 
 #[derive(Debug)]
 pub struct Application {
-    pub event_loop: EventLoop<()>,
-    pub window: Window
+    event_loop: EventLoop<()>,
+    instance: Arc<Instance>,
+    window: Window,
 }
 
 impl Application {
     pub fn initialize() -> Self {
         let event_loop = EventLoop::new();
-        let window = WindowBuilder::new().build(&event_loop).unwrap();
+        let instance = Self::create_instance();
+
+        let window = WindowBuilder::new()
+            .with_title("My Application")
+            .build(&event_loop)
+            .unwrap();
 
         Self {
             event_loop,
+            instance,
             window
         }
     }
@@ -37,5 +51,18 @@ impl Application {
                 _ => (),
             }
         });
+    }
+
+    fn create_instance() -> Arc<Instance> {
+        let required_extensions = vulkano_win::required_extensions();
+
+        let app_info = ApplicationInfo {
+            application_name: Some("My Application".into()),
+            application_version: Some(Version { major: 1, minor: 0, patch: 0 }),
+            engine_name: Some("Blackbird".into()),
+            engine_version: Some(Version { major: 1, minor: 0, patch: 0 }),
+        };
+
+        Instance::new(Some(&app_info), &required_extensions, None).unwrap()
     }
 }
