@@ -1,12 +1,5 @@
-[package]
-name = "blackbird"
-version = "0.1.0"
-authors = ["matheus"]
-edition = "2018"
+[workspace]
+resolver = "2"
+members = ["application", "rendering"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]
-vulkano-win = "0.19"
-vulkano = "0.19"
-winit = "0.22"

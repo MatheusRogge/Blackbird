@@ -1,0 +1,22 @@
+[package]
+name = "application"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "application"
+
+[dependencies]
+winit = "0.30.5"
+raw-window-handle = "0.6.2"
+tokio = { version = "1.39.3", features = ["macros", "rt-multi-thread"] }
+
+rendering = { path = "../rendering/" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59.0", features = [
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_SystemServices",
+] }
