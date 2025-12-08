@@ -1,8 +1,13 @@
 [package]
 name = "rendering"
-version = "0.1.0"
-edition = "2021"
+version = "1.0.0"
+edition = "2024"
 
 [dependencies]
-wgpu = "22.1.0"
-raw-window-handle = "0.6.2"
+bytemuck = { version = "1.24", features = ["derive"] }
+thiserror = { workspace = true }
+winit = { workspace = true }
+ultraviolet = { version = "0.10.0", features = ["int", "f64"] }
+wgpu = { version = "27.0.1", features = ["wgsl"] }
+
+engine = { path = "../engine/" }

@@ -1,0 +1,10 @@
+[package]
+name = "engine"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+downcast-rs = "2.0.2"
+slotmap = "1.0.7"
+log = { workspace = true }
+thiserror = { workspace = true }
