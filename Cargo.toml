@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["application", "engine", "rendering", "sandbox"]
+members = ["application", "engine", "gltf", "rendering", "sandbox", "window"]
 
 [workspace.dependencies]
 anyhow = { version = "1.0.100" }

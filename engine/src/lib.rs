@@ -1,6 +1,5 @@
 use crate::{asset::AssetManager, input::InputBuffer, world::World};
 
-pub mod application;
 pub mod asset;
 pub mod entity;
 pub mod input;

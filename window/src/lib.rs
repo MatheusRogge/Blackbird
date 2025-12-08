@@ -1,8 +1,5 @@
-use engine::{
-    Engine,
-    application::{Application, ApplicationError},
-    input::InputEvent,
-};
+use application::{Application, ApplicationError};
+use engine::{Engine, input::InputEvent};
 use rendering::{
     pipeline::RenderingPipelineDescriptor,
     renderer::{Renderer, RendererError, SurfaceError},

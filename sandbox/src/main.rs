@@ -1,7 +1,6 @@
-use application::windowed::WindowedApplication;
+use application::{Application, ApplicationError};
 use engine::{
     Engine,
-    application::{Application, ApplicationError},
     input::{InputEvent, KeyCodes},
     plugin::EnginePlugin,
     world::DefaultKey,
@@ -13,9 +12,8 @@ use rendering::{
     shader::{ShaderAsset, ShaderAssetResolver},
 };
 
-use crate::gltf::{GLTFAsset, GLTFAssetResolver, GLTFEnginePlugin};
-
-mod gltf;
+use gltf::{GLTFAsset, GLTFAssetResolver, GLTFEnginePlugin};
+use window::WindowedApplication;
 
 struct MyApplication {
     default_camera_id: DefaultKey,

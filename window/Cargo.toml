@@ -1,0 +1,13 @@
+[package]
+name = "window"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+pollster = "0.4.0"
+winit = { workspace = true }
+thiserror = { workspace = true }
+
+application = { path = "../application/" }
+engine = { path = "../engine/" }
+rendering = { path = "../rendering/" }

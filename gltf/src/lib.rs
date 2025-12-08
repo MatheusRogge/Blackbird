@@ -1,6 +1,5 @@
 use engine::{
     Engine,
-    application::ApplicationError,
     asset::{Asset, AssetError, AssetResolver},
     plugin::{EnginePlugin, EnginePluginError},
     world::World,
@@ -37,10 +36,10 @@ pub enum GLTFError {
     LoadSceneError,
 }
 
-impl From<GLTFError> for ApplicationError {
+impl From<GLTFError> for EnginePluginError {
     fn from(val: GLTFError) -> Self {
         match val {
-            GLTFError::LoadSceneError => ApplicationError {
+            GLTFError::LoadSceneError => EnginePluginError {
                 message: val.to_string(),
                 source: Box::new(val),
             },
@@ -155,3 +154,4 @@ impl GLTFEnginePlugin {
         Ok(())
     }
 }
+
