@@ -2,26 +2,34 @@ use std::{
     borrow::Cow,
     fs::File,
     io::{self, BufReader, Read},
+    path::Path,
 };
 
 use engine::asset::{Asset, AssetError, AssetResolver};
-use wgpu::{Device, ShaderModule, ShaderModuleDescriptor};
+use wgpu::{Device, ShaderModule, ShaderModuleDescriptor, ShaderSource};
 
 pub use wgpu::{BindGroupLayoutEntry, BindingType, BufferBindingType, ShaderStages};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ShaderAsset {
-    pub(crate) content: String,
-    pub(crate) bindings: Vec<BindGroupLayoutEntry>,
+    pub content: String,
+    pub bindings: Vec<BindGroupLayoutEntry>,
 }
 
 impl Asset for ShaderAsset {}
 
 impl ShaderAsset {
-    pub(crate) fn compile(&self, device: &Device) -> Result<ShaderModule, io::Error> {
+    pub fn from_raw(content: impl Into<String>) -> Self {
+        Self {
+            bindings: Vec::new(),
+            content: content.into(),
+        }
+    }
+
+    pub fn compile(&self, device: &Device) -> Result<ShaderModule, io::Error> {
         let shader_module = device.create_shader_module(ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(&self.content)),
+            source: ShaderSource::Wgsl(Cow::Borrowed(&self.content)),
         });
 
         Ok(shader_module)
@@ -38,7 +46,7 @@ impl AssetResolver for ShaderAssetResolver {
     type Asset = ShaderAsset;
     type Error = AssetError;
 
-    fn resolve(&self, file: File) -> Result<Self::Asset, Self::Error> {
+    fn resolve(&self, _base_path: &Path, file: File) -> Result<Self::Asset, Self::Error> {
         let mut reader = BufReader::new(file);
 
         let mut content = String::new();

@@ -1,10 +1,18 @@
 [workspace]
 resolver = "2"
-members = ["application", "engine", "gltf", "rendering", "sandbox", "window"]
+members = [
+  "application",
+  "engine",
+  "gltf",
+  "rendering",
+  "sandbox",
+  "window",
+]
 
 [workspace.dependencies]
-anyhow = { version = "1.0.100" }
+anyhow = { version = "1.0.102" }
 log = { version = "0.4.29" }
-thiserror = { version = "2" }
-tracing = { version = "0.1.43" }
-winit = { version = "0.30.12" }
+thiserror = { version = "2.0.18" }
+tracing = { version = "0.1.44" }
+winit = { version = "0.30.13" }
+slotmap = { version = "1.1.1" }

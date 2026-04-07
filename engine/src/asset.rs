@@ -1,16 +1,18 @@
 use std::{
     any::Any,
     collections::HashMap,
+    env,
     ffi::OsStr,
     fs::File,
     io::{self},
-    path::Path,
+    ops::Deref,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
 use downcast_rs::{Downcast, impl_downcast};
-use log::debug;
 use thiserror::Error;
+use tracing::info;
 
 #[derive(Error, Debug)]
 pub enum AssetError {
@@ -53,23 +55,35 @@ impl ErasedLoadedAsset {
     }
 }
 
-pub trait ErasedAssetResolver {
-    fn resolve(&self, file: File) -> Result<ErasedLoadedAsset, AssetError>;
+pub struct AssetHandle {
+    inner: Arc<ErasedLoadedAsset>,
 }
 
-pub trait AssetResolver: 'static {
+impl Deref for AssetHandle {
+    type Target = ErasedLoadedAsset;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref()
+    }
+}
+
+pub trait ErasedAssetResolver {
+    fn resolve(&self, base_path: &Path, file: File) -> Result<ErasedLoadedAsset, AssetError>;
+}
+
+pub trait AssetResolver {
     type Asset: Asset;
     type Error: Into<AssetError>;
 
-    fn resolve(&self, file: File) -> Result<Self::Asset, Self::Error>;
+    fn resolve(&self, base_path: &Path, file: File) -> Result<Self::Asset, Self::Error>;
 }
 
 impl<R> ErasedAssetResolver for R
 where
     R: AssetResolver,
 {
-    fn resolve(&self, file: File) -> Result<ErasedLoadedAsset, AssetError> {
-        <R as AssetResolver>::resolve(self, file)
+    fn resolve(&self, base_path: &Path, file: File) -> Result<ErasedLoadedAsset, AssetError> {
+        <R as AssetResolver>::resolve(self, base_path, file)
             .map(|e| ErasedLoadedAsset { inner: Box::new(e) })
             .map_err(Into::into)
     }
@@ -77,11 +91,70 @@ where
 
 #[derive(Default)]
 pub struct AssetManager {
-    _handles: HashMap<String, Arc<ErasedLoadedAsset>>,
     resolvers: HashMap<String, Box<dyn ErasedAssetResolver>>,
 }
 
 impl AssetManager {
+    fn resolve_path(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+
+        env::current_exe().unwrap().join(path.as_os_str())
+    }
+
+    fn load_resolved<A>(&mut self, resolved: &Path) -> Result<Arc<A>, AssetError>
+    where
+        A: Asset,
+    {
+        info!("Loading asset at path: {:?}", resolved);
+
+        let extension = resolved
+            .extension()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Failed to file extension"))
+            .map(String::from)?;
+
+        info!("Detected extension: {:?}", extension);
+
+        let Some(resolver) = self.resolvers.get(&extension) else {
+            return Err(AssetError::IO(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("No loader found for extension: {}", extension),
+            )));
+        };
+
+        let file = File::open(resolved)?;
+        let base_path = resolved.parent().expect("File must have parent");
+
+        let asset = resolver.resolve(base_path, file)?;
+        let Ok(loaded_asset) = asset.downcast::<A>() else {
+            return Err(AssetError::Other("Failed to cast".to_string()));
+        };
+
+        Ok(Arc::new(loaded_asset.inner))
+    }
+
+    pub fn load_asset<A>(&mut self, path: impl AsRef<Path>) -> Result<Arc<A>, AssetError>
+    where
+        A: Asset,
+    {
+        let resolved = self.resolve_path(path.as_ref());
+        self.load_resolved::<A>(&resolved)
+    }
+
+    pub fn load_asset_from<A>(
+        &mut self,
+        path: impl AsRef<Path>,
+        base_path: impl AsRef<Path>,
+    ) -> Result<Arc<A>, AssetError>
+    where
+        A: Asset,
+    {
+        let resolved = base_path.as_ref().join(path.as_ref());
+        self.load_resolved::<A>(&resolved)
+    }
+
     pub fn add_resolver<R>(&mut self, extension: impl Into<String>, resolver: R)
     where
         R: AssetResolver + 'static,
@@ -90,37 +163,5 @@ impl AssetManager {
         let v = Box::new(resolver);
 
         self.resolvers.insert(k, v);
-    }
-
-    pub fn load_asset<A>(&mut self, path: impl AsRef<Path>) -> Result<Arc<A>, AssetError>
-    where
-        A: Asset,
-    {
-        debug!("Loading asset at path: {:?}", path.as_ref());
-
-        let extension = path
-            .as_ref()
-            .extension()
-            .and_then(OsStr::to_str)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Failed to file extension"))
-            .map(String::from)?;
-
-        debug!("Detected extension: {:?}", extension);
-
-        match self.resolvers.get(&extension) {
-            None => Err(AssetError::IO(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("No loader found for extension: {}", extension),
-            ))),
-            Some(resolver) => {
-                let file = File::open(path.as_ref())?;
-                let asset = resolver.resolve(file)?;
-
-                match asset.downcast::<A>() {
-                    Ok(value) => Ok(Arc::new(value.inner)),
-                    Err(_) => Err(AssetError::Other("Failed to cast".to_string())),
-                }
-            }
-        }
     }
 }

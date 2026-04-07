@@ -1,10 +1,8 @@
+use std::sync::Arc;
+
 use application::{Application, ApplicationError};
 use engine::{Engine, input::InputEvent};
-use rendering::{
-    pipeline::RenderingPipelineDescriptor,
-    renderer::{Renderer, RendererError, SurfaceError},
-};
-use std::sync::Arc;
+use rendering::renderer::{RenderGraphBuilder, Renderer};
 use thiserror::Error;
 use winit::{
     application::ApplicationHandler,
@@ -28,36 +26,36 @@ impl From<ApplicationEventLoopError> for ApplicationError {
     }
 }
 
-pub struct WindowedApplication<'a, A> {
-    engine: Engine,
-    pipeline_descriptor: RenderingPipelineDescriptor<'a>,
-
-    window: Option<Arc<Window>>,
-    renderer: Option<Renderer<'a>>,
-
-    inner: A,
+pub enum WindowApplicationState<B> {
+    Uninitialized(Option<B>),
+    Initialized {
+        window: Arc<Window>,
+        renderer: Box<Renderer>,
+    },
 }
 
-impl<'a, A> WindowedApplication<'a, A>
+pub struct WindowedApplication<A: Application, B: RenderGraphBuilder> {
+    pub inner: A,
+    engine: Engine,
+    state: WindowApplicationState<B>,
+}
+
+impl<A, B> WindowedApplication<A, B>
 where
     A: Application,
+    B: RenderGraphBuilder,
 {
-    pub fn create(
-        mut engine: Engine,
-        pipeline_descriptor: RenderingPipelineDescriptor<'a>,
-    ) -> Result<Self, ApplicationError> {
+    pub fn create(mut engine: Engine, builder: B) -> Result<Self, ApplicationError> {
         let inner = A::setup(&mut engine)?;
 
         Ok(Self {
-            engine,
-            pipeline_descriptor,
-            renderer: None,
-            window: None,
             inner,
+            engine,
+            state: WindowApplicationState::Uninitialized(Some(builder)),
         })
     }
 
-    pub async fn execute(&mut self) -> Result<(), ApplicationError> {
+    pub async fn run(&mut self) -> Result<(), ApplicationError> {
         let event_loop = EventLoop::builder()
             .build()
             .map_err(ApplicationEventLoopError)?;
@@ -72,25 +70,32 @@ where
     }
 }
 
-impl<'a, A> ApplicationHandler for WindowedApplication<'a, A>
+impl<A, B> ApplicationHandler for WindowedApplication<A, B>
 where
     A: Application,
+    B: RenderGraphBuilder,
 {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let WindowApplicationState::Uninitialized(ref mut graph_builder) = self.state else {
+            return;
+        };
+
+        let Some(builder) = graph_builder.take() else {
+            return;
+        };
+
         let window = Arc::new(
             event_loop
                 .create_window(WindowAttributes::default())
                 .unwrap(),
         );
 
-        let renderer_fut = Renderer::new(
-            window.clone(),
-            window.inner_size().into(),
-            &self.pipeline_descriptor,
-        );
+        let renderer = pollster::block_on(Renderer::new(window.clone(), builder)).unwrap();
 
-        self.window = Some(window);
-        self.renderer = Some(pollster::block_on(renderer_fut).unwrap());
+        self.state = WindowApplicationState::Initialized {
+            window,
+            renderer: Box::new(renderer),
+        };
     }
 
     fn window_event(
@@ -99,14 +104,12 @@ where
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        let renderer = match self.renderer {
-            Some(ref mut renderer) => renderer,
-            None => return,
-        };
-
-        let window = match self.window {
-            Some(ref window) => window,
-            None => return,
+        let WindowApplicationState::Initialized {
+            ref window,
+            ref mut renderer,
+        } = self.state
+        else {
+            return;
         };
 
         match event {
@@ -119,8 +122,8 @@ where
 
                 let event = {
                     match event.state {
-                        ElementState::Released => InputEvent::KeyReleased { key_code },
                         ElementState::Pressed => InputEvent::KeyPressed { key_code },
+                        ElementState::Released => InputEvent::KeyReleased { key_code },
                     }
                 };
 
@@ -129,23 +132,9 @@ where
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => renderer.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
-                // Process game logic
                 pollster::block_on(self.inner.run(&mut self.engine)).unwrap();
-
-                // Request next frame
                 window.request_redraw();
-
-                if let Err(error) = renderer.render(self.engine.world()) {
-                    if let RendererError::SurfaceError(
-                        SurfaceError::Lost | SurfaceError::Outdated,
-                    ) = error
-                    {
-                        let size = window.inner_size();
-                        renderer.resize(size.width, size.height);
-                    }
-
-                    println!("Failed to render: {}", error);
-                }
+                renderer.render(self.engine.world());
             }
             _ => (),
         }

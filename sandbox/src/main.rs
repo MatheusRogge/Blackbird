@@ -1,22 +1,22 @@
+use std::sync::Arc;
+
 use application::{Application, ApplicationError};
 use engine::{
     Engine,
     input::{InputEvent, KeyCodes},
     plugin::EnginePlugin,
-    world::DefaultKey,
 };
+use gltf::{GLTFAsset, GLTFEnginePlugin};
 use log::LevelFilter;
 use rendering::{
     camera::Camera,
-    pipeline::{RenderingPipelineDescriptor, StageShaderDescriptor},
+    mesh::Vec3,
+    pbr::RenderGraphPBRBuilder,
     shader::{ShaderAsset, ShaderAssetResolver},
 };
-
-use gltf::{GLTFAsset, GLTFAssetResolver, GLTFEnginePlugin};
 use window::WindowedApplication;
 
 struct MyApplication {
-    default_camera_id: DefaultKey,
     camera_speed: f32,
 }
 
@@ -27,7 +27,7 @@ impl Application for MyApplication {
         let gltf_path: &str = {
             if cfg!(target_os = "windows") {
                 "F:\\Desktop\\projects\\glTF-Sample-Assets\\Models\\Box\\glTF-Binary\\Box.glb"
-                // "F:\\Desktop\\projects\\glTF-Sample-Assets\\Models\\Duck\\glTF-Binary\\Duck.glb"
+                // "F:\\Desktop\\projects\\glTF-Sample-Assets\\Models\\Sponza\\gltf\\Sponza.gltf"
             } else {
                 "/mnt/f/Desktop/projects/glTF-Sample-Assets/Models/Box/glTF-Binary/Box.glb"
             }
@@ -36,41 +36,47 @@ impl Application for MyApplication {
         let scene_file = engine.asset_manager().load_asset::<GLTFAsset>(gltf_path)?;
         gltf_plugin.load_scene(&scene_file, engine.world()).unwrap();
 
-        let default_camera_id = engine.world().add_entity(Camera {
-            eye: (1.0, 0.0, 0.0).into(),
-            target: (0.0, 0.0, 0.0).into(),
-            up: (0.0, 1.0, 0.0).into(),
-            aspect: (4 / 3) as f32,
-            field_of_view: 45.0,
-            znear: 0.1,
-            zfar: 100.0,
-        });
+        // Add a default camera if the scene didn't include one
+        if engine.world().get_entities::<Camera>().is_empty() {
+            engine.world().add_entity(Camera {
+                up: (0.0, 1.0, 0.0).into(),
+                eye: (0.0, 40.0, 150.0).into(),
+                target: (0.0, 40.0, 0.0).into(),
+                // target: (-60.52, 651.50, -38.69).into(),
+                aspect: 800.0 / 600.0,
+                fovy: 45.0_f32.to_radians(),
+                near: 0.1,
+                far: 1000.0,
+            });
+        }
 
-        Ok(Self {
-            default_camera_id,
-            camera_speed: 0.2,
-        })
+        Ok(Self { camera_speed: 1.5 })
     }
 
-    // Run game logic
     async fn run(&mut self, engine: &mut Engine) -> Result<(), ApplicationError> {
         let input = engine.input().pop();
 
-        let camera = engine
-            .world()
-            .get_entity_mut::<Camera>(self.default_camera_id)
-            .unwrap();
+        let mut cameras = engine.world().get_entities_mut::<Camera>();
+        let Some(camera) = cameras.first_mut() else {
+            return Ok(());
+        };
 
-        let forward = camera.target - camera.eye;
-        let forward_norm = forward.normalized();
+        let up = -camera.eye.normalized().dot(Vec3::unit_y());
+        let left = camera.eye.normalized().dot(Vec3::unit_x());
 
         if let Some(InputEvent::KeyPressed { key_code }) = input {
             match key_code {
                 KeyCodes::W => {
-                    camera.eye += forward_norm * self.camera_speed;
+                    camera.eye.y += up * self.camera_speed;
                 }
                 KeyCodes::S => {
-                    camera.eye -= forward_norm * self.camera_speed;
+                    camera.eye.y -= up * self.camera_speed;
+                }
+                KeyCodes::A => {
+                    camera.eye.x += left * self.camera_speed;
+                }
+                KeyCodes::D => {
+                    camera.eye.x += left * self.camera_speed;
                 }
                 _ => {}
             }
@@ -83,44 +89,30 @@ impl Application for MyApplication {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::builder()
-        .filter_level(LevelFilter::Warn)
+        .filter_level(LevelFilter::Info)
         .format_source_path(true)
         .format_level(true)
         .format_timestamp_millis()
+        .parse_default_env()
         .init();
 
     let mut engine = Engine::default();
 
     let asset_manager = engine.asset_manager();
-    asset_manager.add_resolver("glb", GLTFAssetResolver);
     asset_manager.add_resolver("wgsl", ShaderAssetResolver);
 
-    let shader_path: &str = {
-        if cfg!(target_os = "windows") {
-            "F:\\Desktop\\projects\\blackbird\\triangle.wgsl"
-        } else {
-            "/home/matheus/workspace/blackbird/sandbox/shaders/triangle.wgsl"
-        }
-    };
+    let gbuffer_shader = Arc::new(ShaderAsset::from_raw(include_str!(
+        "../shaders/gbuffer.wgsl"
+    )));
 
-    let example_shader = engine
-        .asset_manager()
-        .load_asset::<ShaderAsset>(shader_path)?;
+    let present_shader = Arc::new(ShaderAsset::from_raw(include_str!(
+        "../shaders/present.wgsl"
+    )));
 
-    let mut application = WindowedApplication::<MyApplication>::create(
-        engine,
-        RenderingPipelineDescriptor {
-            vertex: StageShaderDescriptor {
-                entrypoint: "vs_main",
-                asset: &example_shader,
-            },
-            fragment: StageShaderDescriptor {
-                entrypoint: "fs_main",
-                asset: &example_shader,
-            },
-        },
-    )?;
+    let builder = RenderGraphPBRBuilder::new(gbuffer_shader, present_shader);
 
-    application.execute().await?;
+    let mut application = WindowedApplication::<MyApplication, _>::create(engine, builder).unwrap();
+    application.run().await.unwrap();
+
     Ok(())
 }

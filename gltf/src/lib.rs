@@ -4,14 +4,15 @@ use engine::{
     plugin::{EnginePlugin, EnginePluginError},
     world::World,
 };
-use gltf::{import_slice, mesh::util::ReadIndices};
+use gltf::{Gltf, import_buffers, import_images, mesh::util::ReadIndices};
 use rendering::{
     camera::Camera,
     mesh::{Mesh, Vertex},
 };
 use std::{
     fs::File,
-    io::{self, Read},
+    io::{self},
+    path::Path,
 };
 use thiserror::Error;
 
@@ -50,7 +51,7 @@ impl From<GLTFError> for EnginePluginError {
 pub struct GLTFAsset {
     pub(crate) document: gltf::Document,
     pub(crate) buffers: Vec<gltf::buffer::Data>,
-    // pub(crate) images: Vec<gltf::image::Data>,
+    pub(crate) images: Vec<gltf::image::Data>,
 }
 
 impl Asset for GLTFAsset {}
@@ -61,17 +62,27 @@ impl AssetResolver for GLTFAssetResolver {
     type Asset = GLTFAsset;
     type Error = GLTFAssetError;
 
-    fn resolve(&self, file: File) -> Result<Self::Asset, Self::Error> {
-        let mut bytes = Vec::new();
-        let mut reader = io::BufReader::new(file);
-        let _ = reader.read_to_end(&mut bytes)?;
+    fn resolve(&self, base_path: &Path, file: File) -> Result<Self::Asset, Self::Error> {
+        println!(
+            "[GLTFAssetResolver] Reading: base_path={:?}, file={:?}",
+            base_path, &file
+        );
 
-        let (document, buffers, _images) = import_slice(bytes.as_slice())?;
+        let base = Some(base_path);
+        let reader = io::BufReader::new(file);
+        let Gltf { document, blob } = Gltf::from_reader(reader)?;
+        println!("GLTF document loaded!");
+
+        let buffer_data = import_buffers(&document, base, blob)?;
+        println!("Buffers read: {:?}", buffer_data.len());
+
+        let image_data = import_images(&document, base, &buffer_data)?;
+        println!("Read images: {:?}", image_data.len());
 
         Ok(GLTFAsset {
             document,
-            buffers,
-            // images,
+            images: image_data,
+            buffers: buffer_data,
         })
     }
 }
@@ -86,6 +97,10 @@ impl EnginePlugin for GLTFEnginePlugin {
         engine
             .asset_manager()
             .add_resolver("gltf", GLTFAssetResolver);
+
+        engine
+            .asset_manager()
+            .add_resolver("glb", GLTFAssetResolver);
 
         Ok(Self)
     }
@@ -104,7 +119,7 @@ impl GLTFEnginePlugin {
 
                 if let Some(reader) = reader.read_indices() {
                     let values = match reader {
-                        ReadIndices::U32(_) => Vec::default(),
+                        ReadIndices::U32(iter) => iter.map(|e| e as u16).collect(),
                         ReadIndices::U8(iter) => iter.map(|e| e as u16).collect(),
                         ReadIndices::U16(iter) => iter.collect(),
                     };
@@ -116,18 +131,27 @@ impl GLTFEnginePlugin {
                     for position in positions {
                         vertices.push(Vertex {
                             position,
-                            color: [0.0, 0.0, 0.0],
+                            color: [1.0, 1.0, 1.0],
+                            normal: [0.0, 0.0, 0.0],
                         });
+                    }
+                }
+
+                if let Some(normals) = reader.read_normals() {
+                    for (i, normal) in normals.enumerate() {
+                        vertices[i].normal = normal;
+                    }
+                }
+
+                if let Some(colors) = reader.read_colors(1) {
+                    for (i, color) in colors.into_rgb_f32().enumerate() {
+                        vertices[i].color = color;
                     }
                 }
             }
 
             if !vertices.is_empty() {
-                let mut mesh = Mesh::new(vertices);
-                if !indices.is_empty() {
-                    mesh.push_indices(indices);
-                }
-
+                let mesh = Mesh::new(vertices, indices);
                 world.add_entity(mesh);
             }
         }
@@ -139,13 +163,14 @@ impl GLTFEnginePlugin {
                 }
                 gltf::camera::Projection::Perspective(perspective) => {
                     world.add_entity(Camera {
-                        eye: (0.0, 0.0, 0.0).into(),
-                        target: (0.0, 0.0, 0.0).into(),
-                        up: (0.0, 1.0, 0.0).into(),
+                        fovy: perspective.yfov(),
+                        near: perspective.znear(),
+                        far: perspective.zfar().unwrap_or(1000.0),
                         aspect: perspective.aspect_ratio().unwrap_or((4 / 3) as f32),
-                        field_of_view: perspective.yfov(),
-                        znear: perspective.znear(),
-                        zfar: perspective.zfar().unwrap_or(1000.0),
+
+                        up: (0.0, 1.0, 0.0).into(),
+                        eye: (0.0, 40.0, 150.0).into(),
+                        target: (0.0, 40.0, 0.0).into(),
                     });
                 }
             }
@@ -154,4 +179,3 @@ impl GLTFEnginePlugin {
         Ok(())
     }
 }
-

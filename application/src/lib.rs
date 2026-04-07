@@ -6,7 +6,7 @@ use engine::{Engine, asset::AssetError, plugin::EnginePluginError};
 pub struct ApplicationError {
     pub message: String,
     #[source]
-    pub source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    pub source: Box<dyn std::error::Error>,
 }
 
 impl From<EnginePluginError> for ApplicationError {

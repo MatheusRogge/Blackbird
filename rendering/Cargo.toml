@@ -4,10 +4,10 @@ version = "1.0.0"
 edition = "2024"
 
 [dependencies]
-bytemuck = { version = "1.24", features = ["derive"] }
 thiserror = { workspace = true }
-winit = { workspace = true }
+
+bytemuck = { version = "1.25.0", features = ["derive"] }
+wgpu = { version = "29.0.1", features = ["wgsl"] }
 ultraviolet = { version = "0.10.0", features = ["int", "f64"] }
-wgpu = { version = "27.0.1", features = ["wgsl"] }
 
 engine = { path = "../engine/" }

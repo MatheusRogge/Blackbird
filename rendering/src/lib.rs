@@ -1,5 +1,11 @@
+pub mod cache;
+pub mod graph;
+pub mod pass;
+pub mod pbr;
+pub mod renderer;
+pub mod resource;
+pub mod shader;
 pub mod camera;
 pub mod mesh;
-pub mod pipeline;
-pub mod renderer;
-pub mod shader;
+
+pub use renderer::RenderGraphBuilder;

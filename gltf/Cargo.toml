@@ -5,7 +5,14 @@ edition = "2024"
 
 [dependencies]
 thiserror = { workspace = true }
-gltf = { version = "1.4.1", features = ["extras", "names", "import", "utils"] }
+tracing = { workspace = true }
+gltf = { version = "1.4.1", features = [
+  "extras",
+  "names",
+  "import",
+  "utils",
+  "guess_mime_type",
+] }
 
 engine = { path = "../engine/" }
 rendering = { path = "../rendering/" }
