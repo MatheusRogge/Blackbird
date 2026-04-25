@@ -11,23 +11,13 @@ pub enum KeyCodes {
 
 impl From<u32> for KeyCodes {
     fn from(value: u32) -> Self {
-        if value == 17 {
-            return Self::W;
+        match value {
+            17 => Self::W,
+            30 => Self::A,
+            31 => Self::S,
+            32 => Self::D,
+            _ => Self::Unknown,
         }
-
-        if value == 30 {
-            return Self::A;
-        }
-
-        if value == 31 {
-            return Self::S;
-        }
-
-        if value == 32 {
-            return Self::D;
-        }
-
-        Self::Unknown
     }
 }
 

@@ -1,4 +1,4 @@
-use engine::world::World;
+use engine_core::world::World;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,

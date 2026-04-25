@@ -6,7 +6,7 @@ use crate::{
     graph::NodeId,
     resource::{BindingResource, ResourceId},
 };
-use engine::world::World;
+use engine_core::world::World;
 use std::collections::HashMap;
 
 pub struct PassContext<'a> {

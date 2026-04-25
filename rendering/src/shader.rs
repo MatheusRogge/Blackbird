@@ -5,7 +5,7 @@ use std::{
     path::Path,
 };
 
-use engine::asset::{Asset, AssetError, AssetResolver};
+use assets::{Asset, AssetError, AssetResolver};
 use wgpu::{Device, ShaderModule, ShaderModuleDescriptor, ShaderSource};
 
 pub use wgpu::{BindGroupLayoutEntry, BindingType, BufferBindingType, ShaderStages};

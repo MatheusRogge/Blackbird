@@ -4,7 +4,7 @@ use crate::{
     pass::{PassContext, RenderPass, RenderPassDesc},
     resource::{BindingResource, ResourceDescriptor, ResourceId},
 };
-use engine::world::World;
+use engine_core::world::World;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

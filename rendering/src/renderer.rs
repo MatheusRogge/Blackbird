@@ -1,8 +1,8 @@
-use engine::world::World;
+use engine_core::world::World;
 use thiserror::Error;
 use wgpu::{
     Backends, CreateSurfaceError, Device, DeviceDescriptor, Features, Instance, InstanceDescriptor,
-    InstanceFlags, Limits, MemoryBudgetThresholds, MemoryHints, PowerPreference, Queue,
+    InstanceFlags, MemoryBudgetThresholds, MemoryHints, PowerPreference, Queue,
     RequestAdapterError, RequestAdapterOptions, RequestDeviceError, Surface, SurfaceConfiguration,
     SurfaceTarget,
 };
@@ -43,6 +43,7 @@ pub struct Renderer {
     queue: Queue,
 
     surface_config: SurfaceConfiguration,
+    max_texture_dimension: u32,
 
     graph: RenderGraph,
 
@@ -81,14 +82,23 @@ impl Renderer {
                 trace: wgpu::Trace::Off,
                 memory_hints: MemoryHints::MemoryUsage,
                 required_features: Features::empty(),
-                required_limits: Limits::downlevel_webgl2_defaults(),
+                required_limits: adapter.limits(),
                 ..Default::default()
             })
             .await?;
 
-        let surface_config = surface
+        let max_texture_dimension = device.limits().max_texture_dimension_2d;
+
+        let mut surface_config = surface
             .get_default_config(&adapter, 800, 600)
             .ok_or(RendererError::SurfaceNotSupportedError)?;
+
+        // Prefer an sRGB surface so the hardware gamma-encodes our linear output.
+        // Without this, sRGB-decoded texture values render ~4× too dark on Vulkan.
+        let caps = surface.get_capabilities(&adapter);
+        if let Some(&srgb_fmt) = caps.formats.iter().find(|f| f.is_srgb()) {
+            surface_config.format = srgb_fmt;
+        }
 
         let (graph, surface_id) = builder.build(&device, &surface_config);
 
@@ -99,6 +109,7 @@ impl Renderer {
             queue,
             surface,
             surface_config,
+            max_texture_dimension,
             surface_id,
             is_surface_configured: true,
             needs_reconfigure: false,
@@ -111,8 +122,9 @@ impl Renderer {
             return;
         }
 
-        self.surface_config.width = width;
-        self.surface_config.height = height;
+        let max = self.max_texture_dimension;
+        self.surface_config.width = width.min(max);
+        self.surface_config.height = height.min(max);
 
         self.needs_reconfigure = true;
         self.is_surface_configured = true;

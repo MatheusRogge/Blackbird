@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 pollster = "0.4.0"
+
 winit = { workspace = true }
 thiserror = { workspace = true }
 

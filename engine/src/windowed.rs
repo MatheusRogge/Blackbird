@@ -1,13 +1,10 @@
-use std::marker::PhantomData;
 use std::mem;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Instant;
 
-use application::{Application, ApplicationError};
-use engine::{Engine, input::{InputEvent, MouseButton}};
+use engine_core::input::{InputEvent, MouseButton};
 use rendering::renderer::{RenderGraphBuilder, Renderer};
-use thiserror::Error;
 use winit::{
     application::ApplicationHandler,
     error::EventLoopError,
@@ -17,18 +14,8 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
-#[derive(Debug, Error)]
-#[error(transparent)]
-pub struct ApplicationEventLoopError(#[from] EventLoopError);
-
-impl From<ApplicationEventLoopError> for ApplicationError {
-    fn from(value: ApplicationEventLoopError) -> Self {
-        Self {
-            message: value.0.to_string(),
-            source: Box::new(value),
-        }
-    }
-}
+use crate::application::{ApplicationError, HeadlessApplication};
+use crate::plugin::Plugin;
 
 enum GameMsg {
     Tick { inputs: Vec<InputEvent> },
@@ -39,57 +26,72 @@ enum ResizeMsg {
     Resized(u32, u32),
 }
 
-pub struct WindowedApplication<A: Application, B: RenderGraphBuilder> {
+pub struct WindowedApplication<B: RenderGraphBuilder> {
+    inner: HeadlessApplication,
     graph_builder: Option<B>,
-    engine: Option<Engine>,
+
     pending_inputs: Vec<InputEvent>,
     game_tx: Option<mpsc::SyncSender<GameMsg>>,
     resize_tx: Option<mpsc::SyncSender<ResizeMsg>>,
     window: Option<Arc<Window>>,
     game_thread: Option<thread::JoinHandle<()>>,
     render_thread: Option<thread::JoinHandle<()>>,
-    _phantom: PhantomData<A>,
 }
 
-impl<A, B> WindowedApplication<A, B>
-where
-    A: Application,
-    B: RenderGraphBuilder,
-{
-    pub fn create(engine: Engine, builder: B) -> Result<Self, ApplicationError> {
-        Ok(Self {
-            graph_builder: Some(builder),
-            engine: Some(engine),
+impl<B: RenderGraphBuilder> WindowedApplication<B> {
+    /// Creates a windowed application pre-loaded with AssetsPlugin, GltfPlugin.
+    pub fn new(render_graph: B) -> Self {
+        use crate::plugins::assets::AssetsPlugin;
+        #[cfg(feature = "gltf")]
+        use crate::plugins::gltf::GltfPlugin;
+
+        let mut inner = HeadlessApplication::new().add_plugin(AssetsPlugin);
+
+        #[cfg(feature = "gltf")]
+        {
+            inner = inner.add_plugin(GltfPlugin);
+        }
+
+        Self {
+            inner,
+            graph_builder: Some(render_graph),
             pending_inputs: Vec::new(),
             game_tx: None,
             resize_tx: None,
             window: None,
             game_thread: None,
             render_thread: None,
-            _phantom: PhantomData,
-        })
+        }
+    }
+
+    pub fn add_plugin(mut self, plugin: impl Plugin) -> Self {
+        self.inner = self.inner.add_plugin(plugin);
+        self
     }
 
     pub fn run(mut self) -> Result<(), ApplicationError> {
-        let event_loop = EventLoop::builder()
-            .build()
-            .map_err(ApplicationEventLoopError)?;
+        let event_loop =
+            EventLoop::builder()
+                .build()
+                .map_err(|e: EventLoopError| ApplicationError {
+                    message: e.to_string(),
+                    source: Some(Box::new(e)),
+                })?;
 
         event_loop.set_control_flow(ControlFlow::Poll);
 
         event_loop
             .run_app(&mut self)
-            .map_err(ApplicationEventLoopError)?;
+            .map_err(|e| ApplicationError {
+                message: e.to_string(),
+                source: Some(Box::new(e)),
+            })?;
 
         Ok(())
     }
 }
 
-impl<A, B> ApplicationHandler for WindowedApplication<A, B>
-where
-    A: Application,
-    B: RenderGraphBuilder,
-{
+impl<B: RenderGraphBuilder> ApplicationHandler for WindowedApplication<B> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.game_tx.is_some() {
             return;
@@ -104,19 +106,14 @@ where
         let builder = self.graph_builder.take().unwrap();
         let renderer = pollster::block_on(Renderer::new(window.clone(), builder)).unwrap();
 
-        let mut engine = self.engine.take().unwrap();
-
-        // Application::setup runs on the main thread before threads diverge,
-        // giving it exclusive Engine access with no synchronization needed.
-        let app = A::setup(&mut engine).unwrap();
-
-        let world_arc = engine.world_arc();
+        let world_arc = self.inner.engine.world_arc();
+        let mut plugins = std::mem::take(&mut self.inner.plugins);
+        let mut engine = std::mem::take(&mut self.inner.engine);
 
         let (game_tx, game_rx) = mpsc::sync_channel::<GameMsg>(1);
         let (render_tx, render_rx) = mpsc::sync_channel::<()>(1);
         let (resize_tx, resize_rx) = mpsc::sync_channel::<ResizeMsg>(4);
 
-        // Render thread — owns Renderer and a read-only view of the world.
         let window_clone = Arc::clone(&window);
         let render_thread = thread::Builder::new()
             .name("render".into())
@@ -140,12 +137,9 @@ where
             })
             .unwrap();
 
-        // Game thread — owns Engine and Application.
         let game_thread = thread::Builder::new()
             .name("game".into())
             .spawn(move || {
-                let mut engine = engine;
-                let mut app = app;
                 let mut last_tick = Instant::now();
 
                 while let Ok(GameMsg::Tick { inputs }) = game_rx.recv() {
@@ -161,13 +155,15 @@ where
                         world.tick_all(delta);
                     }
 
-                    app.tick(&mut engine, delta).unwrap();
+                    for plugin in &mut plugins {
+                        plugin.tick(&mut engine, delta);
+                    }
+
                     let _ = render_tx.send(());
                 }
             })
             .unwrap();
 
-        // Kick off the first frame.
         window.request_redraw();
 
         self.game_tx = Some(game_tx);
@@ -184,17 +180,12 @@ where
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::KeyboardInput {
-                event,
-                is_synthetic: _,
-                device_id: _,
-            } => {
+            WindowEvent::KeyboardInput { event, .. } => {
                 let key_code = event.physical_key.to_scancode().unwrap().into();
                 let input_event = match event.state {
                     ElementState::Pressed => InputEvent::KeyPressed { key_code },
                     ElementState::Released => InputEvent::KeyReleased { key_code },
                 };
-
                 self.pending_inputs.push(input_event);
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -215,7 +206,8 @@ where
                     MouseScrollDelta::LineDelta(_x, y) => y,
                     MouseScrollDelta::PixelDelta(pos) => (pos.y as f32) / 20.0,
                 };
-                self.pending_inputs.push(InputEvent::MouseScrolled { delta: scroll });
+                self.pending_inputs
+                    .push(InputEvent::MouseScrolled { delta: scroll });
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.pending_inputs.push(InputEvent::MouseMoved {
@@ -232,14 +224,11 @@ where
                 if let Some(tx) = self.game_tx.take() {
                     let _ = tx.send(GameMsg::Shutdown);
                 }
-
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
                 if let Some(tx) = &self.game_tx {
                     let inputs = mem::take(&mut self.pending_inputs);
-                    // Non-blocking: if game thread is still processing the previous frame,
-                    // skip this tick. The render thread will call request_redraw again.
                     let _ = tx.try_send(GameMsg::Tick { inputs });
                 }
             }

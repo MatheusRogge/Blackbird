@@ -1,24 +1,18 @@
-use std::sync::Arc;
-
 use crate::{
     graph::RenderGraph,
-    pass::{
-        camera::CameraPass,
-        gbuffer::GBufferPass,
-        present::PresentPass,
-    },
+    pass::{camera::CameraPass, gbuffer::GBufferPass, present::PresentPass},
     renderer::RenderGraphBuilder,
     resource::ResourceId,
     shader::ShaderAsset,
 };
 
 pub struct RenderGraphPBRBuilder {
-    gbuffer_shader: Arc<ShaderAsset>,
-    present_shader: Arc<ShaderAsset>,
+    gbuffer_shader: ShaderAsset,
+    present_shader: ShaderAsset,
 }
 
 impl RenderGraphPBRBuilder {
-    pub fn new(gbuffer_shader: Arc<ShaderAsset>, present_shader: Arc<ShaderAsset>) -> Self {
+    pub fn new(gbuffer_shader: ShaderAsset, present_shader: ShaderAsset) -> Self {
         Self {
             gbuffer_shader,
             present_shader,
@@ -46,6 +40,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             surface_config,
             self.gbuffer_shader,
         );
+
         graph.add_pass(device, gbuffer_pass);
 
         let present_pass = PresentPass::new(
@@ -54,6 +49,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             surface_config.format,
             self.present_shader,
         );
+
         graph.add_pass(device, present_pass);
 
         (graph, surface_view_id)

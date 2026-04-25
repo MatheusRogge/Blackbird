@@ -1,6 +1,7 @@
+use assets::AssetError;
 use thiserror::Error;
 
-use engine::{Engine, asset::AssetError, plugin::EnginePluginError};
+use engine::{Engine, plugin::EnginePluginError};
 
 #[derive(Error, Debug)]
 pub struct ApplicationError {
@@ -33,10 +34,10 @@ impl std::fmt::Display for ApplicationError {
     }
 }
 
-pub trait Application {
+pub trait Application: Send + 'static {
     fn setup(engine: &mut Engine) -> Result<Self, ApplicationError>
     where
         Self: Sized;
 
-    fn run(&mut self, engine: &mut Engine) -> impl Future<Output = Result<(), ApplicationError>>;
+    fn tick(&mut self, engine: &mut Engine, delta: f32) -> Result<(), ApplicationError>;
 }

@@ -4,8 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-thiserror = { workspace = true }
-tracing = { workspace = true }
 gltf = { version = "1.4.1", features = [
   "extras",
   "names",
@@ -14,5 +12,10 @@ gltf = { version = "1.4.1", features = [
   "guess_mime_type",
 ] }
 
-engine = { path = "../engine/" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+log = { workspace = true }
+
+assets = { path = "../assets/" }
+engine_core = { path = "../core/" }
 rendering = { path = "../rendering/" }

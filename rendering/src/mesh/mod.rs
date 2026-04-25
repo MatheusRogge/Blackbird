@@ -1,4 +1,6 @@
-use engine::entity::Entity;
+use std::sync::Arc;
+
+use engine_core::entity::Entity;
 
 pub use ultraviolet::Vec3;
 use wgpu::{
@@ -6,17 +8,20 @@ use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
 };
 
+use crate::texture::TextureAsset;
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub color: [f32; 3],
+    pub uv: [f32; 2],
 }
 
 impl Vertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 3] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
+    const ATTRIBS: [wgpu::VertexAttribute; 4] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2];
 
     pub fn buffer_descriptor() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -29,13 +34,22 @@ impl Vertex {
 
 #[derive(Debug, Default, Clone)]
 pub struct Mesh {
-    pub indices: Vec<u16>,
+    pub indices: Vec<u32>,
     pub vertices: Vec<Vertex>,
+    pub albedo_texture: Option<Arc<TextureAsset>>,
 }
 
 impl Mesh {
-    pub fn new(vertices: Vec<Vertex>, indices: Vec<u16>) -> Self {
-        Self { indices, vertices }
+    pub fn new(
+        vertices: Vec<Vertex>,
+        indices: Vec<u32>,
+        albedo_texture: Option<Arc<TextureAsset>>,
+    ) -> Self {
+        Self {
+            indices,
+            vertices,
+            albedo_texture,
+        }
     }
 
     pub fn get_indices_count(&self) -> usize {
@@ -99,14 +113,14 @@ impl MeshBatch {
 
     /// Returns all indices with per-mesh base-vertex offsets applied, so the
     /// entire batch can be drawn with a single `draw_indexed` call.
-    pub fn packed_indices(&self) -> Vec<u16> {
+    pub fn packed_indices(&self) -> Vec<u32> {
         let mut out = Vec::new();
-        let mut base: u16 = 0;
+        let mut base: u32 = 0;
         for mesh in &self.meshes {
             for &idx in &mesh.indices {
                 out.push(idx + base);
             }
-            base += mesh.vertices.len() as u16;
+            base += mesh.vertices.len() as u32;
         }
         out
     }

@@ -7,10 +7,5 @@ edition = "2024"
 anyhow = { workspace = true }
 log = { workspace = true }
 env_logger = { version = "0.11.10" }
-tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread"] }
 
-application = { path = "../application/" }
-gltf = { path = "../gltf/" }
-engine = { path = "../engine/" }
-rendering = { path = "../rendering/" }
-window = { path = "../window/" }
+engine = { path = "../engine/", features = ["full"] }

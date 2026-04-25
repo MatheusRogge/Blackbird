@@ -4,8 +4,23 @@ version = "1.0.0"
 edition = "2024"
 
 [dependencies]
-downcast-rs = "2.0.2"
-
-slotmap = { workspace = true }
-tracing = { workspace = true }
 thiserror = { workspace = true }
+
+engine_core = { path = "../core/" }
+threading = { path = "../threading/" }
+
+assets    = { path = "../assets/",    optional = true }
+gltf      = { path = "../gltf/",      optional = true }
+rendering = { path = "../rendering/", optional = true }
+
+# window feature pulls in winit + pollster directly (no separate window crate needed)
+winit     = { workspace = true,        optional = true }
+pollster  = { version = "0.4.0",       optional = true }
+ultraviolet = { workspace = true }
+
+[features]
+default  = []
+assets   = ["dep:assets"]
+gltf     = ["dep:gltf", "dep:assets", "assets"]
+window   = ["dep:rendering", "dep:winit", "dep:pollster"]
+full     = ["assets", "gltf", "window"]

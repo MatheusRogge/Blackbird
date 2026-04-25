@@ -1,12 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-  "application",
+  "core",
+  "assets",
   "engine",
   "gltf",
   "rendering",
   "sandbox",
-  "window",
+  "threading",
 ]
 
 [workspace.dependencies]
@@ -16,3 +17,4 @@ thiserror = { version = "2.0.18" }
 tracing = { version = "0.1.44" }
 winit = { version = "0.30.13" }
 slotmap = { version = "1.1.1" }
+ultraviolet = { version = "0.10.0", features = ["int", "f64"] }

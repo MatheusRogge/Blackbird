@@ -1,11 +1,8 @@
-use engine::{
-    Engine,
-    asset::{Asset, AssetError, AssetResolver},
-    plugin::{EnginePlugin, EnginePluginError},
-    world::World,
-};
-use gltf::{Gltf, import_buffers, import_images, mesh::util::ReadIndices};
+use assets::{Asset, AssetError, AssetResolver};
+use engine_core::world::World;
+use gltf::{Gltf, image::Format, import_buffers, import_images, mesh::util::ReadIndices};
 use rendering::{
+    TextureAsset,
     camera::Camera,
     mesh::{Mesh, Vertex},
 };
@@ -13,6 +10,7 @@ use std::{
     fs::File,
     io::{self},
     path::Path,
+    sync::Arc,
 };
 use thiserror::Error;
 
@@ -31,23 +29,6 @@ impl From<GLTFAssetError> for AssetError {
     }
 }
 
-#[derive(Error, Debug)]
-pub enum GLTFError {
-    #[error("Scene loading failed")]
-    LoadSceneError,
-}
-
-impl From<GLTFError> for EnginePluginError {
-    fn from(val: GLTFError) -> Self {
-        match val {
-            GLTFError::LoadSceneError => EnginePluginError {
-                message: val.to_string(),
-                source: Box::new(val),
-            },
-        }
-    }
-}
-
 pub struct GLTFAsset {
     pub(crate) document: gltf::Document,
     pub(crate) buffers: Vec<gltf::buffer::Data>,
@@ -63,21 +44,13 @@ impl AssetResolver for GLTFAssetResolver {
     type Error = GLTFAssetError;
 
     fn resolve(&self, base_path: &Path, file: File) -> Result<Self::Asset, Self::Error> {
-        println!(
-            "[GLTFAssetResolver] Reading: base_path={:?}, file={:?}",
-            base_path, &file
-        );
-
         let base = Some(base_path);
+
         let reader = io::BufReader::new(file);
         let Gltf { document, blob } = Gltf::from_reader(reader)?;
-        println!("GLTF document loaded!");
 
         let buffer_data = import_buffers(&document, base, blob)?;
-        println!("Buffers read: {:?}", buffer_data.len());
-
         let image_data = import_images(&document, base, &buffer_data)?;
-        println!("Read images: {:?}", image_data.len());
 
         Ok(GLTFAsset {
             document,
@@ -87,95 +60,153 @@ impl AssetResolver for GLTFAssetResolver {
     }
 }
 
-pub struct GLTFEnginePlugin;
+fn image_to_texture_asset(img: &gltf::image::Data) -> Option<Arc<TextureAsset>> {
+    let rgba: Vec<u8> = match img.format {
+        Format::R8G8B8A8 => img.pixels.clone(),
+        Format::R8G8B8 => img
+            .pixels
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        other => {
+            log::warn!("Unsupported image format: {:?} — skipping texture", other);
+            return None;
+        }
+    };
 
-impl EnginePlugin for GLTFEnginePlugin {
-    fn setup(&self, engine: &mut Engine) -> Result<Self, EnginePluginError>
-    where
-        Self: Sized,
-    {
-        engine
-            .asset_manager()
-            .add_resolver("gltf", GLTFAssetResolver);
+    Some(Arc::new(TextureAsset::new(img.width, img.height, rgba)))
+}
 
-        engine
-            .asset_manager()
-            .add_resolver("glb", GLTFAssetResolver);
+fn build_mesh_primitives(
+    mesh: &gltf::Mesh<'_>,
+    buffers: &[gltf::buffer::Data],
+    images: &[gltf::image::Data],
+) -> Vec<Mesh> {
+    let mut out = Vec::new();
 
-        Ok(Self)
+    for primitive in mesh.primitives() {
+        let reader = primitive.reader(|e| buffers.get(e.index()).map(|e| e.0.as_slice()));
+
+        let positions: Vec<[f32; 3]> = match reader.read_positions() {
+            Some(it) => it.collect(),
+            None => continue,
+        };
+
+        let mut vertices: Vec<Vertex> = positions
+            .into_iter()
+            .map(|position| Vertex {
+                position,
+                color: [1.0, 1.0, 1.0],
+                normal: [0.0, 0.0, 0.0],
+                uv: [0.0, 0.0],
+            })
+            .collect();
+
+        if let Some(normals) = reader.read_normals() {
+            for (i, normal) in normals.enumerate() {
+                if let Some(v) = vertices.get_mut(i) {
+                    v.normal = normal;
+                }
+            }
+        }
+
+        if let Some(colors) = reader.read_colors(0) {
+            for (i, color) in colors.into_rgb_f32().enumerate() {
+                if let Some(v) = vertices.get_mut(i) {
+                    v.color = color;
+                }
+            }
+        }
+
+        if let Some(uvs) = reader.read_tex_coords(0) {
+            for (i, uv) in uvs.into_f32().enumerate() {
+                if let Some(v) = vertices.get_mut(i) {
+                    v.uv = uv;
+                }
+            }
+        }
+
+        let indices: Vec<u32> = match reader.read_indices() {
+            Some(ReadIndices::U32(iter)) => iter.collect(),
+            Some(ReadIndices::U16(iter)) => iter.map(|e| e as u32).collect(),
+            Some(ReadIndices::U8(iter)) => iter.map(|e| e as u32).collect(),
+            None => (0..vertices.len() as u32).collect(),
+        };
+
+        let albedo_texture = primitive
+            .material()
+            .pbr_metallic_roughness()
+            .base_color_texture()
+            .and_then(|tex_info| images.get(tex_info.texture().source().index()))
+            .and_then(image_to_texture_asset);
+
+        out.push(Mesh::new(vertices, indices, albedo_texture));
+    }
+
+    out
+}
+
+pub struct GltfScene {
+    asset: Arc<GLTFAsset>,
+    next_mesh: usize,
+    cameras_loaded: bool,
+}
+
+impl GltfScene {
+    pub fn new(asset: Arc<GLTFAsset>) -> Self {
+        Self {
+            asset,
+            next_mesh: 0,
+            cameras_loaded: false,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        let total = self.asset.document.meshes().count();
+        self.next_mesh >= total && self.cameras_loaded
+    }
+
+    /// Inserts up to `count` meshes into `world`. Returns `true` if more remain.
+    pub fn load_batch(&mut self, world: &mut World, count: usize) -> bool {
+        if !self.cameras_loaded {
+            load_cameras(&self.asset.document, world);
+            self.cameras_loaded = true;
+        }
+
+        let meshes = self
+            .asset
+            .document
+            .meshes()
+            .skip(self.next_mesh)
+            .take(count);
+
+        if meshes.len() == 0 {
+            return false;
+        }
+
+        for mesh in meshes {
+            self.next_mesh = mesh.index() + 1;
+            for entity in build_mesh_primitives(&mesh, &self.asset.buffers, &self.asset.images) {
+                world.add_entity(entity);
+            }
+        }
+
+        !self.is_complete()
     }
 }
 
-impl GLTFEnginePlugin {
-    pub fn load_scene(&self, asset: &GLTFAsset, world: &mut World) -> Result<(), GLTFError> {
-        let buffers = &asset.buffers;
-
-        for mesh in asset.document.meshes() {
-            let mut indices = Vec::new();
-            let mut vertices = Vec::new();
-
-            for primitive in mesh.primitives() {
-                let reader = primitive.reader(|e| buffers.get(e.index()).map(|e| e.0.as_slice()));
-
-                if let Some(reader) = reader.read_indices() {
-                    let values = match reader {
-                        ReadIndices::U32(iter) => iter.map(|e| e as u16).collect(),
-                        ReadIndices::U8(iter) => iter.map(|e| e as u16).collect(),
-                        ReadIndices::U16(iter) => iter.collect(),
-                    };
-
-                    indices = values;
-                }
-
-                if let Some(positions) = reader.read_positions() {
-                    for position in positions {
-                        vertices.push(Vertex {
-                            position,
-                            color: [1.0, 1.0, 1.0],
-                            normal: [0.0, 0.0, 0.0],
-                        });
-                    }
-                }
-
-                if let Some(normals) = reader.read_normals() {
-                    for (i, normal) in normals.enumerate() {
-                        vertices[i].normal = normal;
-                    }
-                }
-
-                if let Some(colors) = reader.read_colors(1) {
-                    for (i, color) in colors.into_rgb_f32().enumerate() {
-                        vertices[i].color = color;
-                    }
-                }
-            }
-
-            if !vertices.is_empty() {
-                let mesh = Mesh::new(vertices, indices);
-                world.add_entity(mesh);
-            }
+fn load_cameras(document: &gltf::Document, world: &mut World) {
+    for camera in document.cameras() {
+        if let gltf::camera::Projection::Perspective(perspective) = camera.projection() {
+            world.add_entity(Camera {
+                fovy: perspective.yfov(),
+                near: perspective.znear(),
+                far: perspective.zfar().unwrap_or(1000.0),
+                aspect: perspective.aspect_ratio().unwrap_or((4 / 3) as f32),
+                up: (0.0, 1.0, 0.0).into(),
+                eye: (0.0, 40.0, 150.0).into(),
+                target: (0.0, 40.0, 0.0).into(),
+            });
         }
-
-        for camera in asset.document.cameras() {
-            match camera.projection() {
-                gltf::camera::Projection::Orthographic(_orthographic) => {
-                    // Not implemeted.
-                }
-                gltf::camera::Projection::Perspective(perspective) => {
-                    world.add_entity(Camera {
-                        fovy: perspective.yfov(),
-                        near: perspective.znear(),
-                        far: perspective.zfar().unwrap_or(1000.0),
-                        aspect: perspective.aspect_ratio().unwrap_or((4 / 3) as f32),
-
-                        up: (0.0, 1.0, 0.0).into(),
-                        eye: (0.0, 40.0, 150.0).into(),
-                        target: (0.0, 40.0, 0.0).into(),
-                    });
-                }
-            }
-        }
-
-        Ok(())
     }
 }

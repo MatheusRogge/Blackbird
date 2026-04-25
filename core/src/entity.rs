@@ -13,7 +13,12 @@ pub trait Entity: Any + Downcast + Send + Sync + 'static {
 
 impl_downcast!(Entity);
 
-/// Opt-in trait for entities that can be moved by a `PlayerController`.
 pub trait Controllable: Entity {
     fn translate(&mut self, delta: Vec3);
+    fn forward(&self) -> Vec3 {
+        Vec3::new(0.0, 0.0, -1.0)
+    }
+    fn right(&self) -> Vec3 {
+        Vec3::new(1.0, 0.0, 0.0)
+    }
 }

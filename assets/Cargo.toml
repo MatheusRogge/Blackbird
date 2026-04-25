@@ -1,0 +1,12 @@
+[package]
+name = "assets"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+downcast-rs = "2.0.2"
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+threading = { path = "../threading/" }

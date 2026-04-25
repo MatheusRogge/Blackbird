@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use engine::world::World;
+use engine_core::world::World;
 
 use crate::{
     graph::NodeId,
@@ -11,7 +11,7 @@ use crate::{
 
 pub struct PresentPass {
     node_id: Option<NodeId>,
-    shader: Arc<ShaderAsset>,
+    shader: ShaderAsset,
     pipeline: Option<Arc<wgpu::RenderPipeline>>,
     bind_group_layout: Option<wgpu::BindGroupLayout>,
     albedo_id: ResourceId,
@@ -24,7 +24,7 @@ impl PresentPass {
         albedo_id: ResourceId,
         surface_id: ResourceId,
         surface_format: wgpu::TextureFormat,
-        shader: Arc<ShaderAsset>,
+        shader: ShaderAsset,
     ) -> Self {
         Self {
             node_id: None,
@@ -100,12 +100,11 @@ impl RenderPass for PresentPass {
                     entries: &layout_entries,
                 });
 
-            let pipeline_layout =
-                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("present_pipeline_layout"),
-                    bind_group_layouts: &[Some(&bind_group_layout)],
-                    immediate_size: 0,
-                });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("present_pipeline_layout"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            });
 
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("present_pipeline"),
