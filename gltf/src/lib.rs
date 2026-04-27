@@ -99,6 +99,7 @@ fn build_mesh_primitives(
                 color: [1.0, 1.0, 1.0],
                 normal: [0.0, 0.0, 0.0],
                 uv: [0.0, 0.0],
+                tangent: [1.0, 0.0, 0.0, 1.0],
             })
             .collect();
 
@@ -126,6 +127,14 @@ fn build_mesh_primitives(
             }
         }
 
+        if let Some(tangents) = reader.read_tangents() {
+            for (i, tangent) in tangents.enumerate() {
+                if let Some(v) = vertices.get_mut(i) {
+                    v.tangent = tangent;
+                }
+            }
+        }
+
         let indices: Vec<u32> = match reader.read_indices() {
             Some(ReadIndices::U32(iter)) => iter.collect(),
             Some(ReadIndices::U16(iter)) => iter.map(|e| e as u32).collect(),
@@ -133,14 +142,20 @@ fn build_mesh_primitives(
             None => (0..vertices.len() as u32).collect(),
         };
 
-        let albedo_texture = primitive
-            .material()
-            .pbr_metallic_roughness()
+        let material = primitive.material();
+        let pbr = material.pbr_metallic_roughness();
+
+        let albedo_texture = pbr
             .base_color_texture()
             .and_then(|tex_info| images.get(tex_info.texture().source().index()))
             .and_then(image_to_texture_asset);
 
-        out.push(Mesh::new(vertices, indices, albedo_texture));
+        let normal_texture = material
+            .normal_texture()
+            .and_then(|tex_info| images.get(tex_info.texture().source().index()))
+            .and_then(image_to_texture_asset);
+
+        out.push(Mesh::new(vertices, indices, albedo_texture, normal_texture));
     }
 
     out

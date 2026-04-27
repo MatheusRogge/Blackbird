@@ -1,10 +1,8 @@
-use std::sync::Arc;
-
 use engine_core::world::World;
 
 use crate::{
     graph::NodeId,
-    pass::{PassContext, RenderPass, RenderPassDesc},
+    pass::{PassContext, Pass, PassDesc},
     resource::ResourceId,
     shader::ShaderAsset,
 };
@@ -12,7 +10,7 @@ use crate::{
 pub struct PresentPass {
     node_id: Option<NodeId>,
     shader: ShaderAsset,
-    pipeline: Option<Arc<wgpu::RenderPipeline>>,
+    pipeline: Option<wgpu::RenderPipeline>,
     bind_group_layout: Option<wgpu::BindGroupLayout>,
     albedo_id: ResourceId,
     surface_id: ResourceId,
@@ -38,7 +36,7 @@ impl PresentPass {
     }
 }
 
-impl RenderPassDesc for PresentPass {
+impl PassDesc for PresentPass {
     fn name(&self) -> &'static str {
         "present"
     }
@@ -52,7 +50,7 @@ impl RenderPassDesc for PresentPass {
     }
 }
 
-impl RenderPass for PresentPass {
+impl Pass for PresentPass {
     fn bind_node_id(&mut self, node_id: NodeId) {
         self.node_id = Some(node_id);
     }
@@ -132,7 +130,7 @@ impl RenderPass for PresentPass {
                 cache: None,
             });
 
-            self.pipeline = Some(Arc::new(pipeline));
+            self.pipeline = Some(pipeline);
             self.bind_group_layout = Some(bind_group_layout);
         }
 

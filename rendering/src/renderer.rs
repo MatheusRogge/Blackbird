@@ -7,7 +7,7 @@ use wgpu::{
     SurfaceTarget,
 };
 
-use crate::{graph::RenderGraph, resource::ResourceId};
+use crate::{graph::RenderGraph, profiler::FrameStats, resource::ResourceId};
 
 pub trait RenderGraphBuilder: Send + 'static {
     /// Build the render graph.
@@ -76,12 +76,13 @@ impl Renderer {
             })
             .await?;
 
+        let timing_features = Features::TIMESTAMP_QUERY | Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor {
                 label: None,
                 trace: wgpu::Trace::Off,
                 memory_hints: MemoryHints::MemoryUsage,
-                required_features: Features::empty(),
+                required_features: adapter.features() & timing_features,
                 required_limits: adapter.limits(),
                 ..Default::default()
             })
@@ -115,6 +116,10 @@ impl Renderer {
             needs_reconfigure: false,
             graph,
         })
+    }
+
+    pub fn frame_stats(&self) -> &FrameStats {
+        self.graph.frame_stats()
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -161,10 +166,17 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let cmd = self.graph
-            .execute(&self.device, &self.queue, self.surface_id, &surface_view, world);
+        let cmd = self.graph.execute(
+            &self.device,
+            &self.queue,
+            self.surface_id,
+            &surface_view,
+            (self.surface_config.width, self.surface_config.height),
+            world,
+        );
 
         self.queue.submit(std::iter::once(cmd));
+        self.graph.schedule_gpu_readback(&self.device);
         surface_texture.present();
     }
 }

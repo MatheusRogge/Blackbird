@@ -36,6 +36,9 @@ pub struct Engine {
 
     #[cfg(feature = "assets")]
     pub(crate) assets: assets::AssetManager,
+
+    #[cfg(feature = "window")]
+    pub(crate) frame_stats: Arc<RwLock<rendering::FrameStats>>,
 }
 
 impl Engine {
@@ -47,6 +50,9 @@ impl Engine {
 
             #[cfg(feature = "assets")]
             assets: assets::AssetManager::default(),
+
+            #[cfg(feature = "window")]
+            frame_stats: Arc::new(RwLock::new(rendering::FrameStats::default())),
         }
     }
 
@@ -81,6 +87,16 @@ impl Engine {
     #[cfg(feature = "assets")]
     pub fn assets_mut(&mut self) -> &mut assets::AssetManager {
         &mut self.assets
+    }
+
+    #[cfg(feature = "window")]
+    pub(crate) fn frame_stats_arc(&self) -> Arc<RwLock<rendering::FrameStats>> {
+        Arc::clone(&self.frame_stats)
+    }
+
+    #[cfg(feature = "window")]
+    pub fn frame_stats(&self) -> rendering::FrameStats {
+        self.frame_stats.read().expect("frame_stats RwLock poisoned").clone()
     }
 }
 

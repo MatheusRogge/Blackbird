@@ -7,6 +7,7 @@ use engine::{
     rendering::{
         camera::Camera,
         camera_controller::{CameraController, CameraMode},
+        light::PointLight,
         pbr::RenderGraphPBRBuilder,
         shader::ShaderAsset,
     },
@@ -19,6 +20,7 @@ struct MyGame {
     camera_controller: Option<CameraController>,
     player_controller: PlayerController,
     pending_gltf: Option<AssetLoadHandle<GLTFAsset>>,
+    tick: u64,
 }
 
 impl Default for MyGame {
@@ -28,6 +30,7 @@ impl Default for MyGame {
             camera_controller: None,
             player_controller: PlayerController::new(20.5),
             pending_gltf: None,
+            tick: 0,
         }
     }
 }
@@ -56,10 +59,30 @@ impl Plugin for MyGame {
         self.player_controller.attach(camera_key);
         self.camera_controller = Some(CameraController::new(camera_key, CameraMode::FirstPerson));
 
+        let mut world = engine.world();
+        world.add_entity(PointLight {
+            position: (0.0, 100.0, 0.0).into(),
+            color: (1.0, 1.0, 1.0).into(),
+            intensity: 1000.0,
+            radius: 500.0,
+        });
+        world.add_entity(PointLight {
+            position: (-150.0, 50.0, 0.0).into(),
+            color: (1.0, 0.5, 0.2).into(),
+            intensity: 600.0,
+            radius: 300.0,
+        });
+
         Ok(())
     }
 
     fn tick(&mut self, engine: &mut Engine, delta: f32) {
+        self.tick += 1;
+
+        if self.tick.is_multiple_of(120) {
+            log::info!("perf\n{}", engine.frame_stats());
+        }
+
         self.player_controller.tick::<Camera>(engine, delta);
 
         if let Some(ctrl) = &mut self.camera_controller {
@@ -96,9 +119,16 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let gbuffer_shader = ShaderAsset::from_raw(include_str!("../shaders/gbuffer.wgsl"));
+    let cluster_shader = ShaderAsset::from_raw(include_str!("../shaders/cluster_assignment.wgsl"));
+    let lighting_shader = ShaderAsset::from_raw(include_str!("../shaders/lighting.wgsl"));
     let present_shader = ShaderAsset::from_raw(include_str!("../shaders/present.wgsl"));
 
-    let render_graph = RenderGraphPBRBuilder::new(gbuffer_shader, present_shader);
+    let render_graph = RenderGraphPBRBuilder::new(
+        gbuffer_shader,
+        cluster_shader,
+        lighting_shader,
+        present_shader,
+    );
 
     WindowedApplication::new(render_graph)
         .add_plugin(MyGame::default())

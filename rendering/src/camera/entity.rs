@@ -12,9 +12,11 @@ pub struct Camera {
 }
 
 impl Camera {
-    pub fn view_proj_matrix(&self) -> Mat4 {
-        let view = Mat4::look_at(self.eye, self.target, self.up);
+    pub fn view_matrix(&self) -> Mat4 {
+        Mat4::look_at(self.eye, self.target, self.up)
+    }
 
+    pub fn view_proj_matrix(&self) -> Mat4 {
         // Reversed-Z for better depth precision — near/far swapped,
         // clip depth maps to [1, 0] instead of [0, 1].
         let proj = projection::perspective_reversed_z_wgpu_dx_gl(
@@ -24,7 +26,7 @@ impl Camera {
             self.far,
         );
 
-        proj * view
+        proj * self.view_matrix()
     }
 }
 

@@ -107,6 +107,7 @@ impl<B: RenderGraphBuilder> ApplicationHandler for WindowedApplication<B> {
         let renderer = pollster::block_on(Renderer::new(window.clone(), builder)).unwrap();
 
         let world_arc = self.inner.engine.world_arc();
+        let frame_stats_arc = self.inner.engine.frame_stats_arc();
         let mut plugins = std::mem::take(&mut self.inner.plugins);
         let mut engine = std::mem::take(&mut self.inner.engine);
 
@@ -129,6 +130,9 @@ impl<B: RenderGraphBuilder> ApplicationHandler for WindowedApplication<B> {
                         Ok(()) => {
                             let world = world_arc.read().expect("world RwLock poisoned");
                             renderer.render(&world);
+                            if let Ok(mut s) = frame_stats_arc.write() {
+                                *s = renderer.frame_stats().clone();
+                            }
                             window_clone.request_redraw();
                         }
                         Err(_) => break,

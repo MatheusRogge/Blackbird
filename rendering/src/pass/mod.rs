@@ -1,5 +1,8 @@
 pub mod camera;
+pub mod cluster_assignment;
 pub mod gbuffer;
+pub mod light_upload;
+pub mod lighting;
 pub mod present;
 
 use crate::{
@@ -14,9 +17,10 @@ pub struct PassContext<'a> {
     pub buffers: HashMap<ResourceId, &'a wgpu::Buffer>,
     pub bind_group: Option<&'a wgpu::BindGroup>,
     pub upstream: HashMap<NodeId, &'a wgpu::BindGroup>,
+    pub surface_size: (u32, u32),
 }
 
-pub trait RenderPassDesc {
+pub trait PassDesc {
     fn name(&self) -> &'static str;
 
     fn reads(&self) -> Vec<ResourceId>;
@@ -35,8 +39,10 @@ pub trait RenderPassDesc {
     }
 }
 
-pub trait RenderPass: RenderPassDesc + Send + Sync + 'static {
+pub trait Pass: PassDesc + Send + Sync + 'static {
     fn bind_node_id(&mut self, node_id: NodeId);
+
+    fn on_resize(&mut self, _width: u32, _height: u32) {}
 
     fn execute(
         &mut self,

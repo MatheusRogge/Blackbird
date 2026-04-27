@@ -15,6 +15,10 @@ pub enum ResourceDescriptor {
         usage: wgpu::TextureUsages,
         format: wgpu::TextureFormat,
     },
+    ScreenTexture {
+        usage: wgpu::TextureUsages,
+        format: wgpu::TextureFormat,
+    },
     ExternalView,
 }
 

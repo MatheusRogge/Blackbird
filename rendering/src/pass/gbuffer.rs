@@ -1,11 +1,12 @@
 use std::{collections::HashMap, sync::Arc};
+use wgpu::util::DeviceExt;
 
 use engine_core::world::World;
 
 use crate::{
     graph::{NodeId, RenderGraph},
     mesh::{Mesh, Vertex},
-    pass::{PassContext, RenderPass, RenderPassDesc},
+    pass::{Pass, PassContext, PassDesc},
     resource::{BindingResource, ResourceDescriptor, ResourceId},
     shader::ShaderAsset,
     texture::TextureAsset,
@@ -20,18 +21,23 @@ pub struct GBufferOutputs {
 
 pub struct GBufferPass {
     node_id: Option<NodeId>,
-    surface_size: wgpu::Extent3d,
 
     shader: ShaderAsset,
-    pipeline: Option<Arc<wgpu::RenderPipeline>>,
+    pipeline: Option<wgpu::RenderPipeline>,
     camera_bind_group_layout: Option<wgpu::BindGroupLayout>,
     texture_bind_group_layout: Option<wgpu::BindGroupLayout>,
 
     texture_sampler: Option<wgpu::Sampler>,
     texture_cache: HashMap<usize, (wgpu::Texture, wgpu::TextureView)>,
-    texture_bind_groups: HashMap<usize, wgpu::BindGroup>,
-    fallback_texture: Option<(wgpu::Texture, wgpu::TextureView)>,
+    texture_bind_groups: HashMap<(usize, usize), wgpu::BindGroup>,
+    fallback_albedo: Option<(wgpu::Texture, wgpu::TextureView)>,
+    fallback_normal: Option<(wgpu::Texture, wgpu::TextureView)>,
     fallback_bind_group: Option<wgpu::BindGroup>,
+    camera_bind_group: Option<wgpu::BindGroup>,
+    // Vertex/index buffers keyed by mesh index. Meshes are only ever appended,
+    // so indices are stable and each buffer is uploaded exactly once.
+    vertex_buffer_cache: HashMap<usize, wgpu::Buffer>,
+    index_buffer_cache: HashMap<usize, wgpu::Buffer>,
 
     camera_buffer_id: ResourceId,
     albedo_id: ResourceId,
@@ -45,35 +51,25 @@ impl GBufferPass {
         graph: &mut RenderGraph,
         _camera_node_id: NodeId,
         camera_buffer_id: ResourceId,
-        surface_config: &wgpu::SurfaceConfiguration,
+        _surface_config: &wgpu::SurfaceConfiguration,
         shader: ShaderAsset,
     ) -> (Self, GBufferOutputs) {
-        let size = wgpu::Extent3d {
-            width: surface_config.width,
-            height: surface_config.height,
-            depth_or_array_layers: 1,
-        };
-
-        let albedo_id = graph.alloc_resource_id(ResourceDescriptor::Texture {
-            size,
+        let albedo_id = graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         });
 
-        let normal_id = graph.alloc_resource_id(ResourceDescriptor::Texture {
-            size,
+        let normal_id = graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
             format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         });
 
-        let material_id = graph.alloc_resource_id(ResourceDescriptor::Texture {
-            size,
+        let material_id = graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         });
 
-        let depth_id = graph.alloc_resource_id(ResourceDescriptor::Texture {
-            size,
+        let depth_id = graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
             format: wgpu::TextureFormat::Depth32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         });
@@ -88,7 +84,6 @@ impl GBufferPass {
         (
             Self {
                 node_id: None,
-                surface_size: size,
                 shader,
                 pipeline: None,
                 camera_bind_group_layout: None,
@@ -96,8 +91,12 @@ impl GBufferPass {
                 texture_sampler: None,
                 texture_cache: HashMap::new(),
                 texture_bind_groups: HashMap::new(),
-                fallback_texture: None,
+                fallback_albedo: None,
+                fallback_normal: None,
                 fallback_bind_group: None,
+                camera_bind_group: None,
+                vertex_buffer_cache: HashMap::new(),
+                index_buffer_cache: HashMap::new(),
                 camera_buffer_id,
                 albedo_id,
                 normal_id,
@@ -112,6 +111,7 @@ impl GBufferPass {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         asset: &TextureAsset,
+        format: wgpu::TextureFormat,
     ) -> (wgpu::Texture, wgpu::TextureView) {
         let size = wgpu::Extent3d {
             width: asset.width,
@@ -125,12 +125,11 @@ impl GBufferPass {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
 
-        // bytes_per_row must be a multiple of COPY_BYTES_PER_ROW_ALIGNMENT (256).
         let unpadded = 4 * asset.width;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let bytes_per_row = unpadded.div_ceil(align) * align;
@@ -152,7 +151,6 @@ impl GBufferPass {
                 size,
             );
         } else {
-            // Pad each row to meet alignment requirements.
             let padded: Vec<u8> = asset
                 .data
                 .chunks_exact(unpadded as usize)
@@ -187,7 +185,8 @@ impl GBufferPass {
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
-        view: &wgpu::TextureView,
+        albedo_view: &wgpu::TextureView,
+        normal_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -195,10 +194,14 @@ impl GBufferPass {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(view),
+                    resource: wgpu::BindingResource::TextureView(albedo_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
+                    resource: wgpu::BindingResource::TextureView(normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
@@ -206,7 +209,7 @@ impl GBufferPass {
     }
 }
 
-impl RenderPassDesc for GBufferPass {
+impl PassDesc for GBufferPass {
     fn name(&self) -> &'static str {
         "gbuffer"
     }
@@ -280,41 +283,33 @@ impl RenderPassDesc for GBufferPass {
             BindingResource {
                 slot: 0,
                 resource_id: self.albedo_id,
-                descriptor: ResourceDescriptor::Texture {
-                    size: self.surface_size,
+                descriptor: ResourceDescriptor::ScreenTexture {
                     format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                 },
             },
             BindingResource {
                 slot: 1,
                 resource_id: self.normal_id,
-                descriptor: ResourceDescriptor::Texture {
-                    size: self.surface_size,
+                descriptor: ResourceDescriptor::ScreenTexture {
                     format: wgpu::TextureFormat::Rgba16Float,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                 },
             },
             BindingResource {
                 slot: 2,
                 resource_id: self.material_id,
-                descriptor: ResourceDescriptor::Texture {
-                    size: self.surface_size,
+                descriptor: ResourceDescriptor::ScreenTexture {
                     format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                 },
             },
             BindingResource {
                 slot: 3,
                 resource_id: self.depth_id,
-                descriptor: ResourceDescriptor::Texture {
-                    size: self.surface_size,
+                descriptor: ResourceDescriptor::ScreenTexture {
                     format: wgpu::TextureFormat::Depth32Float,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                 },
             },
         ]
@@ -333,9 +328,13 @@ impl RenderPassDesc for GBufferPass {
     }
 }
 
-impl RenderPass for GBufferPass {
+impl Pass for GBufferPass {
     fn bind_node_id(&mut self, node_id: NodeId) {
         self.node_id = Some(node_id);
+    }
+
+    fn on_resize(&mut self, _width: u32, _height: u32) {
+        self.camera_bind_group = None;
     }
 
     fn execute(
@@ -387,6 +386,16 @@ impl RenderPass for GBufferPass {
                         },
                         wgpu::BindGroupLayoutEntry {
                             binding: 1,
+                            count: None,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                multisampled: false,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            },
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
                             count: None,
                             visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
@@ -462,18 +471,37 @@ impl RenderPass for GBufferPass {
                 ..Default::default()
             });
 
-            // 1×1 white fallback texture
-            let fallback_asset = TextureAsset::new(1, 1, vec![255, 255, 255, 255]);
-            let (fallback_tex, fallback_view) =
-                Self::upload_texture(device, queue, &fallback_asset);
-            let fallback_bg =
-                Self::create_texture_bind_group(device, &texture_layout, &sampler, &fallback_view);
+            let fallback_albedo_asset = TextureAsset::new(1, 1, vec![255, 255, 255, 255]);
+            let (fallback_albedo_tex, fallback_albedo_view) = Self::upload_texture(
+                device,
+                queue,
+                &fallback_albedo_asset,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+            );
 
-            self.pipeline = Some(Arc::new(pipeline));
+            // [128, 128, 255] decodes to (0, 0, 1) in tangent space — a flat normal map
+            let fallback_normal_asset = TextureAsset::new(1, 1, vec![128, 128, 255, 255]);
+            let (fallback_normal_tex, fallback_normal_view) = Self::upload_texture(
+                device,
+                queue,
+                &fallback_normal_asset,
+                wgpu::TextureFormat::Rgba8Unorm,
+            );
+
+            let fallback_bg = Self::create_texture_bind_group(
+                device,
+                &texture_layout,
+                &sampler,
+                &fallback_albedo_view,
+                &fallback_normal_view,
+            );
+
+            self.pipeline = Some(pipeline);
             self.camera_bind_group_layout = Some(camera_layout);
             self.texture_bind_group_layout = Some(texture_layout);
             self.texture_sampler = Some(sampler);
-            self.fallback_texture = Some((fallback_tex, fallback_view));
+            self.fallback_albedo = Some((fallback_albedo_tex, fallback_albedo_view));
+            self.fallback_normal = Some((fallback_normal_tex, fallback_normal_view));
             self.fallback_bind_group = Some(fallback_bg);
         }
 
@@ -521,56 +549,120 @@ impl RenderPass for GBufferPass {
             ..Default::default()
         });
 
-        pass.set_pipeline(pipeline);
-
-        if let (Some(layout), Some(buf)) = (
-            self.camera_bind_group_layout.as_ref(),
-            ctx.buffers.get(&self.camera_buffer_id),
-        ) {
-            let camera_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        if self.camera_bind_group.is_none()
+            && let (Some(layout), Some(buf)) = (
+                self.camera_bind_group_layout.as_ref(),
+                ctx.buffers.get(&self.camera_buffer_id),
+            )
+        {
+            self.camera_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("gbuffer_camera_bg"),
                 layout,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
                     resource: buf.as_entire_binding(),
                 }],
-            });
-            pass.set_bind_group(0, &camera_bg, &[]);
+            }));
         }
 
         let meshes = world.get_entities::<Mesh>();
 
-        for mesh in meshes {
-            if let Some(tex_arc) = &mesh.albedo_texture {
-                let key = Arc::as_ptr(tex_arc) as usize;
-                if !self.texture_cache.contains_key(&key) {
-                    let (tex, view) = Self::upload_texture(device, queue, tex_arc);
-                    if let (Some(layout), Some(sampler)) = (
-                        self.texture_bind_group_layout.as_ref(),
-                        self.texture_sampler.as_ref(),
-                    ) {
-                        let bg = Self::create_texture_bind_group(device, layout, sampler, &view);
-                        self.texture_bind_groups.insert(key, bg);
-                    }
-                    self.texture_cache.insert(key, (tex, view));
+        // Upload any new textures and build missing bind groups before the render
+        // pass opens, so no resource creation happens during command recording.
+        for mesh in meshes.iter() {
+            let albedo_key = mesh.albedo_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
+            let normal_key = mesh.normal_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
+
+            if let (Some(k), Some(tex)) = (albedo_key, &mesh.albedo_texture) {
+                self.texture_cache.entry(k).or_insert_with(|| {
+                    Self::upload_texture(device, queue, tex, wgpu::TextureFormat::Rgba8UnormSrgb)
+                });
+            }
+            if let (Some(k), Some(tex)) = (normal_key, &mesh.normal_texture) {
+                self.texture_cache.entry(k).or_insert_with(|| {
+                    Self::upload_texture(device, queue, tex, wgpu::TextureFormat::Rgba8Unorm)
+                });
+            }
+
+            let bg_key = (albedo_key.unwrap_or(0), normal_key.unwrap_or(0));
+            if !self.texture_bind_groups.contains_key(&bg_key) {
+                let av = albedo_key
+                    .and_then(|k| self.texture_cache.get(&k))
+                    .map(|(_, v)| v)
+                    .or_else(|| self.fallback_albedo.as_ref().map(|(_, v)| v));
+                let nv = normal_key
+                    .and_then(|k| self.texture_cache.get(&k))
+                    .map(|(_, v)| v)
+                    .or_else(|| self.fallback_normal.as_ref().map(|(_, v)| v));
+
+                if let (Some(av), Some(nv), Some(layout), Some(sampler)) = (
+                    av,
+                    nv,
+                    self.texture_bind_group_layout.as_ref(),
+                    self.texture_sampler.as_ref(),
+                ) {
+                    let bg = Self::create_texture_bind_group(device, layout, sampler, av, nv);
+                    self.texture_bind_groups.insert(bg_key, bg);
+                }
+            }
+        }
+
+        // Upload vertex/index buffers for any new meshes before the render pass.
+        for (mesh_idx, mesh) in meshes.iter().enumerate() {
+            self.vertex_buffer_cache.entry(mesh_idx).or_insert_with(|| {
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("vertex_buffer"),
+                    usage: wgpu::BufferUsages::VERTEX,
+                    contents: mesh.get_vertex_buffer_content(),
+                })
+            });
+            self.index_buffer_cache.entry(mesh_idx).or_insert_with(|| {
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("index_buffer"),
+                    usage: wgpu::BufferUsages::INDEX,
+                    contents: mesh.get_indices_buffer_content(),
+                })
+            });
+        }
+
+        // Sort draw order by bind group key so consecutive meshes that share a
+        // material don't trigger a GPU bind group switch.
+        let mut draw_order: Vec<usize> = (0..meshes.len()).collect();
+        draw_order.sort_unstable_by_key(|&i| {
+            let m = &meshes[i];
+            let ak = m.albedo_texture.as_ref().map(|t| Arc::as_ptr(t) as usize).unwrap_or(0);
+            let nk = m.normal_texture.as_ref().map(|t| Arc::as_ptr(t) as usize).unwrap_or(0);
+            (ak, nk)
+        });
+
+        pass.set_pipeline(pipeline);
+
+        if let Some(camera_bg) = self.camera_bind_group.as_ref() {
+            pass.set_bind_group(0, camera_bg, &[]);
+        }
+
+        let mut current_bg_key: Option<(usize, usize)> = None;
+
+        for mesh_idx in draw_order {
+            let mesh = &meshes[mesh_idx];
+            let albedo_key = mesh.albedo_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
+            let normal_key = mesh.normal_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
+            let bg_key = (albedo_key.unwrap_or(0), normal_key.unwrap_or(0));
+
+            if current_bg_key != Some(bg_key) {
+                let texture_bg = self
+                    .texture_bind_groups
+                    .get(&bg_key)
+                    .or(self.fallback_bind_group.as_ref());
+
+                if let Some(bg) = texture_bg {
+                    pass.set_bind_group(1, bg, &[]);
+                    current_bg_key = Some(bg_key);
                 }
             }
 
-            let texture_bg = match &mesh.albedo_texture {
-                Some(tex_arc) => {
-                    let key = Arc::as_ptr(tex_arc) as usize;
-                    self.texture_bind_groups.get(&key)
-                }
-                None => None,
-            }
-            .or(self.fallback_bind_group.as_ref());
-
-            if let Some(bg) = texture_bg {
-                pass.set_bind_group(1, bg, &[]);
-            }
-
-            let vertex_buffer = mesh.get_vertex_buffer(device);
-            let index_buffer = mesh.get_index_buffer(device);
+            let vertex_buffer = &self.vertex_buffer_cache[&mesh_idx];
+            let index_buffer = &self.index_buffer_cache[&mesh_idx];
             let index_count = mesh.get_indices_count() as u32;
 
             pass.set_vertex_buffer(0, vertex_buffer.slice(..));

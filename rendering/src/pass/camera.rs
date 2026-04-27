@@ -1,7 +1,7 @@
 use crate::{
     camera::Camera,
     graph::{NodeId, RenderGraph},
-    pass::{PassContext, RenderPass, RenderPassDesc},
+    pass::{PassContext, Pass, PassDesc},
     resource::{BindingResource, ResourceDescriptor, ResourceId},
 };
 use engine_core::world::World;
@@ -42,7 +42,7 @@ impl CameraPass {
     }
 }
 
-impl RenderPassDesc for CameraPass {
+impl PassDesc for CameraPass {
     fn name(&self) -> &'static str {
         "camera"
     }
@@ -80,7 +80,7 @@ impl RenderPassDesc for CameraPass {
     }
 }
 
-impl RenderPass for CameraPass {
+impl Pass for CameraPass {
     fn bind_node_id(&mut self, node_id: NodeId) {
         self.node_id = Some(node_id);
     }

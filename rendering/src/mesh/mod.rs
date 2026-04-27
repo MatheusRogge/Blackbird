@@ -17,11 +17,12 @@ pub struct Vertex {
     pub normal: [f32; 3],
     pub color: [f32; 3],
     pub uv: [f32; 2],
+    pub tangent: [f32; 4],
 }
 
 impl Vertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 4] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2];
+    const ATTRIBS: [wgpu::VertexAttribute; 5] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2, 4 => Float32x4];
 
     pub fn buffer_descriptor() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -37,6 +38,7 @@ pub struct Mesh {
     pub indices: Vec<u32>,
     pub vertices: Vec<Vertex>,
     pub albedo_texture: Option<Arc<TextureAsset>>,
+    pub normal_texture: Option<Arc<TextureAsset>>,
 }
 
 impl Mesh {
@@ -44,11 +46,13 @@ impl Mesh {
         vertices: Vec<Vertex>,
         indices: Vec<u32>,
         albedo_texture: Option<Arc<TextureAsset>>,
+        normal_texture: Option<Arc<TextureAsset>>,
     ) -> Self {
         Self {
             indices,
             vertices,
             albedo_texture,
+            normal_texture,
         }
     }
 
@@ -87,10 +91,6 @@ impl Mesh {
 
 impl Entity for Mesh {}
 
-/// A snapshot of all meshes packed into a single flat batch for upload to the GPU.
-///
-/// The application populates this each frame (or whenever meshes change) and the
-/// `MeshPass` uploads it to a single vertex + index buffer, issuing one draw call.
 #[derive(Clone, Default)]
 pub struct MeshBatch {
     pub meshes: Vec<Mesh>,
@@ -103,7 +103,6 @@ impl MeshBatch {
         self.meshes.is_empty()
     }
 
-    /// Returns all vertices from all meshes concatenated in order.
     pub fn packed_vertices(&self) -> Vec<Vertex> {
         self.meshes
             .iter()
@@ -111,8 +110,6 @@ impl MeshBatch {
             .collect()
     }
 
-    /// Returns all indices with per-mesh base-vertex offsets applied, so the
-    /// entire batch can be drawn with a single `draw_indexed` call.
     pub fn packed_indices(&self) -> Vec<u32> {
         let mut out = Vec::new();
         let mut base: u32 = 0;
