@@ -15,12 +15,16 @@ use crate::{
     shader::ShaderAsset,
 };
 
+pub const NUM_CASCADES: usize = 4;
 pub const SHADOW_MAP_SIZE: u32 = 2048;
+
+const CASCADE_LAMBDA: f32 = 0.75;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct ShadowParams {
-    pub view_to_shadow: [[f32; 4]; 4],
+    pub view_to_shadow: [[[f32; 4]; 4]; NUM_CASCADES],
+    pub cascade_splits: [f32; NUM_CASCADES],
     pub bias: f32,
     pub inv_shadow_map_size: f32,
     pub _pad: [f32; 2],
@@ -35,12 +39,14 @@ pub struct ShadowPass {
     node_id: Option<NodeId>,
     shader: ShaderAsset,
     pipeline: Option<wgpu::RenderPipeline>,
+    bgl: Option<wgpu::BindGroupLayout>,
 
     shadow_map_id: ResourceId,
     shadow_params_id: ResourceId,
 
-    light_vp_buf: Option<wgpu::Buffer>,
-    bind_group: Option<wgpu::BindGroup>,
+    cascade_views: Vec<wgpu::TextureView>,
+    cascade_vp_bufs: Vec<wgpu::Buffer>,
+    cascade_bind_groups: Vec<wgpu::BindGroup>,
 
     vertex_buffer_cache: HashMap<usize, wgpu::Buffer>,
     index_buffer_cache: HashMap<usize, wgpu::Buffer>,
@@ -52,7 +58,7 @@ impl ShadowPass {
             size: wgpu::Extent3d {
                 width: SHADOW_MAP_SIZE,
                 height: SHADOW_MAP_SIZE,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: NUM_CASCADES as u32,
             },
             format: wgpu::TextureFormat::Depth32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
@@ -70,10 +76,12 @@ impl ShadowPass {
                 node_id: None,
                 shader,
                 pipeline: None,
+                bgl: None,
                 shadow_map_id,
                 shadow_params_id,
-                light_vp_buf: None,
-                bind_group: None,
+                cascade_views: Vec::new(),
+                cascade_vp_bufs: Vec::new(),
+                cascade_bind_groups: Vec::new(),
                 vertex_buffer_cache: HashMap::new(),
                 index_buffer_cache: HashMap::new(),
             },
@@ -94,54 +102,83 @@ fn ortho_rh_wgpu(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) -> Mat4 {
     )
 }
 
-fn shadow_vp_stable(camera: &Camera, light_view: &Mat4, shadow_distance: f32) -> Mat4 {
-    let near = camera.near;
-    let far = shadow_distance.min(camera.far);
+/// Builds a stable light-space VP matrix for one cascade slice.
+///
+/// Uses a bounding sphere (not an AABB) to fix the XY extents so the ortho
+/// projection size is rotation-invariant — the camera rotating no longer changes
+/// the projection bounds, eliminating the warping artefact. The sphere centre is
+/// then snapped to the nearest shadow texel so the grid only shifts by whole-
+/// texel steps during camera translation.
+fn cascade_vp(camera: &Camera, light_view: &Mat4, near_z: f32, far_z: f32) -> Mat4 {
     let th = (camera.fovy * 0.5).tan();
-    let nh = near * th;
+    let nh = near_z * th;
     let nw = nh * camera.aspect;
-    let fh = far * th;
+    let fh = far_z * th;
     let fw = fh * camera.aspect;
 
     let corners_vs = [
-        Vec3::new(-nw, -nh, -near), Vec3::new( nw, -nh, -near),
-        Vec3::new(-nw,  nh, -near), Vec3::new( nw,  nh, -near),
-        Vec3::new(-fw, -fh, -far),  Vec3::new( fw, -fh, -far),
-        Vec3::new(-fw,  fh, -far),  Vec3::new( fw,  fh, -far),
+        Vec3::new(-nw, -nh, -near_z), Vec3::new( nw, -nh, -near_z),
+        Vec3::new(-nw,  nh, -near_z), Vec3::new( nw,  nh, -near_z),
+        Vec3::new(-fw, -fh, -far_z),  Vec3::new( fw, -fh, -far_z),
+        Vec3::new(-fw,  fh, -far_z),  Vec3::new( fw,  fh, -far_z),
     ];
 
     let inv_cam_view = camera.view_matrix().inversed();
 
-    let mut min_x = f32::MAX; let mut max_x = f32::MIN;
-    let mut min_y = f32::MAX; let mut max_y = f32::MIN;
-    let mut min_z = f32::MAX; let mut max_z = f32::MIN;
-
-    for c in &corners_vs {
-        let world = inv_cam_view * Vec4::new(c.x, c.y, c.z, 1.0);
-        let ls    = *light_view  * Vec4::new(world.x, world.y, world.z, 1.0);
-        min_x = min_x.min(ls.x); max_x = max_x.max(ls.x);
-        min_y = min_y.min(ls.y); max_y = max_y.max(ls.y);
-        min_z = min_z.min(ls.z); max_z = max_z.max(ls.z);
+    // Convert corners to world space.
+    let mut corners_ws = [Vec3::zero(); 8];
+    let mut center_ws  = Vec3::zero();
+    for (i, c) in corners_vs.iter().enumerate() {
+        let w4 = inv_cam_view * Vec4::new(c.x, c.y, c.z, 1.0);
+        corners_ws[i] = Vec3::new(w4.x, w4.y, w4.z);
+        center_ws += corners_ws[i];
     }
+    center_ws /= 8.0;
 
-    let ortho_near = (-max_z - shadow_distance * 0.5).max(0.1);
+    // Bounding sphere radius — constant for a given (near_z, far_z, fov, aspect)
+    // regardless of camera orientation, so the XY projection bounds never change
+    // size as the camera rotates.
+    let radius = corners_ws
+        .iter()
+        .map(|c| (*c - center_ws).mag())
+        .fold(0f32, f32::max);
+
+    // Project sphere centre into light space and snap to whole-texel steps.
+    let c_ls = *light_view * Vec4::new(center_ws.x, center_ws.y, center_ws.z, 1.0);
+    let texel = 2.0 * radius / SHADOW_MAP_SIZE as f32;
+    let sx = (c_ls.x / texel).round() * texel;
+    let sy = (c_ls.y / texel).round() * texel;
+
+    // Fixed square XY ortho bounds around the snapped centre.
+    let l = sx - radius;
+    let r = sx + radius;
+    let b = sy - radius;
+    let t = sy + radius;
+
+    // Z range from actual corners; extend backwards to capture casters outside the slice.
+    let mut min_z = f32::MAX;
+    let mut max_z = f32::MIN;
+    for c in &corners_ws {
+        let ls = *light_view * Vec4::new(c.x, c.y, c.z, 1.0);
+        min_z = min_z.min(ls.z);
+        max_z = max_z.max(ls.z);
+    }
+    let ortho_near = (-max_z - far_z * 0.5).max(0.1);
     let ortho_far  = -min_z + 10.0;
 
-    let l = min_x;
-    let r = max_x;
-    let b = min_y;
-    let t = max_y;
-    let mut vp = ortho_rh_wgpu(l, r, b, t, ortho_near, ortho_far) * *light_view;
+    ortho_rh_wgpu(l, r, b, t, ortho_near, ortho_far) * *light_view
+}
 
-    // The AABB bounds (l,r,b,t) are constant for pure camera translation so
-    // snapping them does nothing. What moves is the combined VP translation
-    // column. Snap it to the nearest shadow-texel in NDC space so the shadow
-    // grid only moves in whole-texel steps for every direction of movement.
-    let half = SHADOW_MAP_SIZE as f32 * 0.5; // texels per NDC unit
-    vp.cols[3].x = (vp.cols[3].x * half).round() / half;
-    vp.cols[3].y = (vp.cols[3].y * half).round() / half;
-
-    vp
+/// PSSM split scheme blending logarithmic and uniform distributions.
+fn compute_cascade_splits(near: f32, far: f32) -> [f32; NUM_CASCADES] {
+    let mut splits = [0f32; NUM_CASCADES];
+    for i in 0..NUM_CASCADES {
+        let t = (i + 1) as f32 / NUM_CASCADES as f32;
+        let log = near * (far / near).powf(t);
+        let uni = near + (far - near) * t;
+        splits[i] = CASCADE_LAMBDA * log + (1.0 - CASCADE_LAMBDA) * uni;
+    }
+    splits
 }
 
 impl PassDesc for ShadowPass {
@@ -174,9 +211,6 @@ impl Pass for ShadowPass {
         let Some(&params_buf) = ctx.buffers.get(&self.shadow_params_id) else {
             return;
         };
-        let Some(&shadow_view) = ctx.views.get(&self.shadow_map_id) else {
-            return;
-        };
 
         let cameras = world.get_entities::<Camera>();
         let Some(camera) = cameras.first() else {
@@ -194,24 +228,12 @@ impl Pass for ShadowPass {
         } else {
             Vec3::unit_y()
         };
-        // Place the light far behind the camera so all scene geometry (including
-        // overhead casters) sits in front of the light's near plane.
         let light_push = camera.far;
         let light_view = Mat4::look_at(camera.eye - dir * light_push, camera.eye, up);
-        let shadow_distance = camera.far * 0.5;
-        let light_vp = shadow_vp_stable(camera, &light_view, shadow_distance);
 
-        let view_to_shadow = light_vp * camera.view_matrix().inversed();
-        let cols = view_to_shadow.cols;
-        let params = ShadowParams {
-            view_to_shadow: [cols[0].into(), cols[1].into(), cols[2].into(), cols[3].into()],
-            bias: 0.002,
-            inv_shadow_map_size: 1.0 / SHADOW_MAP_SIZE as f32,
-            _pad: [0.0; 2],
-        };
-        queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
+        let splits = compute_cascade_splits(camera.near, camera.far);
 
-        // Lazy pipeline + light VP buffer init
+        // Lazy init: pipeline + per-cascade buffers + per-layer views.
         if self.pipeline.is_none() {
             let module = self.shader.compile(device).expect("shadow shader compile failed");
 
@@ -261,38 +283,49 @@ impl Pass for ShadowPass {
                 cache: None,
             });
 
-            let light_vp_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("shadow_light_vp_buf"),
-                size: std::mem::size_of::<[[f32; 4]; 4]>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            for i in 0..NUM_CASCADES {
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("shadow_vp_cascade{i}")),
+                    size: std::mem::size_of::<[[f32; 4]; 4]>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("shadow_bg_cascade{i}")),
+                    layout: &bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buf.as_entire_binding(),
+                    }],
+                });
+                self.cascade_vp_bufs.push(buf);
+                self.cascade_bind_groups.push(bg);
+            }
 
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("shadow_bg"),
-                layout: &bgl,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: light_vp_buf.as_entire_binding(),
-                }],
-            });
-
+            self.bgl = Some(bgl);
             self.pipeline = Some(pipeline);
-            self.light_vp_buf = Some(light_vp_buf);
-            self.bind_group = Some(bg);
         }
 
-        let light_vp_cols = light_vp.cols;
-        let light_vp_raw: [[f32; 4]; 4] = [
-            light_vp_cols[0].into(),
-            light_vp_cols[1].into(),
-            light_vp_cols[2].into(),
-            light_vp_cols[3].into(),
-        ];
-        if let Some(buf) = &self.light_vp_buf {
-            queue.write_buffer(buf, 0, bytemuck::bytes_of(&light_vp_raw));
+        // Create per-layer render attachment views once, from the graph-allocated texture.
+        if self.cascade_views.is_empty() {
+            if let Some(&tex) = ctx.textures.get(&self.shadow_map_id) {
+                for i in 0..NUM_CASCADES {
+                    let view = tex.create_view(&wgpu::TextureViewDescriptor {
+                        dimension: Some(wgpu::TextureViewDimension::D2),
+                        base_array_layer: i as u32,
+                        array_layer_count: Some(1),
+                        ..Default::default()
+                    });
+                    self.cascade_views.push(view);
+                }
+            }
         }
 
+        if self.cascade_views.is_empty() {
+            return;
+        }
+
+        // Upload mesh buffers once.
         let meshes = world.get_entities::<Mesh>();
         for (mesh_idx, mesh) in meshes.iter().enumerate() {
             self.vertex_buffer_cache.entry(mesh_idx).or_insert_with(|| {
@@ -312,35 +345,64 @@ impl Pass for ShadowPass {
         }
 
         let pipeline = self.pipeline.as_ref().unwrap();
-        let bg = self.bind_group.as_ref().unwrap();
+        let inv_cam_view = camera.view_matrix().inversed();
 
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("shadow"),
-            color_attachments: &[],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: shadow_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
+        let mut view_to_shadow_raw = [[[0f32; 4]; 4]; NUM_CASCADES];
+
+        for i in 0..NUM_CASCADES {
+            let near_z = if i == 0 { camera.near } else { splits[i - 1] };
+            let far_z  = splits[i];
+            let light_vp = cascade_vp(camera, &light_view, near_z, far_z);
+
+            let v2s = light_vp * inv_cam_view;
+            let cols = v2s.cols;
+            view_to_shadow_raw[i] = [cols[0].into(), cols[1].into(), cols[2].into(), cols[3].into()];
+
+            let lp_cols = light_vp.cols;
+            let vp_raw: [[f32; 4]; 4] = [
+                lp_cols[0].into(), lp_cols[1].into(), lp_cols[2].into(), lp_cols[3].into(),
+            ];
+            queue.write_buffer(&self.cascade_vp_bufs[i], 0, bytemuck::bytes_of(&vp_raw));
+
+            let layer_view = &self.cascade_views[i];
+            let bg = &self.cascade_bind_groups[i];
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(&format!("shadow_cascade{i}")),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: layer_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
                 }),
-                stencil_ops: None,
-            }),
-            ..Default::default()
-        });
+                ..Default::default()
+            });
 
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, bg, &[]);
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bg, &[]);
 
-        for mesh_idx in 0..meshes.len() {
-            if let (Some(vb), Some(ib)) = (
-                self.vertex_buffer_cache.get(&mesh_idx),
-                self.index_buffer_cache.get(&mesh_idx),
-            ) {
-                let mesh = &meshes[mesh_idx];
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.get_indices_count() as u32, 0, 0..1);
+            for mesh_idx in 0..meshes.len() {
+                if let (Some(vb), Some(ib)) = (
+                    self.vertex_buffer_cache.get(&mesh_idx),
+                    self.index_buffer_cache.get(&mesh_idx),
+                ) {
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..meshes[mesh_idx].get_indices_count() as u32, 0, 0..1);
+                }
             }
         }
+
+        let params = ShadowParams {
+            view_to_shadow: view_to_shadow_raw,
+            cascade_splits: splits,
+            bias: 0.002,
+            inv_shadow_map_size: 1.0 / SHADOW_MAP_SIZE as f32,
+            _pad: [0.0; 2],
+        };
+        queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
     }
 }

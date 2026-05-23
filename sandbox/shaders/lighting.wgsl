@@ -162,15 +162,23 @@ struct GpuSkyLight {
 
 // Shadow
 struct ShadowParams {
-    view_to_shadow: mat4x4<f32>,
+    view_to_shadow: array<mat4x4<f32>, 4>,
+    cascade_splits: vec4<f32>,
     bias: f32,
     inv_shadow_map_size: f32,
     _pad: vec2<f32>,
 }
 
 @group(2) @binding(0) var<uniform> sp:       ShadowParams;
-@group(2) @binding(1) var          t_shadow: texture_depth_2d;
+@group(2) @binding(1) var          t_shadow: texture_depth_2d_array;
 @group(2) @binding(2) var          s_shadow: sampler_comparison;
+
+fn select_cascade(depth_vs: f32) -> u32 {
+    if depth_vs < sp.cascade_splits.x { return 0u; }
+    if depth_vs < sp.cascade_splits.y { return 1u; }
+    if depth_vs < sp.cascade_splits.z { return 2u; }
+    return 3u;
+}
 
 const CLUSTER_X: u32 = 16u;
 const CLUSTER_Y: u32 = 9u;
@@ -287,11 +295,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let L = normalize((camera.inv_view * vec4f(-sky.direction_vs, 0.0)).xyz);
         let diff = max(dot(N, L), 0.0);
 
-        // Project fragment to shadow clip space
-        let shadow_clip  = sp.view_to_shadow * vec4<f32>(pos_vs, 1.0);
-        let shadow_ndc   = shadow_clip.xyz / shadow_clip.w;
-        let shadow_uv    = shadow_ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
-        let ref_depth    = shadow_ndc.z - sp.bias;
+        // Select cascade based on view-space depth and project into shadow space.
+        let cascade     = select_cascade(depth_vs);
+        let shadow_clip = sp.view_to_shadow[cascade] * vec4<f32>(pos_vs, 1.0);
+        let shadow_ndc  = shadow_clip.xyz / shadow_clip.w;
+        let shadow_uv   = shadow_ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+        let ref_depth   = shadow_ndc.z - sp.bias;
 
         var lit = 1.0;
         if (shadow_uv.x >= 0.0 && shadow_uv.x <= 1.0 &&
@@ -301,7 +310,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             for (var sy: i32 = -1; sy <= 1; sy += 1) {
                 for (var sx: i32 = -1; sx <= 1; sx += 1) {
                     let off = vec2<f32>(f32(sx), f32(sy)) * sp.inv_shadow_map_size;
-                    shadow_sum += textureSampleCompare(t_shadow, s_shadow, shadow_uv + off, ref_depth);
+                    shadow_sum += textureSampleCompare(
+                        t_shadow, s_shadow, shadow_uv + off, i32(cascade), ref_depth,
+                    );
                 }
             }
             lit = shadow_sum / 9.0;

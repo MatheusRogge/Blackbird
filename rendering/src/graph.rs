@@ -377,6 +377,7 @@ impl RenderGraph {
             let writes = self.ctx.passes[&node_id].writes();
 
             let mut views: HashMap<ResourceId, &wgpu::TextureView> = HashMap::new();
+            let mut textures: HashMap<ResourceId, &wgpu::Texture> = HashMap::new();
             let mut buffers: HashMap<ResourceId, &wgpu::Buffer> = HashMap::new();
 
             for id in reads.iter().chain(writes.iter()) {
@@ -385,8 +386,9 @@ impl RenderGraph {
                     continue;
                 }
                 match self.ctx.resources.get(id).and_then(|r| r.resource.as_ref()) {
-                    Some(AllocatedResource::Texture(_, view)) => {
+                    Some(AllocatedResource::Texture(tex, view)) => {
                         views.insert(*id, view);
+                        textures.insert(*id, tex);
                     }
                     Some(AllocatedResource::ExternalView(view)) => {
                         views.insert(*id, view);
@@ -417,6 +419,7 @@ impl RenderGraph {
 
             let ctx = PassContext {
                 views,
+                textures,
                 buffers,
                 bind_group,
                 upstream,

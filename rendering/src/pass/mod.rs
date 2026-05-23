@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 pub struct PassContext<'a> {
     pub views: HashMap<ResourceId, &'a wgpu::TextureView>,
+    pub textures: HashMap<ResourceId, &'a wgpu::Texture>,
     pub buffers: HashMap<ResourceId, &'a wgpu::Buffer>,
     pub bind_group: Option<&'a wgpu::BindGroup>,
     pub upstream: HashMap<NodeId, &'a wgpu::BindGroup>,
