@@ -1,9 +1,14 @@
+pub mod bvh_upload;
 pub mod camera;
 pub mod cluster_assignment;
 pub mod gbuffer;
 pub mod light_upload;
 pub mod lighting;
 pub mod present;
+pub mod probe_atlas;
+pub mod probe_trace;
+pub mod probe_update;
+pub mod shadow;
 
 use crate::{
     graph::NodeId,

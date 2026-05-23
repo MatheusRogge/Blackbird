@@ -1,8 +1,17 @@
 use crate::{
     graph::RenderGraph,
     pass::{
-        camera::CameraPass, cluster_assignment::ClusterAssignmentPass, gbuffer::GBufferPass,
-        light_upload::LightUploadPass, lighting::LightingPass, present::PresentPass,
+        bvh_upload::BvhUploadPass,
+        camera::CameraPass,
+        cluster_assignment::ClusterAssignmentPass,
+        gbuffer::GBufferPass,
+        light_upload::LightUploadPass,
+        lighting::LightingPass,
+        present::PresentPass,
+        probe_atlas::{ProbeAtlasPass, ProbeGridConfig},
+        probe_trace::ProbeTracePass,
+        probe_update::ProbeUpdatePass,
+        shadow::ShadowPass,
     },
     renderer::RenderGraphBuilder,
     resource::ResourceId,
@@ -10,24 +19,33 @@ use crate::{
 };
 
 pub struct RenderGraphPBRBuilder {
-    gbuffer_shader: ShaderAsset,
-    cluster_shader: ShaderAsset,
-    lighting_shader: ShaderAsset,
-    present_shader: ShaderAsset,
+    gbuffer_shader:     ShaderAsset,
+    cluster_shader:     ShaderAsset,
+    lighting_shader:    ShaderAsset,
+    present_shader:     ShaderAsset,
+    shadow_shader:      ShaderAsset,
+    probe_trace_shader: ShaderAsset,
+    probe_update_shader: ShaderAsset,
 }
 
 impl RenderGraphPBRBuilder {
     pub fn new(
-        gbuffer_shader: ShaderAsset,
-        cluster_shader: ShaderAsset,
-        lighting_shader: ShaderAsset,
-        present_shader: ShaderAsset,
+        gbuffer_shader:      ShaderAsset,
+        cluster_shader:      ShaderAsset,
+        lighting_shader:     ShaderAsset,
+        present_shader:      ShaderAsset,
+        shadow_shader:       ShaderAsset,
+        probe_trace_shader:  ShaderAsset,
+        probe_update_shader: ShaderAsset,
     ) -> Self {
         Self {
             gbuffer_shader,
             cluster_shader,
             lighting_shader,
             present_shader,
+            shadow_shader,
+            probe_trace_shader,
+            probe_update_shader,
         }
     }
 }
@@ -48,6 +66,33 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         let (light_upload_pass, light_buffers) = LightUploadPass::new(&mut graph);
         graph.add_pass(device, light_upload_pass);
 
+        let (bvh_pass, bvh_outputs) = BvhUploadPass::new(&mut graph);
+        graph.add_pass(device, bvh_pass);
+
+        let (probe_atlas_pass, probe_atlas_outputs) =
+            ProbeAtlasPass::new(&mut graph, ProbeGridConfig::default());
+        graph.add_pass(device, probe_atlas_pass);
+
+        let (probe_trace_pass, probe_trace_outputs) = ProbeTracePass::new(
+            &mut graph,
+            &bvh_outputs,
+            &probe_atlas_outputs,
+            &light_buffers,
+            self.probe_trace_shader,
+        );
+        graph.add_pass(device, probe_trace_pass);
+
+        let probe_update_pass = ProbeUpdatePass::new(
+            &mut graph,
+            &probe_atlas_outputs,
+            &probe_trace_outputs,
+            self.probe_update_shader,
+        );
+        graph.add_pass(device, probe_update_pass);
+
+        let (shadow_pass, shadow_outputs) = ShadowPass::new(&mut graph, self.shadow_shader);
+        graph.add_pass(device, shadow_pass);
+
         let (gbuffer_pass, gbuffer_outputs) = GBufferPass::new(
             &mut graph,
             camera_node_id,
@@ -66,6 +111,9 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             &gbuffer_outputs,
             &cluster_outputs,
             &light_buffers,
+            &shadow_outputs,
+            &probe_atlas_outputs,
+            camera_buffer_id,
             surface_config,
             self.lighting_shader,
         );

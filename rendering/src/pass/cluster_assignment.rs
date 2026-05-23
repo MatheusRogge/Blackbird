@@ -4,7 +4,7 @@ use engine_core::world::World;
 use crate::{
     camera::Camera,
     graph::{NodeId, RenderGraph},
-    light::{MAX_POINT_LIGHTS, PointLight},
+    light::{MAX_POINT_LIGHTS, MAX_SKY_LIGHTS, PointLight, SkyLight},
     pass::light_upload::LightBuffers,
     pass::{Pass, PassContext, PassDesc},
     resource::{ResourceDescriptor, ResourceId},
@@ -35,7 +35,10 @@ pub struct ClusterParams {
     pub screen_w: f32,
     pub screen_h: f32,
     pub debug_mode: u32,
-    pub _pad: u32,
+    pub num_sky_lights: u32,
+    // Inverse camera view matrix for world-position reconstruction in lighting.
+    // mat4x4<f32> needs 16-byte alignment; offset 48 is already 16-byte aligned.
+    pub inv_view: [[f32; 4]; 4],
 }
 
 pub struct ClusterOutputs {
@@ -147,6 +150,20 @@ impl Pass for ClusterAssignmentPass {
             .len()
             .min(MAX_POINT_LIGHTS) as u32;
 
+        let num_sky_lights = world
+            .get_entities::<SkyLight>()
+            .len()
+            .min(MAX_SKY_LIGHTS) as u32;
+
+        let inv_view = camera.view_matrix().inversed();
+        let c = inv_view.cols;
+        let inv_view_arr = [
+            [c[0].x, c[0].y, c[0].z, c[0].w],
+            [c[1].x, c[1].y, c[1].z, c[1].w],
+            [c[2].x, c[2].y, c[2].z, c[2].w],
+            [c[3].x, c[3].y, c[3].z, c[3].w],
+        ];
+
         let params = ClusterParams {
             tile_w: w / CLUSTER_X as f32,
             tile_h: h / CLUSTER_Y as f32,
@@ -159,7 +176,8 @@ impl Pass for ClusterAssignmentPass {
             screen_w: w,
             screen_h: h,
             debug_mode: 0,
-            _pad: 0,
+            num_sky_lights,
+            inv_view: inv_view_arr,
         };
 
         let Some(&params_buf) = ctx.buffers.get(&self.cluster_params_id) else {

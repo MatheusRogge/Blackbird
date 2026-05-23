@@ -1,3 +1,4 @@
+pub mod bvh;
 pub mod cache;
 pub mod camera;
 pub mod camera_controller;

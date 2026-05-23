@@ -31,3 +31,11 @@ pub struct AreaLight {
 }
 
 impl Entity for AreaLight {}
+
+pub struct SkyLight {
+    pub direction: Vec3, // direction light travels (toward ground), need not be normalised
+    pub color: Vec3,
+    pub intensity: f32,
+}
+
+impl Entity for SkyLight {}

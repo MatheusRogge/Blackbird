@@ -496,6 +496,30 @@ impl RenderGraph {
                 format,
                 usage,
             } => make_texture(*size, *format, *usage),
+            ResourceDescriptor::FixedTexture { size, format, usage } => {
+                make_texture(*size, *format, *usage)
+            }
+            ResourceDescriptor::Fixed3DTexture { size, format, usage } => {
+                let tex = device.create_texture(&wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d {
+                        width: size[0],
+                        height: size[1],
+                        depth_or_array_layers: size[2],
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D3,
+                    format: *format,
+                    usage: *usage,
+                    view_formats: &[],
+                });
+                let view = tex.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D3),
+                    ..Default::default()
+                });
+                AllocatedResource::Texture(tex, view)
+            }
             ResourceDescriptor::ScreenTexture { format, usage } => {
                 let size = wgpu::Extent3d {
                     width: sw,

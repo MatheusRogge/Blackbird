@@ -35,9 +35,18 @@ pub struct GpuAreaLight {
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuSkyLight {
+    pub direction_vs: [f32; 3],
+    pub intensity: f32,
+    pub color: [f32; 3],
+    pub _pad: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct LightCounts {
     pub num_point: u32,
     pub num_spot: u32,
     pub num_area: u32,
-    pub _pad: u32,
+    pub num_sky: u32,
 }

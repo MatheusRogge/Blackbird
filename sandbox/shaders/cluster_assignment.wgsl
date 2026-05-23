@@ -10,7 +10,7 @@ struct ClusterParams {
     screen_w: f32,
     screen_h: f32,
     debug_mode: u32,
-    _pad: u32,
+    num_sky_lights: u32,
 }
 
 struct GpuPointLight {

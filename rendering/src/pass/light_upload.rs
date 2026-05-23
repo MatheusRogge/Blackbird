@@ -7,8 +7,9 @@ use crate::{
     camera::Camera,
     graph::{NodeId, RenderGraph},
     light::{
-        AreaLight, GpuAreaLight, GpuPointLight, GpuSpotLight, LightCounts, MAX_AREA_LIGHTS,
-        MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, PointLight, SpotLight,
+        AreaLight, GpuAreaLight, GpuPointLight, GpuSkyLight, GpuSpotLight, LightCounts,
+        MAX_AREA_LIGHTS, MAX_POINT_LIGHTS, MAX_SKY_LIGHTS, MAX_SPOT_LIGHTS, PointLight, SkyLight,
+        SpotLight,
     },
     pass::{PassContext, Pass, PassDesc},
     resource::{ResourceDescriptor, ResourceId},
@@ -18,6 +19,7 @@ pub struct LightBuffers {
     pub point_buffer_id: ResourceId,
     pub spot_buffer_id: ResourceId,
     pub area_buffer_id: ResourceId,
+    pub sky_buffer_id: ResourceId,
     pub counts_buffer_id: ResourceId,
 }
 
@@ -43,6 +45,11 @@ impl LightUploadPass {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        let sky_buffer_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
+            size: (MAX_SKY_LIGHTS * size_of::<GpuSkyLight>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         let counts_buffer_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
             size: size_of::<LightCounts>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -52,6 +59,7 @@ impl LightUploadPass {
             point_buffer_id,
             spot_buffer_id,
             area_buffer_id,
+            sky_buffer_id,
             counts_buffer_id,
         };
 
@@ -61,6 +69,7 @@ impl LightUploadPass {
                 point_buffer_id,
                 spot_buffer_id,
                 area_buffer_id,
+                sky_buffer_id,
                 counts_buffer_id,
             },
         };
@@ -83,6 +92,7 @@ impl PassDesc for LightUploadPass {
             self.buffers.point_buffer_id,
             self.buffers.spot_buffer_id,
             self.buffers.area_buffer_id,
+            self.buffers.sky_buffer_id,
             self.buffers.counts_buffer_id,
         ]
     }
@@ -161,11 +171,23 @@ impl Pass for LightUploadPass {
             })
             .collect();
 
+        let sky_lights: Vec<GpuSkyLight> = world
+            .get_entities::<SkyLight>()
+            .iter()
+            .take(MAX_SKY_LIGHTS)
+            .map(|l| GpuSkyLight {
+                direction_vs: dir_to_vs(l.direction.normalized()),
+                intensity: l.intensity,
+                color: l.color.into(),
+                _pad: 0.0,
+            })
+            .collect();
+
         let counts = LightCounts {
             num_point: point_lights.len() as u32,
             num_spot: spot_lights.len() as u32,
             num_area: area_lights.len() as u32,
-            _pad: 0,
+            num_sky: sky_lights.len() as u32,
         };
 
         if !point_lights.is_empty() {
@@ -189,6 +211,14 @@ impl Pass for LightUploadPass {
                 ctx.buffers[&self.buffers.area_buffer_id],
                 0,
                 bytemuck::cast_slice(&area_lights),
+            );
+        }
+
+        if !sky_lights.is_empty() {
+            queue.write_buffer(
+                ctx.buffers[&self.buffers.sky_buffer_id],
+                0,
+                bytemuck::cast_slice(&sky_lights),
             );
         }
 

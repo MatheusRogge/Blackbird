@@ -10,12 +10,16 @@ use engine_core::world::World;
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     pub view_proj: [[f32; 4]; 4],
+    pub inv_view_proj: [[f32; 4]; 4],
+    pub inv_view: [[f32; 4]; 4],
 }
 
 impl CameraUniform {
     pub fn from_camera(camera: &Camera) -> Self {
         Self {
             view_proj: camera.view_proj_matrix().into(),
+            inv_view_proj: camera.view_proj_matrix().inversed().into(),
+            inv_view: camera.view_matrix().inversed().into(),
         }
     }
 }

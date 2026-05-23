@@ -21,7 +21,17 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
     return out;
 }
 
+fn aces(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(t_color, s_color, in.uv);
+    let hdr = textureSample(t_color, s_color, in.uv).rgb;
+    return vec4<f32>(aces(hdr), 1.0);
 }

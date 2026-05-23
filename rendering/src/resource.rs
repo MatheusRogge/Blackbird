@@ -19,6 +19,18 @@ pub enum ResourceDescriptor {
         usage: wgpu::TextureUsages,
         format: wgpu::TextureFormat,
     },
+    /// Fixed-size texture that is never resized with the screen.
+    FixedTexture {
+        size: wgpu::Extent3d,
+        usage: wgpu::TextureUsages,
+        format: wgpu::TextureFormat,
+    },
+    /// Fixed-size 3D texture that is never resized.
+    Fixed3DTexture {
+        size: [u32; 3],
+        format: wgpu::TextureFormat,
+        usage: wgpu::TextureUsages,
+    },
     ExternalView,
 }
 
