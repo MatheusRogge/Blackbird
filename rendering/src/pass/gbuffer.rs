@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 use wgpu::util::DeviceExt;
 
-use engine_core::world::World;
+use engine_core::{entity::EntityKey, world::World};
 
 use crate::{
     graph::{NodeId, RenderGraph},
@@ -34,10 +34,8 @@ pub struct GBufferPass {
     fallback_normal: Option<(wgpu::Texture, wgpu::TextureView)>,
     fallback_bind_group: Option<wgpu::BindGroup>,
     camera_bind_group: Option<wgpu::BindGroup>,
-    // Vertex/index buffers keyed by mesh index. Meshes are only ever appended,
-    // so indices are stable and each buffer is uploaded exactly once.
-    vertex_buffer_cache: HashMap<usize, wgpu::Buffer>,
-    index_buffer_cache: HashMap<usize, wgpu::Buffer>,
+    vertex_buffer_cache: HashMap<EntityKey, wgpu::Buffer>,
+    index_buffer_cache: HashMap<EntityKey, wgpu::Buffer>,
 
     camera_buffer_id: ResourceId,
     albedo_id: ResourceId,
@@ -565,11 +563,12 @@ impl Pass for GBufferPass {
             }));
         }
 
-        let meshes = world.get_entities::<Mesh>();
+        let meshes = world.get_entity_handles::<Mesh>();
 
         // Upload any new textures and build missing bind groups before the render
         // pass opens, so no resource creation happens during command recording.
-        for mesh in meshes.iter() {
+        for handle in meshes.iter() {
+            let mesh = handle.entity;
             let albedo_key = mesh.albedo_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
             let normal_key = mesh.normal_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
 
@@ -608,15 +607,16 @@ impl Pass for GBufferPass {
         }
 
         // Upload vertex/index buffers for any new meshes before the render pass.
-        for (mesh_idx, mesh) in meshes.iter().enumerate() {
-            self.vertex_buffer_cache.entry(mesh_idx).or_insert_with(|| {
+        for handle in meshes.iter() {
+            let mesh = handle.entity;
+            self.vertex_buffer_cache.entry(handle.id).or_insert_with(|| {
                 device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("vertex_buffer"),
                     usage: wgpu::BufferUsages::VERTEX,
                     contents: mesh.get_vertex_buffer_content(),
                 })
             });
-            self.index_buffer_cache.entry(mesh_idx).or_insert_with(|| {
+            self.index_buffer_cache.entry(handle.id).or_insert_with(|| {
                 device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("index_buffer"),
                     usage: wgpu::BufferUsages::INDEX,
@@ -629,7 +629,7 @@ impl Pass for GBufferPass {
         // material don't trigger a GPU bind group switch.
         let mut draw_order: Vec<usize> = (0..meshes.len()).collect();
         draw_order.sort_unstable_by_key(|&i| {
-            let m = &meshes[i];
+            let m = meshes[i].entity;
             let ak = m.albedo_texture.as_ref().map(|t| Arc::as_ptr(t) as usize).unwrap_or(0);
             let nk = m.normal_texture.as_ref().map(|t| Arc::as_ptr(t) as usize).unwrap_or(0);
             (ak, nk)
@@ -643,8 +643,9 @@ impl Pass for GBufferPass {
 
         let mut current_bg_key: Option<(usize, usize)> = None;
 
-        for mesh_idx in draw_order {
-            let mesh = &meshes[mesh_idx];
+        for i in draw_order {
+            let handle = &meshes[i];
+            let mesh = handle.entity;
             let albedo_key = mesh.albedo_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
             let normal_key = mesh.normal_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
             let bg_key = (albedo_key.unwrap_or(0), normal_key.unwrap_or(0));
@@ -661,8 +662,8 @@ impl Pass for GBufferPass {
                 }
             }
 
-            let vertex_buffer = &self.vertex_buffer_cache[&mesh_idx];
-            let index_buffer = &self.index_buffer_cache[&mesh_idx];
+            let vertex_buffer = &self.vertex_buffer_cache[&handle.id];
+            let index_buffer = &self.index_buffer_cache[&handle.id];
             let index_count = mesh.get_indices_count() as u32;
 
             pass.set_vertex_buffer(0, vertex_buffer.slice(..));

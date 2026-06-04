@@ -30,9 +30,9 @@ impl From<GLTFAssetError> for AssetError {
 }
 
 pub struct GLTFAsset {
-    pub(crate) document: gltf::Document,
-    pub(crate) buffers: Vec<gltf::buffer::Data>,
-    pub(crate) images: Vec<gltf::image::Data>,
+    pub document: gltf::Document,
+    pub buffers: Vec<gltf::buffer::Data>,
+    pub images: Vec<gltf::image::Data>,
 }
 
 impl Asset for GLTFAsset {}

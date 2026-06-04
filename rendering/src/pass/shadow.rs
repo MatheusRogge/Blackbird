@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
-use engine_core::world::World;
+use engine_core::{entity::EntityKey, world::World};
 use ultraviolet::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 
@@ -48,8 +48,8 @@ pub struct ShadowPass {
     cascade_vp_bufs: Vec<wgpu::Buffer>,
     cascade_bind_groups: Vec<wgpu::BindGroup>,
 
-    vertex_buffer_cache: HashMap<usize, wgpu::Buffer>,
-    index_buffer_cache: HashMap<usize, wgpu::Buffer>,
+    vertex_buffer_cache: HashMap<EntityKey, wgpu::Buffer>,
+    index_buffer_cache: HashMap<EntityKey, wgpu::Buffer>,
 }
 
 impl ShadowPass {
@@ -172,11 +172,11 @@ fn cascade_vp(camera: &Camera, light_view: &Mat4, near_z: f32, far_z: f32) -> Ma
 /// PSSM split scheme blending logarithmic and uniform distributions.
 fn compute_cascade_splits(near: f32, far: f32) -> [f32; NUM_CASCADES] {
     let mut splits = [0f32; NUM_CASCADES];
-    for i in 0..NUM_CASCADES {
+    for (i, split) in splits.iter_mut().enumerate() {
         let t = (i + 1) as f32 / NUM_CASCADES as f32;
         let log = near * (far / near).powf(t);
         let uni = near + (far - near) * t;
-        splits[i] = CASCADE_LAMBDA * log + (1.0 - CASCADE_LAMBDA) * uni;
+        *split = CASCADE_LAMBDA * log + (1.0 - CASCADE_LAMBDA) * uni;
     }
     splits
 }
@@ -307,17 +307,17 @@ impl Pass for ShadowPass {
         }
 
         // Create per-layer render attachment views once, from the graph-allocated texture.
-        if self.cascade_views.is_empty() {
-            if let Some(&tex) = ctx.textures.get(&self.shadow_map_id) {
-                for i in 0..NUM_CASCADES {
-                    let view = tex.create_view(&wgpu::TextureViewDescriptor {
-                        dimension: Some(wgpu::TextureViewDimension::D2),
-                        base_array_layer: i as u32,
-                        array_layer_count: Some(1),
-                        ..Default::default()
-                    });
-                    self.cascade_views.push(view);
-                }
+        if self.cascade_views.is_empty()
+            && let Some(&tex) = ctx.textures.get(&self.shadow_map_id)
+        {
+            for i in 0..NUM_CASCADES {
+                let view = tex.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: i as u32,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                });
+                self.cascade_views.push(view);
             }
         }
 
@@ -326,16 +326,17 @@ impl Pass for ShadowPass {
         }
 
         // Upload mesh buffers once.
-        let meshes = world.get_entities::<Mesh>();
-        for (mesh_idx, mesh) in meshes.iter().enumerate() {
-            self.vertex_buffer_cache.entry(mesh_idx).or_insert_with(|| {
+        let meshes = world.get_entity_handles::<Mesh>();
+        for handle in meshes.iter() {
+            let mesh = handle.entity;
+            self.vertex_buffer_cache.entry(handle.id).or_insert_with(|| {
                 device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
                     usage: wgpu::BufferUsages::VERTEX,
                     contents: mesh.get_vertex_buffer_content(),
                 })
             });
-            self.index_buffer_cache.entry(mesh_idx).or_insert_with(|| {
+            self.index_buffer_cache.entry(handle.id).or_insert_with(|| {
                 device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
                     usage: wgpu::BufferUsages::INDEX,
@@ -384,14 +385,14 @@ impl Pass for ShadowPass {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bg, &[]);
 
-            for mesh_idx in 0..meshes.len() {
+            for handle in meshes.iter() {
                 if let (Some(vb), Some(ib)) = (
-                    self.vertex_buffer_cache.get(&mesh_idx),
-                    self.index_buffer_cache.get(&mesh_idx),
+                    self.vertex_buffer_cache.get(&handle.id),
+                    self.index_buffer_cache.get(&handle.id),
                 ) {
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..meshes[mesh_idx].get_indices_count() as u32, 0, 0..1);
+                    pass.draw_indexed(0..handle.entity.get_indices_count() as u32, 0, 0..1);
                 }
             }
         }
