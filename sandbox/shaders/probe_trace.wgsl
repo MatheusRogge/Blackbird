@@ -185,7 +185,9 @@ fn shade_hit(pos: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
     var radiance = vec3<f32>(0.0);
     for (var i = 0u; i < light_counts.num_sky; i++) {
         let dir_ws  = (frame.inv_view * vec4<f32>(sky_lights[i].direction_vs, 0.0)).xyz;
-        let n_dot_l = max(0.0, dot(normal, -dir_ws));
+        let L       = -dir_ws;
+        if L.y < 0.0 { continue; }
+        let n_dot_l = max(0.0, dot(normal, L));
         radiance   += albedo * sky_lights[i].color * sky_lights[i].intensity * n_dot_l;
     }
     return radiance;
@@ -194,7 +196,9 @@ fn shade_hit(pos: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
 fn sample_sky(ray_dir: vec3<f32>) -> vec3<f32> {
     if light_counts.num_sky > 0u {
         let dir_ws     = (frame.inv_view * vec4<f32>(sky_lights[0].direction_vs, 0.0)).xyz;
-        let sun_factor = max(0.0, dot(ray_dir, -dir_ws));
+        let L          = -dir_ws;
+        if L.y < 0.0 { return vec3f(0.0); }
+        let sun_factor = max(0.0, dot(ray_dir, L));
         let sky_base   = sky_lights[0].color * sky_lights[0].intensity;
         return sky_base * (0.3 + 0.7 * max(0.0, ray_dir.y) + pow(sun_factor, 32.0));
     }

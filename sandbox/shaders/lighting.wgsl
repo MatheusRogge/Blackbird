@@ -215,6 +215,7 @@ fn sky_color(ray_dir: vec3<f32>) -> vec3<f32> {
     var col = mix(horizon, zenith, clamp(ray_dir.y, 0.0, 1.0));
     for (var i = 0u; i < cp.num_sky_lights; i++) {
         let L_ws = normalize((camera.inv_view * vec4f(-sky_lights[i].direction_vs, 0.0)).xyz);
+        if L_ws.y < 0.0 { continue; }
         col += sky_lights[i].color * sky_lights[i].intensity
             * pow(max(dot(ray_dir, L_ws), 0.0), 128.0);
     }
@@ -293,6 +294,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     for (var i = 0u; i < cp.num_sky_lights; i++) {
         let sky = sky_lights[i];
         let L = normalize((camera.inv_view * vec4f(-sky.direction_vs, 0.0)).xyz);
+        if L.y < 0.0 { continue; }
         let diff = max(dot(N, L), 0.0);
 
         // Select cascade based on view-space depth and project into shadow space.
