@@ -38,7 +38,12 @@ impl CameraController {
         }
     }
 
-    pub fn tick(&mut self, input: &mut InputBuffer, world: &mut World, _delta: f32) {
+    pub fn tick(&mut self, input: &mut InputBuffer, world: &mut World, _delta: f32, ui_wants_pointer: bool) {
+        if ui_wants_pointer {
+            self.is_panning = false;
+            self.last_cursor_pos = None;
+        }
+
         let events: Vec<InputEvent> = std::iter::from_fn(|| input.pop()).collect();
 
         let mut pan_delta = (0.0f32, 0.0f32);
@@ -47,10 +52,12 @@ impl CameraController {
 
         for event in events {
             match event {
-                InputEvent::MouseButtonPressed { button: MouseButton::Left } => {
-                    self.is_panning = true;
+                InputEvent::MouseButtonPressed { button: MouseButton::Left, .. } => {
+                    if !ui_wants_pointer {
+                        self.is_panning = true;
+                    }
                 }
-                InputEvent::MouseButtonReleased { button: MouseButton::Left } => {
+                InputEvent::MouseButtonReleased { button: MouseButton::Left, .. } => {
                     self.is_panning = false;
                     self.last_cursor_pos = None;
                 }
@@ -63,8 +70,8 @@ impl CameraController {
                     }
                     self.last_cursor_pos = Some((x, y));
                 }
-                InputEvent::MouseScrolled { delta } => {
-                    scroll_delta += delta;
+                InputEvent::MouseScrolled { y, .. } => {
+                    scroll_delta += y;
                 }
                 other => unhandled.push(other),
             }

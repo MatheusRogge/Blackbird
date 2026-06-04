@@ -1,34 +1,44 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
-#[derive(Debug)]
-pub enum KeyCodes {
-    W,
-    A,
-    S,
-    D,
-    Unknown,
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Modifiers {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub super_: bool,
 }
 
-impl From<u32> for KeyCodes {
-    fn from(value: u32) -> Self {
-        if value == 17 {
-            return Self::W;
-        }
-
-        if value == 30 {
-            return Self::A;
-        }
-
-        if value == 31 {
-            return Self::S;
-        }
-
-        if value == 32 {
-            return Self::D;
-        }
-
-        Self::Unknown
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Key {
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    Enter,
+    Escape,
+    Tab,
+    Space,
+    Backspace,
+    Delete,
+    Insert,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+    Scancode(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,16 +49,20 @@ pub enum MouseButton {
     Other,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum InputEvent {
-    KeyReleased { key_code: KeyCodes },
-    KeyPressed { key_code: KeyCodes },
-    MouseButtonPressed { button: MouseButton },
-    MouseButtonReleased { button: MouseButton },
-    /// Absolute cursor position in physical pixels.
+    KeyPressed { key: Key, modifiers: Modifiers },
+    KeyReleased { key: Key, modifiers: Modifiers },
+    TextInput { text: String },
+    ModifiersChanged(Modifiers),
+    MouseButtonPressed { button: MouseButton, modifiers: Modifiers },
+    MouseButtonReleased { button: MouseButton, modifiers: Modifiers },
     MouseMoved { x: f32, y: f32 },
-    /// Scroll delta — positive is up / zoom-in.
-    MouseScrolled { delta: f32 },
+    MouseScrolled { x: f32, y: f32 },
+    CursorLeft,
+    WindowFocused(bool),
+    ScaleFactorChanged(f32),
+    FileDrop(PathBuf),
 }
 
 pub struct InputBuffer {

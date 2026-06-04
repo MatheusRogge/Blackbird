@@ -2,7 +2,7 @@ use ultraviolet::Vec3;
 
 use engine_core::{
     entity::{Controllable, EntityKey},
-    input::{InputEvent, KeyCodes},
+    input::{InputEvent, Key},
 };
 
 use crate::Engine;
@@ -43,20 +43,14 @@ impl PlayerController {
 
         for event in events {
             match event {
-                InputEvent::KeyPressed { key_code } => match key_code {
-                    KeyCodes::W => self.moving_forward = true,
-                    KeyCodes::S => self.moving_back = true,
-                    KeyCodes::A => self.moving_left = true,
-                    KeyCodes::D => self.moving_right = true,
-                    _ => {}
-                },
-                InputEvent::KeyReleased { key_code } => match key_code {
-                    KeyCodes::W => self.moving_forward = false,
-                    KeyCodes::S => self.moving_back = false,
-                    KeyCodes::A => self.moving_left = false,
-                    KeyCodes::D => self.moving_right = false,
-                    _ => {}
-                },
+                InputEvent::KeyPressed { key: Key::Scancode(17), .. } => self.moving_forward = true,
+                InputEvent::KeyPressed { key: Key::Scancode(31), .. } => self.moving_back = true,
+                InputEvent::KeyPressed { key: Key::Scancode(30), .. } => self.moving_left = true,
+                InputEvent::KeyPressed { key: Key::Scancode(32), .. } => self.moving_right = true,
+                InputEvent::KeyReleased { key: Key::Scancode(17), .. } => self.moving_forward = false,
+                InputEvent::KeyReleased { key: Key::Scancode(31), .. } => self.moving_back = false,
+                InputEvent::KeyReleased { key: Key::Scancode(30), .. } => self.moving_left = false,
+                InputEvent::KeyReleased { key: Key::Scancode(32), .. } => self.moving_right = false,
                 other => unhandled.push(other),
             }
         }
