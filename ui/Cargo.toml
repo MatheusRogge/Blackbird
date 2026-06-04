@@ -1,0 +1,11 @@
+[package]
+name = "ui"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+egui     = "0.34"
+egui-wgpu = "0.34"
+wgpu     = { version = "29", features = ["wgsl"] }
+
+engine_core = { path = "../core/" }

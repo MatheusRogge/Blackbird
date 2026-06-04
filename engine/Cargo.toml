@@ -12,6 +12,7 @@ threading = { path = "../threading/" }
 assets    = { path = "../assets/",    optional = true }
 gltf      = { path = "../gltf/",      optional = true }
 rendering = { path = "../rendering/", optional = true }
+ui        = { path = "../ui/",        optional = true }
 
 # window feature pulls in winit + pollster directly (no separate window crate needed)
 winit     = { workspace = true,        optional = true }
@@ -23,4 +24,6 @@ default  = []
 assets   = ["dep:assets"]
 gltf     = ["dep:gltf", "dep:assets", "assets"]
 window   = ["dep:rendering", "dep:winit", "dep:pollster"]
-full     = ["assets", "gltf", "window"]
+ui       = ["dep:ui", "window"]
+full     = ["assets", "gltf", "window", "ui"]
+debug    = ["window", "ui", "rendering/debug"]

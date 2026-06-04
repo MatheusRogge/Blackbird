@@ -8,6 +8,7 @@ members = [
   "rendering",
   "sandbox",
   "threading",
+  "ui",
 ]
 
 [workspace.dependencies]
