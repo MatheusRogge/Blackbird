@@ -62,6 +62,7 @@ pub struct LightingPass {
 }
 
 impl LightingPass {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         graph: &mut RenderGraph,
         gbuffer: &GBufferOutputs,

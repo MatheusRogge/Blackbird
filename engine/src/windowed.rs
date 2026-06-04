@@ -305,12 +305,12 @@ impl<B: RenderGraphBuilder> ApplicationHandler for WindowedApplication<B> {
                     ElementState::Released => InputEvent::KeyReleased { key, modifiers },
                 };
                 self.pending_inputs.push(input_event);
-                if event.state == ElementState::Pressed {
-                    if let Some(text) = event.text {
-                        let s = text.to_string();
-                        if !s.is_empty() && !s.chars().all(|c| c.is_control()) {
-                            self.pending_inputs.push(InputEvent::TextInput { text: s });
-                        }
+                if event.state == ElementState::Pressed
+                    && let Some(text) = event.text
+                {
+                    let s = text.to_string();
+                    if !s.is_empty() && !s.chars().all(|c| c.is_control()) {
+                        self.pending_inputs.push(InputEvent::TextInput { text: s });
                     }
                 }
             }

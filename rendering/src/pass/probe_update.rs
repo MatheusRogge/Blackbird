@@ -77,7 +77,7 @@ impl Pass for ProbeUpdatePass {
     ) {
         let current = self.frame_index;
         self.frame_index = self.frame_index.wrapping_add(1);
-        if current % 4 != 0 {
+        if !current.is_multiple_of(4) {
             return;
         }
 
