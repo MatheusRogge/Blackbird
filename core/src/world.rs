@@ -85,4 +85,12 @@ impl World {
             entity.tick(delta);
         }
     }
+
+    pub fn remove_entity(&mut self, key: EntityKey) -> bool {
+        self.entities.remove(key).is_some()
+    }
+
+    pub fn clear(&mut self) {
+        self.entities.clear();
+    }
 }
