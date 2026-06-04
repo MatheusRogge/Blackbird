@@ -93,10 +93,15 @@ impl CameraController {
             Self::apply_zoom(camera, scroll_delta, self.zoom_speed, self.min_zoom_distance);
         }
 
-        if pan_delta != (0.0, 0.0)
-            && let CameraMode::FirstPerson = self.mode
-        {
-            Self::apply_pan(camera, pan_delta.0, pan_delta.1, self.pan_speed);
+        if pan_delta != (0.0, 0.0) {
+            match self.mode {
+                CameraMode::FirstPerson => {
+                    Self::apply_look(camera, pan_delta.0, pan_delta.1, self.pan_speed);
+                }
+                CameraMode::ThirdPerson => {
+                    Self::apply_orbit(camera, pan_delta.0, pan_delta.1, self.pan_speed);
+                }
+            }
         }
     }
 
@@ -107,7 +112,7 @@ impl CameraController {
         camera.eye = camera.target - forward * new_distance;
     }
 
-    fn apply_pan(camera: &mut Camera, delta_x: f32, delta_y: f32, speed: f32) {
+    fn apply_look(camera: &mut Camera, delta_x: f32, delta_y: f32, speed: f32) {
         let offset = camera.target - camera.eye;
         let dist = offset.mag();
 
@@ -124,6 +129,25 @@ impl CameraController {
             -dist * new_pitch.cos() * new_yaw.cos(),
         );
         camera.target = camera.eye + new_offset;
+        camera.up = Vec3::unit_y();
+    }
+
+    fn apply_orbit(camera: &mut Camera, delta_x: f32, delta_y: f32, speed: f32) {
+        let offset = camera.eye - camera.target;
+        let dist = offset.mag();
+
+        let yaw = f32::atan2(offset.x, offset.z);
+        let pitch = (offset.y / dist).asin();
+
+        let new_yaw = yaw - delta_x * speed;
+        let new_pitch = (pitch - delta_y * speed)
+            .clamp(-std::f32::consts::FRAC_PI_2 + 0.01, std::f32::consts::FRAC_PI_2 - 0.01);
+
+        camera.eye = camera.target + Vec3::new(
+            dist * new_pitch.cos() * new_yaw.sin(),
+            dist * new_pitch.sin(),
+            dist * new_pitch.cos() * new_yaw.cos(),
+        );
         camera.up = Vec3::unit_y();
     }
 }
