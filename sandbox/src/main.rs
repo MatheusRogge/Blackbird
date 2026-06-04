@@ -72,16 +72,12 @@ impl Plugin for MyGame {
 
     fn tick(&mut self, engine: &mut Engine, delta: f32) {
         self.tick += 1;
-
-        if self.tick.is_multiple_of(120) {
-            log::info!("perf\n{}", engine.frame_stats());
-        }
-
         self.player_controller.tick::<Camera>(engine, delta);
 
         if let Some(ctrl) = &mut self.camera_controller {
+            let ui_wants_pointer = engine.ui_wants_pointer();
             let (input, mut world) = engine.input_and_world();
-            ctrl.tick(input, &mut world, delta);
+            ctrl.tick(input, &mut world, delta, ui_wants_pointer);
         }
 
         if let Some(handle) = &self.pending_gltf
