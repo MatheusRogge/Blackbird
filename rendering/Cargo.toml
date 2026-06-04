@@ -3,6 +3,11 @@ name = "rendering"
 version = "1.0.0"
 edition = "2024"
 
+[features]
+default = ["rendering_2d"]
+rendering_2d = []
+debug = ["dep:egui", "dep:ui"]
+
 [dependencies]
 bytemuck = { version = "1.25.0", features = ["derive"] }
 wgpu = { version = "29.0.1", features = ["wgsl"] }
@@ -13,3 +18,6 @@ ultraviolet = { workspace = true }
 
 assets = { path = "../assets/" }
 engine_core = { path = "../core/" }
+
+egui = { version = "0.34", optional = true }
+ui   = { path = "../ui/", optional = true }

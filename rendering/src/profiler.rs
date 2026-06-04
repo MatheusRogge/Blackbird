@@ -62,7 +62,6 @@ impl Default for FrameProfiler {
 impl FrameProfiler {
     pub fn begin_frame(&mut self) {
         self.frame_start = Instant::now();
-        self.pass_order.clear();
     }
 
     pub fn record_pass(&mut self, name: &'static str, duration: Duration) {

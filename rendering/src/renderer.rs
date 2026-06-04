@@ -9,6 +9,18 @@ use wgpu::{
 
 use crate::{graph::RenderGraph, profiler::FrameStats, resource::ResourceId};
 
+pub trait OverlayPass: Send + 'static {
+    fn execute(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        size: (u32, u32),
+        world: &World,
+    );
+}
+
 pub trait RenderGraphBuilder: Send + 'static {
     /// Build the render graph.
     ///
@@ -118,6 +130,14 @@ impl Renderer {
         })
     }
 
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.surface_config.format
+    }
+
     pub fn frame_stats(&self) -> &FrameStats {
         self.graph.frame_stats()
     }
@@ -137,7 +157,7 @@ impl Renderer {
         self.graph.on_resize(width, height);
     }
 
-    pub fn render(&mut self, world: &World) {
+    pub fn render(&mut self, world: &World, overlay: Option<&mut dyn OverlayPass>) {
         if !self.is_surface_configured {
             return;
         }
@@ -175,7 +195,23 @@ impl Renderer {
             world,
         );
 
-        self.queue.submit(std::iter::once(cmd));
+        if let Some(overlay) = overlay {
+            let mut ui_encoder = self.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: Some("ui") },
+            );
+            overlay.execute(
+                &self.device,
+                &self.queue,
+                &mut ui_encoder,
+                &surface_view,
+                (self.surface_config.width, self.surface_config.height),
+                world,
+            );
+            self.queue.submit([cmd, ui_encoder.finish()]);
+        } else {
+            self.queue.submit(std::iter::once(cmd));
+        }
+
         self.graph.schedule_gpu_readback(&self.device);
         surface_texture.present();
     }

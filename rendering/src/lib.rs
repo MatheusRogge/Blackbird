@@ -1,4 +1,8 @@
 pub mod bvh;
+#[cfg(feature = "debug")]
+pub mod debug_layer;
+#[cfg(feature = "rendering_2d")]
+pub mod rendering_2d;
 pub mod cache;
 pub mod camera;
 pub mod camera_controller;
@@ -16,3 +20,7 @@ pub mod texture;
 pub use profiler::{FrameStats, PassStats};
 pub use renderer::RenderGraphBuilder;
 pub use texture::TextureAsset;
+pub use wgpu;
+
+#[cfg(feature = "debug")]
+pub use debug_layer::DebugLayer;
