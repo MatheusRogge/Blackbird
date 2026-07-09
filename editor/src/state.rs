@@ -5,6 +5,9 @@ use std::sync::{Arc, Mutex};
 use engine_core::entity::EntityKey;
 use gltf_api::Document;
 
+use crate::project::Project;
+use crate::recent::RecentProjects;
+
 pub type SharedState = Arc<Mutex<EditorState>>;
 
 #[derive(Clone, Debug)]
@@ -56,10 +59,103 @@ impl Default for NodeEdit {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Selection {
     GltfNode(usize),
-    SkyLight,
+    Light(usize),
+    Mesh(usize),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LightKind {
+    Sky,
+    Point,
+    Spot,
+    Area,
+}
+
+#[derive(Clone, Debug)]
+pub enum LightData {
+    Sky {
+        color: [f32; 3],
+        intensity: f32,
+        direction: [f32; 3],
+    },
+    Point {
+        position: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+        radius: f32,
+    },
+    Spot {
+        position: [f32; 3],
+        direction: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+        radius: f32,
+        inner_angle: f32,
+        outer_angle: f32,
+    },
+    Area {
+        position: [f32; 3],
+        right: [f32; 3],
+        up: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+    },
+}
+
+impl LightData {
+    pub fn label(&self) -> &'static str {
+        match self {
+            LightData::Sky { .. }   => "☀ Sky Light",
+            LightData::Point { .. } => "● Point Light",
+            LightData::Spot { .. }  => "◎ Spot Light",
+            LightData::Area { .. }  => "▪ Area Light",
+        }
+    }
+
+    pub fn default_for(kind: LightKind) -> Self {
+        match kind {
+            LightKind::Sky => LightData::Sky {
+                color: [0.8, 0.9, 1.0],
+                intensity: 1.5,
+                direction: [-0.3, -1.0, 0.2],
+            },
+            LightKind::Point => LightData::Point {
+                position: [0.0, 2.0, 0.0],
+                color: [1.0, 1.0, 1.0],
+                intensity: 10.0,
+                radius: 10.0,
+            },
+            LightKind::Spot => LightData::Spot {
+                position: [0.0, 3.0, 0.0],
+                direction: [0.0, -1.0, 0.0],
+                color: [1.0, 1.0, 1.0],
+                intensity: 10.0,
+                radius: 10.0,
+                inner_angle: 15.0_f32.to_radians(),
+                outer_angle: 30.0_f32.to_radians(),
+            },
+            LightKind::Area => LightData::Area {
+                position: [0.0, 3.0, 0.0],
+                right: [1.0, 0.0, 0.0],
+                up: [0.0, 0.0, -1.0],
+                color: [1.0, 1.0, 1.0],
+                intensity: 5.0,
+            },
+        }
+    }
+}
+
+pub struct SceneLight {
+    pub key: EntityKey,
+    pub data: LightData,
 }
 
 pub struct EditorState {
+    pub recent_projects: RecentProjects,
+
+    pub project: Option<Project>,
+    pub project_dir: Option<PathBuf>,
+
     pub file_path: Option<PathBuf>,
     pub document: Option<Document>,
     pub scene_nodes: Vec<SceneNode>,
@@ -68,14 +164,19 @@ pub struct EditorState {
     pub node_edits: HashMap<usize, NodeEdit>,
 
     pub editor_camera_key: Option<EntityKey>,
-    pub sky_light_key: Option<EntityKey>,
 
-    pub sky_light_color: [f32; 3],
-    pub sky_light_intensity: f32,
-    pub sky_light_direction: [f32; 3],
+    pub lights: Vec<SceneLight>,
+    pub add_light_requested: Option<LightKind>,
 
+    pub camera_preview_node: Option<usize>,
+
+    pub new_project_requested: bool,
+    pub open_project_requested: bool,
+    pub open_recent_path: Option<PathBuf>,
     pub open_requested: bool,
     pub export_requested: bool,
+    pub new_project_path: Option<(PathBuf, String)>,
+    pub open_project_path: Option<PathBuf>,
     pub load_path: Option<PathBuf>,
     pub export_path: Option<PathBuf>,
 
@@ -85,21 +186,28 @@ pub struct EditorState {
 impl EditorState {
     pub fn new() -> SharedState {
         Arc::new(Mutex::new(Self {
+            recent_projects: RecentProjects::load(),
+            project: None,
+            project_dir: None,
             file_path: None,
             document: None,
             scene_nodes: Vec::new(),
             selected: None,
             node_edits: HashMap::new(),
+            camera_preview_node: None,
             editor_camera_key: None,
-            sky_light_key: None,
-            sky_light_color: [0.8, 0.9, 1.0],
-            sky_light_intensity: 1.5,
-            sky_light_direction: [-0.3, -1.0, 0.2],
+            lights: Vec::new(),
+            add_light_requested: None,
+            new_project_requested: false,
+            open_project_requested: false,
+            open_recent_path: None,
             open_requested: false,
             export_requested: false,
+            new_project_path: None,
+            open_project_path: None,
             load_path: None,
             export_path: None,
-            status: "No file loaded.".to_string(),
+            status: "No project loaded.".to_string(),
         }))
     }
 

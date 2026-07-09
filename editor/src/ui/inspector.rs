@@ -1,7 +1,7 @@
 #![allow(deprecated)]
 use egui::Context;
 
-use crate::state::{EditorState, NodeEdit, NodeKind, Selection};
+use crate::state::{EditorState, LightData, NodeEdit, NodeKind, Selection};
 
 pub fn draw(ctx: &Context, state: &mut EditorState) {
     egui::Panel::right("inspector")
@@ -15,7 +15,11 @@ pub fn draw(ctx: &Context, state: &mut EditorState) {
                 None => {
                     ui.label(egui::RichText::new("Nothing selected.").weak());
                 }
-                Some(Selection::SkyLight) => draw_sky_light(ui, state),
+                Some(Selection::Light(idx)) => {
+                    if let Some(light) = state.lights.get_mut(idx) {
+                        draw_light(ui, &mut light.data);
+                    }
+                }
                 Some(Selection::GltfNode(idx)) => {
                     let node_name = state.scene_nodes.iter()
                         .find_map(|n| find_node(n, idx))
@@ -29,12 +33,33 @@ pub fn draw(ctx: &Context, state: &mut EditorState) {
                     ui.separator();
 
                     if let Some(edit) = state.node_edits.get_mut(&idx) {
-                        draw_transform(ui, edit);
-                        if let Some(NodeKind::Mesh(_)) = &node_kind {
-                            draw_material(ui, edit);
+                        ui.push_id(idx, |ui| {
+                            draw_transform(ui, edit);
+                            if let Some(NodeKind::Mesh(_)) = &node_kind {
+                                draw_material(ui, edit);
+                            }
+                            if let Some(NodeKind::Camera) = &node_kind {
+                                draw_camera(ui, edit);
+                            }
+                        });
+                    }
+
+                    if let Some(NodeKind::Camera) = &node_kind {
+                        ui.separator();
+                        let previewing = state.camera_preview_node == Some(idx);
+                        let label = if previewing { "Exit Camera View" } else { "Assume Camera View" };
+                        if ui.button(label).clicked() {
+                            state.camera_preview_node = if previewing { None } else { Some(idx) };
                         }
-                        if let Some(NodeKind::Camera) = &node_kind {
-                            draw_camera(ui, edit);
+                    }
+                }
+                Some(Selection::Mesh(idx)) => {
+                    if let Some(doc) = &state.document {
+                        if let Some(mesh) = doc.meshes().find(|m| m.index() == idx) {
+                            ui.label(egui::RichText::new(mesh.name().unwrap_or("(unnamed)")).strong());
+                            ui.separator();
+                            let prim_count = mesh.primitives().count();
+                            ui.label(format!("Primitives: {prim_count}"));
                         }
                     }
                 }
@@ -42,34 +67,138 @@ pub fn draw(ctx: &Context, state: &mut EditorState) {
         });
 }
 
-fn draw_sky_light(ui: &mut egui::Ui, state: &mut EditorState) {
-    ui.label(egui::RichText::new("Sky Light").strong());
+fn draw_light(ui: &mut egui::Ui, data: &mut LightData) {
+    ui.label(egui::RichText::new(data.label()).strong());
     ui.separator();
 
-    egui::Grid::new("sky_light_grid")
-        .num_columns(2)
-        .spacing([12.0, 4.0])
-        .show(ui, |ui| {
-            ui.label("Color");
-            ui.color_edit_button_rgb(&mut state.sky_light_color);
-            ui.end_row();
+    match data {
+        LightData::Sky { color, intensity, direction } => {
+            egui::Grid::new("light_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                ui.label("Color");
+                ui.color_edit_button_rgb(color);
+                ui.end_row();
 
-            ui.label("Intensity");
-            ui.add(egui::DragValue::new(&mut state.sky_light_intensity)
-                .speed(0.05)
-                .range(0.0..=20.0));
-            ui.end_row();
+                ui.label("Intensity");
+                ui.add(egui::DragValue::new(intensity).speed(0.05).range(0.0..=20.0));
+                ui.end_row();
 
-            ui.label("Direction X");
-            ui.add(egui::DragValue::new(&mut state.sky_light_direction[0]).speed(0.01));
-            ui.end_row();
-            ui.label("Direction Y");
-            ui.add(egui::DragValue::new(&mut state.sky_light_direction[1]).speed(0.01));
-            ui.end_row();
-            ui.label("Direction Z");
-            ui.add(egui::DragValue::new(&mut state.sky_light_direction[2]).speed(0.01));
-            ui.end_row();
-        });
+                ui.label("Direction");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut direction[0]).speed(0.01).prefix("X "));
+                    ui.add(egui::DragValue::new(&mut direction[1]).speed(0.01).prefix("Y "));
+                    ui.add(egui::DragValue::new(&mut direction[2]).speed(0.01).prefix("Z "));
+                });
+                ui.end_row();
+            });
+        }
+
+        LightData::Point { position, color, intensity, radius } => {
+            egui::Grid::new("light_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                ui.label("Position");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut position[0]).speed(0.1).prefix("X "));
+                    ui.add(egui::DragValue::new(&mut position[1]).speed(0.1).prefix("Y "));
+                    ui.add(egui::DragValue::new(&mut position[2]).speed(0.1).prefix("Z "));
+                });
+                ui.end_row();
+
+                ui.label("Color");
+                ui.color_edit_button_rgb(color);
+                ui.end_row();
+
+                ui.label("Intensity");
+                ui.add(egui::DragValue::new(intensity).speed(0.1).range(0.0..=10000.0));
+                ui.end_row();
+
+                ui.label("Radius");
+                ui.add(egui::DragValue::new(radius).speed(0.1).range(0.0..=1000.0));
+                ui.end_row();
+            });
+        }
+
+        LightData::Spot { position, direction, color, intensity, radius, inner_angle, outer_angle } => {
+            egui::Grid::new("light_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                ui.label("Position");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut position[0]).speed(0.1).prefix("X "));
+                    ui.add(egui::DragValue::new(&mut position[1]).speed(0.1).prefix("Y "));
+                    ui.add(egui::DragValue::new(&mut position[2]).speed(0.1).prefix("Z "));
+                });
+                ui.end_row();
+
+                ui.label("Direction");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut direction[0]).speed(0.01).prefix("X "));
+                    ui.add(egui::DragValue::new(&mut direction[1]).speed(0.01).prefix("Y "));
+                    ui.add(egui::DragValue::new(&mut direction[2]).speed(0.01).prefix("Z "));
+                });
+                ui.end_row();
+
+                ui.label("Color");
+                ui.color_edit_button_rgb(color);
+                ui.end_row();
+
+                ui.label("Intensity");
+                ui.add(egui::DragValue::new(intensity).speed(0.1).range(0.0..=10000.0));
+                ui.end_row();
+
+                ui.label("Radius");
+                ui.add(egui::DragValue::new(radius).speed(0.1).range(0.0..=1000.0));
+                ui.end_row();
+
+                let mut inner_deg = inner_angle.to_degrees();
+                let mut outer_deg = outer_angle.to_degrees();
+
+                ui.label("Inner Angle");
+                if ui.add(egui::DragValue::new(&mut inner_deg).speed(0.5).range(0.0..=89.0).suffix("°")).changed() {
+                    *inner_angle = inner_deg.to_radians();
+                }
+                ui.end_row();
+
+                ui.label("Outer Angle");
+                if ui.add(egui::DragValue::new(&mut outer_deg).speed(0.5).range(0.0..=90.0).suffix("°")).changed() {
+                    *outer_angle = outer_deg.to_radians();
+                }
+                ui.end_row();
+            });
+        }
+
+        LightData::Area { position, right, up, color, intensity } => {
+            egui::Grid::new("light_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                ui.label("Position");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut position[0]).speed(0.1).prefix("X "));
+                    ui.add(egui::DragValue::new(&mut position[1]).speed(0.1).prefix("Y "));
+                    ui.add(egui::DragValue::new(&mut position[2]).speed(0.1).prefix("Z "));
+                });
+                ui.end_row();
+
+                ui.label("Right");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut right[0]).speed(0.01).prefix("X "));
+                    ui.add(egui::DragValue::new(&mut right[1]).speed(0.01).prefix("Y "));
+                    ui.add(egui::DragValue::new(&mut right[2]).speed(0.01).prefix("Z "));
+                });
+                ui.end_row();
+
+                ui.label("Up");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut up[0]).speed(0.01).prefix("X "));
+                    ui.add(egui::DragValue::new(&mut up[1]).speed(0.01).prefix("Y "));
+                    ui.add(egui::DragValue::new(&mut up[2]).speed(0.01).prefix("Z "));
+                });
+                ui.end_row();
+
+                ui.label("Color");
+                ui.color_edit_button_rgb(color);
+                ui.end_row();
+
+                ui.label("Intensity");
+                ui.add(egui::DragValue::new(intensity).speed(0.1).range(0.0..=10000.0));
+                ui.end_row();
+            });
+        }
+    }
 }
 
 fn draw_transform(ui: &mut egui::Ui, edit: &mut NodeEdit) {

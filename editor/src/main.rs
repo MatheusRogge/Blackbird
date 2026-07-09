@@ -1,8 +1,13 @@
 mod export;
 mod plugin;
+mod project;
+mod recent;
 mod state;
 mod ui;
 
+use std::sync::{Arc, RwLock};
+
+use engine::rendering::debug_flags::RenderDebugFlags;
 use engine::rendering::pbr::RenderGraphPBRBuilder;
 use engine::rendering::shader::ShaderAsset;
 use engine::windowed::WindowedApplication;
@@ -30,6 +35,12 @@ fn main() -> anyhow::Result<()> {
     let shadow_shader    = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/shadow.wgsl"));
     let probe_trace      = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/probe_trace.wgsl"));
     let probe_update     = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/probe_update.wgsl"));
+    let debug_overlay    = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/debug_overlay.wgsl"));
+
+    let debug_flags = Arc::new(RwLock::new(RenderDebugFlags {
+        show_grid: true,
+        ..RenderDebugFlags::default()
+    }));
 
     let render_graph = RenderGraphPBRBuilder::new(
         gbuffer_shader,
@@ -39,7 +50,8 @@ fn main() -> anyhow::Result<()> {
         shadow_shader,
         probe_trace,
         probe_update,
-    );
+        debug_overlay,
+    ).with_debug_flags(debug_flags);
 
     WindowedApplication::new(render_graph)
         .add_plugin(EditorPlugin::new(shared_state.clone()))
