@@ -1,7 +1,12 @@
+use std::sync::{Arc, RwLock};
+use std::sync::atomic::AtomicUsize;
+
 use bytemuck::{Pod, Zeroable};
 use engine_core::world::World;
 
 use crate::{
+    camera::Camera,
+    debug_flags::RenderDebugFlags,
     graph::{NodeId, RenderGraph},
     pass::{Pass, PassContext, PassDesc},
     resource::{ResourceDescriptor, ResourceId},
@@ -31,9 +36,8 @@ impl Default for ProbeGridConfig {
     fn default() -> Self {
         Self {
             grid_dim: PROBE_GRID_DIM,
-            // Covers a 24m×12m×24m volume centered near the world origin.
-            grid_origin: [-12.0, 0.0, -12.0],
-            probe_spacing: 2.0,
+            grid_origin: [-28.0, -2.0, -28.0],
+            probe_spacing: 5.0,
         }
     }
 }
@@ -56,48 +60,63 @@ pub struct ProbeGridParams {
 }
 
 pub struct ProbeAtlasOutputs {
-    pub irradiance_atlas_id: ResourceId,
-    pub visibility_atlas_id: ResourceId,
+    /// Ping-pong pair; index 0 is current on startup.
+    pub irradiance_atlas_ids: [ResourceId; 2],
+    pub visibility_atlas_ids: [ResourceId; 2],
     pub probe_params_id: ResourceId,
+    /// Which slot (0 or 1) was written most recently — read by LightingPass.
+    pub current_atlas: Arc<AtomicUsize>,
 }
 
 pub struct ProbeAtlasPass {
     node_id: Option<NodeId>,
     config: ProbeGridConfig,
     probe_params_id: ResourceId,
+    debug_flags: Arc<RwLock<RenderDebugFlags>>,
 }
 
 impl ProbeAtlasPass {
-    pub fn new(graph: &mut RenderGraph, config: ProbeGridConfig) -> (Self, ProbeAtlasOutputs) {
-        let irradiance_atlas_id = graph.alloc_resource_id(ResourceDescriptor::FixedTexture {
-            size: wgpu::Extent3d {
-                width: IRRADIANCE_ATLAS_WIDTH,
-                height: IRRADIANCE_ATLAS_HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
-        });
-
-        let visibility_atlas_id = graph.alloc_resource_id(ResourceDescriptor::FixedTexture {
-            size: wgpu::Extent3d {
-                width: VISIBILITY_ATLAS_WIDTH,
-                height: VISIBILITY_ATLAS_HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
-        });
+    pub fn new(
+        graph: &mut RenderGraph,
+        config: ProbeGridConfig,
+        debug_flags: Arc<RwLock<RenderDebugFlags>>,
+    ) -> (Self, ProbeAtlasOutputs) {
+        let irradiance_atlas_ids = [
+            graph.alloc_resource_id(ResourceDescriptor::FixedTexture {
+                size: wgpu::Extent3d { width: IRRADIANCE_ATLAS_WIDTH, height: IRRADIANCE_ATLAS_HEIGHT, depth_or_array_layers: 1 },
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            }),
+            graph.alloc_resource_id(ResourceDescriptor::FixedTexture {
+                size: wgpu::Extent3d { width: IRRADIANCE_ATLAS_WIDTH, height: IRRADIANCE_ATLAS_HEIGHT, depth_or_array_layers: 1 },
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            }),
+        ];
+        let visibility_atlas_ids = [
+            graph.alloc_resource_id(ResourceDescriptor::FixedTexture {
+                size: wgpu::Extent3d { width: VISIBILITY_ATLAS_WIDTH, height: VISIBILITY_ATLAS_HEIGHT, depth_or_array_layers: 1 },
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            }),
+            graph.alloc_resource_id(ResourceDescriptor::FixedTexture {
+                size: wgpu::Extent3d { width: VISIBILITY_ATLAS_WIDTH, height: VISIBILITY_ATLAS_HEIGHT, depth_or_array_layers: 1 },
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            }),
+        ];
 
         let probe_params_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
             size: std::mem::size_of::<ProbeGridParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        let current_atlas = Arc::new(AtomicUsize::new(0));
         let outputs = ProbeAtlasOutputs {
-            irradiance_atlas_id,
-            visibility_atlas_id,
+            irradiance_atlas_ids,
+            visibility_atlas_ids,
             probe_params_id,
+            current_atlas,
         };
 
         (
@@ -105,6 +124,7 @@ impl ProbeAtlasPass {
                 node_id: None,
                 config,
                 probe_params_id,
+                debug_flags,
             },
             outputs,
         )
@@ -138,7 +158,7 @@ impl Pass for ProbeAtlasPass {
         queue: &wgpu::Queue,
         _encoder: &mut wgpu::CommandEncoder,
         ctx: &PassContext<'_>,
-        _world: &World,
+        world: &World,
     ) {
         let Some(&params_buf) = ctx.buffers.get(&self.probe_params_id) else {
             return;
@@ -147,18 +167,55 @@ impl Pass for ProbeAtlasPass {
         let cfg = &self.config;
         let probe_count = cfg.grid_dim[0] * cfg.grid_dim[1] * cfg.grid_dim[2];
 
+        let (hysteresis, normal_bias, view_bias, probe_spacing, anchor) = self
+            .debug_flags
+            .read()
+            .map(|f| (
+                f.ddgi_hysteresis,
+                f.ddgi_normal_bias,
+                f.ddgi_view_bias,
+                f.ddgi_probe_spacing,
+                f.ddgi_grid_anchor,
+            ))
+            .unwrap_or((0.97, 0.2, 0.1, 5.0, [0.0; 3]));
+
+        let max_ray_distance = {
+            let dim = self.config.grid_dim;
+            dim[0].max(dim[1]).max(dim[2]) as f32 * probe_spacing
+        };
+
+        // Snap the grid origin so probes always sit at world-aligned multiples of
+        // probe_spacing (offset from anchor). The active window slides in discrete
+        // steps to keep the camera inside the grid.
+        let grid_origin = {
+            let cameras = world.get_entities::<Camera>();
+            let eye = cameras.first().map(|c| c.eye).unwrap_or_default();
+            let dim = self.config.grid_dim;
+
+            let snap = |cam: f32, anc: f32, steps: u32| -> f32 {
+                let half = steps as f32 * probe_spacing * 0.5;
+                anc + ((cam - anc - half) / probe_spacing).floor() * probe_spacing
+            };
+
+            [
+                snap(eye.x, anchor[0], dim[0]),
+                snap(eye.y, anchor[1], dim[1]),
+                snap(eye.z, anchor[2], dim[2]),
+            ]
+        };
+
         let params = ProbeGridParams {
             grid_dim: cfg.grid_dim,
             probe_count,
-            grid_origin: cfg.grid_origin,
-            max_ray_distance: 20.0,
-            probe_spacing: cfg.probe_spacing,
+            grid_origin,
+            max_ray_distance,
+            probe_spacing,
             rays_per_probe: 128,
             irradiance_texel_size: IRRADIANCE_TEXEL_SIZE,
             visibility_texel_size: VISIBILITY_TEXEL_SIZE,
-            hysteresis: 0.97,
-            normal_bias: 0.2,
-            view_bias: 0.1,
+            hysteresis,
+            normal_bias,
+            view_bias,
             _pad: 0.0,
         };
 

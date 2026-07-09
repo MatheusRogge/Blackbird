@@ -183,7 +183,10 @@ impl<B: RenderGraphBuilder> ApplicationHandler for WindowedApplication<B> {
             let mut layers = mem::take(&mut self.pending_ui_layers);
 
             #[cfg(feature = "debug")]
-            layers.insert(0, Box::new(rendering::DebugLayer::new(Arc::clone(&frame_stats_arc))));
+            layers.insert(0, Box::new(rendering::DebugLayer::new(
+                Arc::clone(&frame_stats_arc),
+                renderer.debug_flags_arc(),
+            )));
 
             if layers.is_empty() {
                 None
@@ -191,7 +194,7 @@ impl<B: RenderGraphBuilder> ApplicationHandler for WindowedApplication<B> {
                 let (wants_ptr, wants_kbd) = engine.ui_flag_arcs();
                 Some(EguiOverlay(EguiRenderer::new(
                     renderer.device(),
-                    renderer.surface_format(),
+                    renderer.surface_format().remove_srgb_suffix(),
                     layers,
                     wants_ptr,
                     wants_kbd,

@@ -1,6 +1,12 @@
+use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use bytemuck;
 use engine_core::world::World;
+use wgpu::util::DeviceExt;
 
 use crate::{
+    debug_flags::RenderDebugFlags,
     graph::{NodeId, RenderGraph},
     pass::cluster_assignment::ClusterOutputs,
     pass::gbuffer::GBufferOutputs,
@@ -52,13 +58,20 @@ pub struct LightingPass {
     shadow_sampler: Option<wgpu::Sampler>,
     cached_shadow_ptr: usize,
 
-    irradiance_atlas_id: ResourceId,
-    visibility_atlas_id: ResourceId,
+    irradiance_atlas_ids: [ResourceId; 2],
+    visibility_atlas_ids: [ResourceId; 2],
     probe_params_id: ResourceId,
     camera_buffer_id: ResourceId,
+    current_atlas: Arc<AtomicUsize>,
+    cached_irradiance_ptr: usize,
     probe_bgl: Option<wgpu::BindGroupLayout>,
     probe_bg: Option<wgpu::BindGroup>,
     probe_sampler: Option<wgpu::Sampler>,
+
+    debug_flags: Arc<RwLock<RenderDebugFlags>>,
+    debug_flags_buf: Option<wgpu::Buffer>,
+    debug_flags_bgl: Option<wgpu::BindGroupLayout>,
+    debug_flags_bg: Option<wgpu::BindGroup>,
 }
 
 impl LightingPass {
@@ -73,6 +86,7 @@ impl LightingPass {
         camera_buffer_id: ResourceId,
         _surface_config: &wgpu::SurfaceConfiguration,
         shader: ShaderAsset,
+        debug_flags: Arc<RwLock<RenderDebugFlags>>,
     ) -> (Self, LightingOutputs) {
         let lit_id = graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
             format: wgpu::TextureFormat::Rgba16Float,
@@ -109,13 +123,20 @@ impl LightingPass {
                 shadow_bg: None,
                 shadow_sampler: None,
                 cached_shadow_ptr: 0,
-                irradiance_atlas_id: probe_atlas.irradiance_atlas_id,
-                visibility_atlas_id: probe_atlas.visibility_atlas_id,
+                irradiance_atlas_ids: probe_atlas.irradiance_atlas_ids,
+                visibility_atlas_ids: probe_atlas.visibility_atlas_ids,
                 probe_params_id: probe_atlas.probe_params_id,
                 camera_buffer_id,
+                current_atlas: Arc::clone(&probe_atlas.current_atlas),
+                cached_irradiance_ptr: 0,
                 probe_bgl: None,
                 probe_bg: None,
                 probe_sampler: None,
+
+                debug_flags,
+                debug_flags_buf: None,
+                debug_flags_bgl: None,
+                debug_flags_bg: None,
             },
             outputs,
         )
@@ -140,8 +161,10 @@ impl PassDesc for LightingPass {
             self.sky_buffer_id,
             self.shadow_map_id,
             self.shadow_params_id,
-            self.irradiance_atlas_id,
-            self.visibility_atlas_id,
+            self.irradiance_atlas_ids[0],
+            self.irradiance_atlas_ids[1],
+            self.visibility_atlas_ids[0],
+            self.visibility_atlas_ids[1],
             self.probe_params_id,
             self.camera_buffer_id,
         ]
@@ -165,7 +188,7 @@ impl Pass for LightingPass {
     fn execute(
         &mut self,
         device: &wgpu::Device,
-        _queue: &wgpu::Queue,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         ctx: &PassContext<'_>,
         _world: &World,
@@ -218,11 +241,11 @@ impl Pass for LightingPass {
             return;
         };
 
-        let Some(&irradiance_view) = ctx.views.get(&self.irradiance_atlas_id) else {
+        let atlas_idx = self.current_atlas.load(Ordering::Relaxed);
+        let Some(&irradiance_view) = ctx.views.get(&self.irradiance_atlas_ids[atlas_idx]) else {
             return;
         };
-
-        let Some(&visibility_view) = ctx.views.get(&self.visibility_atlas_id) else {
+        let Some(&visibility_view) = ctx.views.get(&self.visibility_atlas_ids[atlas_idx]) else {
             return;
         };
 
@@ -442,6 +465,22 @@ impl Pass for LightingPass {
             self.probe_bgl = Some(probe_bgl);
             self.probe_sampler = Some(probe_sampler);
 
+            let debug_flags_bgl =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("lighting_debug_flags_bgl"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
+            self.debug_flags_bgl = Some(debug_flags_bgl);
+
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("lighting_pipeline_layout"),
                 bind_group_layouts: &[
@@ -449,6 +488,7 @@ impl Pass for LightingPass {
                     Some(&cluster_bgl),
                     Some(&shadow_bgl),
                     Some(self.probe_bgl.as_ref().unwrap()),
+                    Some(self.debug_flags_bgl.as_ref().unwrap()),
                 ],
                 immediate_size: 0,
             });
@@ -593,6 +633,12 @@ impl Pass for LightingPass {
             self.cached_shadow_ptr = shadow_ptr;
         }
 
+        let irr_ptr = irradiance_view as *const wgpu::TextureView as usize;
+        if irr_ptr != self.cached_irradiance_ptr {
+            self.probe_bg = None;
+            self.cached_irradiance_ptr = irr_ptr;
+        }
+
         if self.probe_bg.is_none() {
             let probe_bgl = self.probe_bgl.as_ref().unwrap();
             let probe_sampler = self.probe_sampler.as_ref().unwrap();
@@ -624,10 +670,42 @@ impl Pass for LightingPass {
             }));
         }
 
+        let gpu_flags = self
+            .debug_flags
+            .read()
+            .expect("debug_flags RwLock poisoned")
+            .to_gpu();
+
+        if self.debug_flags_buf.is_none() {
+            self.debug_flags_buf = Some(device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("debug_flags_buf"),
+                    contents: bytemuck::bytes_of(&gpu_flags),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                },
+            ));
+            let debug_flags_bgl = self.debug_flags_bgl.as_ref().unwrap();
+            self.debug_flags_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("lighting_debug_flags_bg"),
+                layout: debug_flags_bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.debug_flags_buf.as_ref().unwrap().as_entire_binding(),
+                }],
+            }));
+        } else {
+            queue.write_buffer(
+                self.debug_flags_buf.as_ref().unwrap(),
+                0,
+                bytemuck::bytes_of(&gpu_flags),
+            );
+        }
+
         let cluster_bg: &wgpu::BindGroup = self.cluster_bg.as_ref().unwrap();
         let gbuffer_bg: &wgpu::BindGroup = self.gbuffer_bg.as_ref().unwrap();
         let shadow_bg: &wgpu::BindGroup = self.shadow_bg.as_ref().unwrap();
         let probe_bg: &wgpu::BindGroup = self.probe_bg.as_ref().unwrap();
+        let debug_flags_bg: &wgpu::BindGroup = self.debug_flags_bg.as_ref().unwrap();
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("lighting"),
@@ -649,6 +727,7 @@ impl Pass for LightingPass {
         pass.set_bind_group(1, cluster_bg, &[]);
         pass.set_bind_group(2, shadow_bg, &[]);
         pass.set_bind_group(3, probe_bg, &[]);
+        pass.set_bind_group(4, debug_flags_bg, &[]);
         pass.draw(0..3, 0..1);
     }
 }

@@ -1,9 +1,13 @@
+use std::sync::{Arc, RwLock};
+
 use crate::{
+    debug_flags::RenderDebugFlags,
     graph::RenderGraph,
     pass::{
         bvh_upload::BvhUploadPass,
         camera::CameraPass,
         cluster_assignment::ClusterAssignmentPass,
+        debug_overlay::DebugOverlayPass,
         gbuffer::GBufferPass,
         light_upload::LightUploadPass,
         lighting::LightingPass,
@@ -19,24 +23,27 @@ use crate::{
 };
 
 pub struct RenderGraphPBRBuilder {
-    gbuffer_shader:     ShaderAsset,
-    cluster_shader:     ShaderAsset,
-    lighting_shader:    ShaderAsset,
-    present_shader:     ShaderAsset,
-    shadow_shader:      ShaderAsset,
-    probe_trace_shader: ShaderAsset,
-    probe_update_shader: ShaderAsset,
+    gbuffer_shader:        ShaderAsset,
+    cluster_shader:        ShaderAsset,
+    lighting_shader:       ShaderAsset,
+    present_shader:        ShaderAsset,
+    shadow_shader:         ShaderAsset,
+    probe_trace_shader:    ShaderAsset,
+    probe_update_shader:   ShaderAsset,
+    debug_overlay_shader:  ShaderAsset,
+    debug_flags:           Option<Arc<RwLock<RenderDebugFlags>>>,
 }
 
 impl RenderGraphPBRBuilder {
     pub fn new(
-        gbuffer_shader:      ShaderAsset,
-        cluster_shader:      ShaderAsset,
-        lighting_shader:     ShaderAsset,
-        present_shader:      ShaderAsset,
-        shadow_shader:       ShaderAsset,
-        probe_trace_shader:  ShaderAsset,
-        probe_update_shader: ShaderAsset,
+        gbuffer_shader:       ShaderAsset,
+        cluster_shader:       ShaderAsset,
+        lighting_shader:      ShaderAsset,
+        present_shader:       ShaderAsset,
+        shadow_shader:        ShaderAsset,
+        probe_trace_shader:   ShaderAsset,
+        probe_update_shader:  ShaderAsset,
+        debug_overlay_shader: ShaderAsset,
     ) -> Self {
         Self {
             gbuffer_shader,
@@ -46,7 +53,14 @@ impl RenderGraphPBRBuilder {
             shadow_shader,
             probe_trace_shader,
             probe_update_shader,
+            debug_overlay_shader,
+            debug_flags: None,
         }
+    }
+
+    pub fn with_debug_flags(mut self, flags: Arc<RwLock<RenderDebugFlags>>) -> Self {
+        self.debug_flags = Some(flags);
+        self
     }
 }
 
@@ -57,6 +71,9 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         surface_config: &wgpu::SurfaceConfiguration,
     ) -> (RenderGraph, ResourceId) {
         let mut graph = RenderGraph::default();
+        if let Some(flags) = self.debug_flags {
+            graph.debug_flags = flags;
+        }
 
         let surface_view_id = graph.create_external_resource();
 
@@ -69,8 +86,10 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         let (bvh_pass, bvh_outputs) = BvhUploadPass::new(&mut graph);
         graph.add_pass(device, bvh_pass);
 
+        let debug_flags = graph.debug_flags_arc();
+
         let (probe_atlas_pass, probe_atlas_outputs) =
-            ProbeAtlasPass::new(&mut graph, ProbeGridConfig::default());
+            ProbeAtlasPass::new(&mut graph, ProbeGridConfig::default(), std::sync::Arc::clone(&debug_flags));
         graph.add_pass(device, probe_atlas_pass);
 
         let (probe_trace_pass, probe_trace_outputs) = ProbeTracePass::new(
@@ -116,11 +135,25 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             camera_buffer_id,
             surface_config,
             self.lighting_shader,
+            std::sync::Arc::clone(&debug_flags),
         );
         graph.add_pass(device, lighting_pass);
 
+        let (debug_overlay_pass, debug_overlay_outputs) = DebugOverlayPass::new(
+            &mut graph,
+            bvh_outputs.nodes_id,
+            bvh_outputs.info_id,
+            camera_buffer_id,
+            probe_atlas_outputs.probe_params_id,
+            bvh_outputs.node_count,
+            debug_flags,
+            self.debug_overlay_shader,
+        );
+        graph.add_pass(device, debug_overlay_pass);
+
         let present_pass = PresentPass::new(
             lighting_outputs.lit_id,
+            debug_overlay_outputs.debug_overlay_id,
             surface_view_id,
             surface_config.format,
             self.present_shader,

@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use bytemuck::bytes_of;
 use engine_core::world::World;
 
@@ -13,6 +16,7 @@ pub struct BvhOutputs {
     pub nodes_id: ResourceId,
     pub tris_id: ResourceId,
     pub info_id: ResourceId,
+    pub node_count: Arc<AtomicU32>,
 }
 
 pub struct BvhUploadPass {
@@ -22,6 +26,7 @@ pub struct BvhUploadPass {
     info_id: ResourceId,
     last_mesh_count: usize,
     dirty: bool,
+    node_count: Arc<AtomicU32>,
 }
 
 impl BvhUploadPass {
@@ -39,7 +44,8 @@ impl BvhUploadPass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let outputs = BvhOutputs { nodes_id, tris_id, info_id };
+        let node_count = Arc::new(AtomicU32::new(0));
+        let outputs = BvhOutputs { nodes_id, tris_id, info_id, node_count: Arc::clone(&node_count) };
         (
             Self {
                 node_id: None,
@@ -48,6 +54,7 @@ impl BvhUploadPass {
                 info_id,
                 last_mesh_count: 0,
                 dirty: true,
+                node_count,
             },
             outputs,
         )
@@ -98,6 +105,7 @@ impl Pass for BvhUploadPass {
         self.dirty = false;
 
         if meshes.is_empty() {
+            self.node_count.store(0, Ordering::Relaxed);
             queue.write_buffer(info_buf, 0, bytes_of(&BvhInfo { node_count: 0, tri_count: 0, enabled: 0, _pad: 0 }));
             return;
         }
@@ -108,9 +116,11 @@ impl Pass for BvhUploadPass {
             let verts = &mesh.vertices;
             for chunk in mesh.indices.chunks(3) {
                 if chunk.len() < 3 { continue; }
-                let v0 = verts[chunk[0] as usize].position;
-                let v1 = verts[chunk[1] as usize].position;
-                let v2 = verts[chunk[2] as usize].position;
+                let (i0, i1, i2) = (chunk[0] as usize, chunk[1] as usize, chunk[2] as usize);
+                if i0 >= verts.len() || i1 >= verts.len() || i2 >= verts.len() { continue; }
+                let v0 = verts[i0].position;
+                let v1 = verts[i1].position;
+                let v2 = verts[i2].position;
                 gpu_tris.push(GpuTriangle { v0, _pad0: 0, v1, _pad1: 0, v2, _pad2: 0 });
             }
         }
@@ -128,22 +138,25 @@ impl Pass for BvhUploadPass {
 
         if node_count > MAX_BVH_NODES {
             log::warn!("bvh_upload: {} nodes exceeds limit ({MAX_BVH_NODES}), skipping", node_count);
+            self.node_count.store(0, Ordering::Relaxed);
             queue.write_buffer(info_buf, 0, bytes_of(&BvhInfo { node_count: 0, tri_count: 0, enabled: 0, _pad: 0 }));
             return;
         }
 
+        let n = built.nodes.len() as u32;
         queue.write_buffer(nodes_buf, 0, bytemuck::cast_slice(&built.nodes));
         queue.write_buffer(tris_buf, 0, bytemuck::cast_slice(&built.triangles));
         queue.write_buffer(
             info_buf,
             0,
             bytes_of(&BvhInfo {
-                node_count: built.nodes.len() as u32,
+                node_count: n,
                 tri_count: built.triangles.len() as u32,
                 enabled: 1,
                 _pad: 0,
             }),
         );
+        self.node_count.store(n, Ordering::Relaxed);
         log::info!("bvh_upload: {} nodes uploaded", node_count);
     }
 }

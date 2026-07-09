@@ -36,6 +36,15 @@ struct CameraUniform {
 @group(3) @binding(3) var probe_sampler: sampler;
 @group(3) @binding(4) var<uniform> camera: CameraUniform;
 
+struct DebugFlags {
+    disable_albedo:   u32,
+    disable_indirect: u32,
+    disable_direct:   u32,
+    disable_shadows:  u32,
+}
+
+@group(4) @binding(0) var<uniform> debug: DebugFlags;
+
 fn octahedral_encode(n: vec3<f32>) -> vec2<f32> {
     let l1 = abs(n.x) + abs(n.y) + abs(n.z);
     var p = n.xy / l1;
@@ -78,8 +87,11 @@ fn chebyshev_weight(mean_d: f32, mean_d2: f32, dist: f32) -> f32 {
     return variance / (variance + d * d);
 }
 
-fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>) -> vec3<f32> {
-    let grid_pos = (pos_ws - probe_params.grid_origin) / probe_params.probe_spacing;
+fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {
+    let biased_pos = pos_ws
+        + N_ws    * probe_params.normal_bias
+        + view_dir * probe_params.view_bias;
+    let grid_pos = (biased_pos - probe_params.grid_origin) / probe_params.probe_spacing;
     let base_f   = floor(grid_pos);
     let base_i   = vec3<i32>(base_f);
     let frac     = grid_pos - base_f;
@@ -105,7 +117,7 @@ fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>) -> vec3<f32> {
 
                 let probe_ws = probe_params.grid_origin
                     + vec3f(f32(ci.x), f32(ci.y), f32(ci.z)) * probe_params.probe_spacing;
-                let probe_dist = length(pos_ws - probe_ws);
+                let probe_dist = length(biased_pos - probe_ws);
 
                 let vis_uv = visibility_atlas_uv(probe_index, oct_uv);
                 let vis    = textureSample(visibility_atlas, probe_sampler, vis_uv).rg;
@@ -233,14 +245,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Reversed-Z: depth_v == 0 means "at far plane / sky" — no geometry.
     if depth_v == 0.0 {
+        if cp.num_sky_lights == 0u {
+            return vec4f(0.0, 0.0, 0.0, 1.0);
+        }
         let far_ws4  = camera.inv_view_proj * vec4f(ndc_x, ndc_y, 0.0, 1.0);
         let near_ws4 = camera.inv_view_proj * vec4f(ndc_x, ndc_y, 1.0, 1.0);
         let ray_dir  = normalize(far_ws4.xyz / far_ws4.w - near_ws4.xyz / near_ws4.w);
         return vec4f(sky_color(ray_dir), 1.0);
     }
 
-    let albedo   = textureSample(t_albedo,   s_linear, in.uv).rgb;
-    let norm_enc = textureSample(t_normal,   s_linear, in.uv).rgb;
+    let albedo_raw = textureSample(t_albedo, s_linear, in.uv).rgb;
+    let albedo     = select(albedo_raw, vec3f(1.0), debug.disable_albedo != 0u);
+    let norm_enc   = textureSample(t_normal, s_linear, in.uv).rgb;
 
     // Reconstruct view-space depth from reversed-Z depth buffer value.
     // z_view_pos = z_near * z_far / (depth * (z_far - z_near) + z_near)
@@ -272,55 +288,65 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(heat, 0.3, 1.0 - heat, 1.0);
     }
 
-    let indirect = sample_probe_irradiance(pos_ws, N);
-    var color = albedo * max(indirect, vec3f(0.03));
-
-    for (var i = 0u; i < light_count; i++) {
-        let li    = light_indices[cluster_idx * MAX_LIGHTS_PER_CLUSTER + i];
-        let light = point_lights[li];
-
-        let to_light = light.position_vs - pos_vs;
-        let dist     = length(to_light);
-        if dist >= light.radius {
-            continue;
-        }
-
-        let L           = to_light / dist;
-        let diff        = max(dot(N, L), 0.0);
-        let attenuation = 1.0 - dist / light.radius;
-        color += albedo * light.color * (light.intensity * diff * attenuation * attenuation);
+    let cam_pos  = camera.inv_view[3].xyz;
+    let view_dir = normalize(cam_pos - pos_ws);
+    let indirect = sample_probe_irradiance(pos_ws, N, view_dir);
+    var color: vec3f;
+    if debug.disable_indirect != 0u {
+        color = vec3f(0.0);
+    } else {
+        color = albedo * max(indirect, vec3f(0.03));
     }
 
-    for (var i = 0u; i < cp.num_sky_lights; i++) {
-        let sky = sky_lights[i];
-        let L = normalize((camera.inv_view * vec4f(-sky.direction_vs, 0.0)).xyz);
-        if L.y < 0.0 { continue; }
-        let diff = max(dot(N, L), 0.0);
+    if debug.disable_direct == 0u {
+        for (var i = 0u; i < light_count; i++) {
+            let li    = light_indices[cluster_idx * MAX_LIGHTS_PER_CLUSTER + i];
+            let light = point_lights[li];
 
-        // Select cascade based on view-space depth and project into shadow space.
-        let cascade     = select_cascade(depth_vs);
-        let shadow_clip = sp.view_to_shadow[cascade] * vec4<f32>(pos_vs, 1.0);
-        let shadow_ndc  = shadow_clip.xyz / shadow_clip.w;
-        let shadow_uv   = shadow_ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
-        let ref_depth   = shadow_ndc.z - sp.bias;
-
-        var lit = 1.0;
-        if (shadow_uv.x >= 0.0 && shadow_uv.x <= 1.0 &&
-            shadow_uv.y >= 0.0 && shadow_uv.y <= 1.0 &&
-            ref_depth >= 0.0 && ref_depth <= 1.0) {
-            var shadow_sum = 0.0;
-            for (var sy: i32 = -1; sy <= 1; sy += 1) {
-                for (var sx: i32 = -1; sx <= 1; sx += 1) {
-                    let off = vec2<f32>(f32(sx), f32(sy)) * sp.inv_shadow_map_size;
-                    shadow_sum += textureSampleCompare(
-                        t_shadow, s_shadow, shadow_uv + off, i32(cascade), ref_depth,
-                    );
-                }
+            let to_light = light.position_vs - pos_vs;
+            let dist     = length(to_light);
+            if dist >= light.radius {
+                continue;
             }
-            lit = shadow_sum / 9.0;
+
+            let L           = to_light / dist;
+            let diff        = max(dot(N, L), 0.0);
+            let attenuation = 1.0 - dist / light.radius;
+            color += albedo * light.color * (light.intensity * diff * attenuation * attenuation);
         }
 
-        color += albedo * sky.color * (sky.intensity * diff * lit);
+        for (var i = 0u; i < cp.num_sky_lights; i++) {
+            let sky = sky_lights[i];
+            let L = normalize((camera.inv_view * vec4f(-sky.direction_vs, 0.0)).xyz);
+            if L.y < 0.0 { continue; }
+            let diff = max(dot(N, L), 0.0);
+
+            // Select cascade based on view-space depth and project into shadow space.
+            let cascade     = select_cascade(depth_vs);
+            let shadow_clip = sp.view_to_shadow[cascade] * vec4<f32>(pos_vs, 1.0);
+            let shadow_ndc  = shadow_clip.xyz / shadow_clip.w;
+            let shadow_uv   = shadow_ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+            let ref_depth   = shadow_ndc.z - sp.bias;
+
+            var lit = 1.0;
+            if debug.disable_shadows == 0u &&
+                shadow_uv.x >= 0.0 && shadow_uv.x <= 1.0 &&
+                shadow_uv.y >= 0.0 && shadow_uv.y <= 1.0 &&
+                ref_depth >= 0.0 && ref_depth <= 1.0 {
+                var shadow_sum = 0.0;
+                for (var sy: i32 = -1; sy <= 1; sy += 1) {
+                    for (var sx: i32 = -1; sx <= 1; sx += 1) {
+                        let off = vec2<f32>(f32(sx), f32(sy)) * sp.inv_shadow_map_size;
+                        shadow_sum += textureSampleCompare(
+                            t_shadow, s_shadow, shadow_uv + off, i32(cascade), ref_depth,
+                        );
+                    }
+                }
+                lit = shadow_sum / 9.0;
+            }
+
+            color += albedo * sky.color * (sky.intensity * diff * lit);
+        }
     }
 
     return vec4<f32>(color, 1.0);

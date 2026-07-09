@@ -108,13 +108,14 @@ fn main() -> anyhow::Result<()> {
         .parse_default_env()
         .init();
 
-    let gbuffer_shader = ShaderAsset::from_raw(include_str!("../shaders/gbuffer.wgsl"));
-    let cluster_shader = ShaderAsset::from_raw(include_str!("../shaders/cluster_assignment.wgsl"));
-    let lighting_shader = ShaderAsset::from_raw(include_str!("../shaders/lighting.wgsl"));
-    let present_shader = ShaderAsset::from_raw(include_str!("../shaders/present.wgsl"));
-    let shadow_shader = ShaderAsset::from_raw(include_str!("../shaders/shadow.wgsl"));
-    let probe_trace_shader = ShaderAsset::from_raw(include_str!("../shaders/probe_trace.wgsl"));
-    let probe_update_shader = ShaderAsset::from_raw(include_str!("../shaders/probe_update.wgsl"));
+    let gbuffer_shader        = ShaderAsset::from_raw(include_str!("../shaders/gbuffer.wgsl"));
+    let cluster_shader        = ShaderAsset::from_raw(include_str!("../shaders/cluster_assignment.wgsl"));
+    let lighting_shader       = ShaderAsset::from_raw(include_str!("../shaders/lighting.wgsl"));
+    let present_shader        = ShaderAsset::from_raw(include_str!("../shaders/present.wgsl"));
+    let shadow_shader         = ShaderAsset::from_raw(include_str!("../shaders/shadow.wgsl"));
+    let probe_trace_shader    = ShaderAsset::from_raw(include_str!("../shaders/probe_trace.wgsl"));
+    let probe_update_shader   = ShaderAsset::from_raw(include_str!("../shaders/probe_update.wgsl"));
+    let debug_overlay_shader  = ShaderAsset::from_raw(include_str!("../shaders/debug_overlay.wgsl"));
 
     let render_graph = RenderGraphPBRBuilder::new(
         gbuffer_shader,
@@ -124,6 +125,7 @@ fn main() -> anyhow::Result<()> {
         shadow_shader,
         probe_trace_shader,
         probe_update_shader,
+        debug_overlay_shader,
     );
 
     WindowedApplication::new(render_graph)

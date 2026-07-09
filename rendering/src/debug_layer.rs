@@ -3,15 +3,17 @@ use std::sync::{Arc, RwLock};
 use engine_core::world::World;
 use ui::UiLayer;
 
+use crate::debug_flags::RenderDebugFlags;
 use crate::profiler::FrameStats;
 
 pub struct DebugLayer {
     stats: Arc<RwLock<FrameStats>>,
+    debug_flags: Arc<RwLock<RenderDebugFlags>>,
 }
 
 impl DebugLayer {
-    pub fn new(stats: Arc<RwLock<FrameStats>>) -> Self {
-        Self { stats }
+    pub fn new(stats: Arc<RwLock<FrameStats>>, debug_flags: Arc<RwLock<RenderDebugFlags>>) -> Self {
+        Self { stats, debug_flags }
     }
 }
 
@@ -51,6 +53,56 @@ impl UiLayer for DebugLayer {
                                 ui.end_row();
                             }
                         });
+                }
+
+                ui.separator();
+                ui.label("Layers");
+                if let Ok(mut flags) = self.debug_flags.write() {
+                    ui.checkbox(&mut flags.albedo, "Albedo");
+                    ui.checkbox(&mut flags.indirect, "Indirect (GI)");
+                    ui.checkbox(&mut flags.direct, "Direct lights");
+                    ui.checkbox(&mut flags.shadows, "Shadows");
+
+                    ui.separator();
+                    ui.label("Visualization");
+                    ui.checkbox(&mut flags.show_bvh, "BVH AABBs");
+                    if flags.show_bvh {
+                        ui.indent("bvh_indent", |ui| {
+                            ui.checkbox(&mut flags.bvh_leaves_only, "Leaves only");
+                        });
+                    }
+                    ui.checkbox(&mut flags.show_probes, "DDGI Probes");
+
+                    ui.separator();
+                    ui.label("DDGI");
+                    ui.add(
+                        egui::Slider::new(&mut flags.ddgi_hysteresis, 0.0..=1.0)
+                            .text("Hysteresis"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut flags.ddgi_normal_bias, 0.0..=1.0)
+                            .text("Normal Bias"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut flags.ddgi_view_bias, 0.0..=1.0)
+                            .text("View Bias"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut flags.ddgi_probe_spacing, 0.5..=50.0)
+                            .text("Probe Spacing"),
+                    );
+                    ui.label("Grid Anchor");
+                    egui::Grid::new("grid_anchor").num_columns(2).show(ui, |ui| {
+                        ui.label("X");
+                        ui.add(egui::DragValue::new(&mut flags.ddgi_grid_anchor[0]).speed(0.5));
+                        ui.end_row();
+                        ui.label("Y");
+                        ui.add(egui::DragValue::new(&mut flags.ddgi_grid_anchor[1]).speed(0.5));
+                        ui.end_row();
+                        ui.label("Z");
+                        ui.add(egui::DragValue::new(&mut flags.ddgi_grid_anchor[2]).speed(0.5));
+                        ui.end_row();
+                    });
                 }
             });
     }

@@ -13,6 +13,7 @@ pub struct PresentPass {
     pipeline: Option<wgpu::RenderPipeline>,
     bind_group_layout: Option<wgpu::BindGroupLayout>,
     albedo_id: ResourceId,
+    debug_overlay_id: ResourceId,
     surface_id: ResourceId,
     surface_format: wgpu::TextureFormat,
 }
@@ -20,6 +21,7 @@ pub struct PresentPass {
 impl PresentPass {
     pub fn new(
         albedo_id: ResourceId,
+        debug_overlay_id: ResourceId,
         surface_id: ResourceId,
         surface_format: wgpu::TextureFormat,
         shader: ShaderAsset,
@@ -30,6 +32,7 @@ impl PresentPass {
             pipeline: None,
             bind_group_layout: None,
             albedo_id,
+            debug_overlay_id,
             surface_id,
             surface_format,
         }
@@ -42,7 +45,7 @@ impl PassDesc for PresentPass {
     }
 
     fn reads(&self) -> Vec<ResourceId> {
-        vec![self.albedo_id]
+        vec![self.albedo_id, self.debug_overlay_id]
     }
 
     fn writes(&self) -> Vec<ResourceId> {
@@ -65,8 +68,8 @@ impl Pass for PresentPass {
     ) {
         let surface_view = ctx.views[&self.surface_id];
         let albedo_view = ctx.views[&self.albedo_id];
+        let Some(&debug_view) = ctx.views.get(&self.debug_overlay_id) else { return };
 
-        // Lazily create pipeline + layout (once)
         if self.pipeline.is_none() {
             let shader_module = self
                 .shader
@@ -90,11 +93,21 @@ impl Pass for PresentPass {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    count: None,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                },
             ];
 
             let bind_group_layout =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("present_bind_group_layout"),
+                    label: Some("present_bgl"),
                     entries: &layout_entries,
                 });
 
@@ -145,7 +158,7 @@ impl Pass for PresentPass {
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("present_bind_group"),
+            label: Some("present_bg"),
             layout: bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -155,6 +168,10 @@ impl Pass for PresentPass {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(debug_view),
                 },
             ],
         });

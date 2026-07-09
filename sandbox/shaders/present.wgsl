@@ -1,8 +1,11 @@
 @group(0) @binding(0)
-var t_color: texture_2d<f32>;
+var t_lit: texture_2d<f32>;
 
 @group(0) @binding(1)
 var s_color: sampler;
+
+@group(0) @binding(2)
+var t_debug: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -32,6 +35,9 @@ fn aces(x: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let hdr = textureSample(t_color, s_color, in.uv).rgb;
-    return vec4<f32>(aces(hdr), 1.0);
+    let hdr = textureSample(t_lit, s_color, in.uv).rgb;
+    let tonemapped = aces(hdr);
+    let debug = textureSample(t_debug, s_color, in.uv);
+    let result = mix(tonemapped, debug.rgb, debug.a);
+    return vec4<f32>(result, 1.0);
 }

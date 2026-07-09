@@ -1,3 +1,5 @@
+use std::sync::{Arc, RwLock};
+
 use engine_core::world::World;
 use thiserror::Error;
 use wgpu::{
@@ -7,7 +9,7 @@ use wgpu::{
     SurfaceTarget,
 };
 
-use crate::{graph::RenderGraph, profiler::FrameStats, resource::ResourceId};
+use crate::{debug_flags::RenderDebugFlags, graph::RenderGraph, profiler::FrameStats, resource::ResourceId};
 
 pub trait OverlayPass: Send + 'static {
     fn execute(
@@ -111,6 +113,10 @@ impl Renderer {
         let caps = surface.get_capabilities(&adapter);
         if let Some(&srgb_fmt) = caps.formats.iter().find(|f| f.is_srgb()) {
             surface_config.format = srgb_fmt;
+            let linear_fmt = srgb_fmt.remove_srgb_suffix();
+            if linear_fmt != srgb_fmt {
+                surface_config.view_formats = vec![linear_fmt];
+            }
         }
 
         let (graph, surface_id) = builder.build(&device, &surface_config);
@@ -140,6 +146,10 @@ impl Renderer {
 
     pub fn frame_stats(&self) -> &FrameStats {
         self.graph.frame_stats()
+    }
+
+    pub fn debug_flags_arc(&self) -> Arc<RwLock<RenderDebugFlags>> {
+        self.graph.debug_flags_arc()
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -196,6 +206,16 @@ impl Renderer {
         );
 
         if let Some(overlay) = overlay {
+            let linear_fmt = self.surface_config.format.remove_srgb_suffix();
+            let overlay_view = if linear_fmt != self.surface_config.format {
+                surface_texture.texture.create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(linear_fmt),
+                    ..Default::default()
+                })
+            } else {
+                surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default())
+            };
+
             let mut ui_encoder = self.device.create_command_encoder(
                 &wgpu::CommandEncoderDescriptor { label: Some("ui") },
             );
@@ -203,7 +223,7 @@ impl Renderer {
                 &self.device,
                 &self.queue,
                 &mut ui_encoder,
-                &surface_view,
+                &overlay_view,
                 (self.surface_config.width, self.surface_config.height),
                 world,
             );
