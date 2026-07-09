@@ -1,9 +1,11 @@
 use engine_core::world::World;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use wgpu::{BindGroup, BindGroupLayout, Device, util::DeviceExt};
 
 use crate::{
+    debug_flags::RenderDebugFlags,
     pass::{Pass, PassContext},
     profiler::{FrameProfiler, FrameStats, GpuProfiler},
     resource::{AllocatedResource, GraphResource, ResourceDescriptor, ResourceId},
@@ -116,7 +118,6 @@ impl<'a> SubGraphBuilder<'a> {
     }
 }
 
-#[derive(Default)]
 pub struct RenderGraph {
     ctx: GraphContext,
     nodes: Vec<GraphNode>,
@@ -124,6 +125,21 @@ pub struct RenderGraph {
     gpu_profiler: Option<GpuProfiler>,
     gpu_resolved: bool,
     surface_size: (u32, u32),
+    pub debug_flags: Arc<RwLock<RenderDebugFlags>>,
+}
+
+impl Default for RenderGraph {
+    fn default() -> Self {
+        Self {
+            ctx: GraphContext::default(),
+            nodes: Vec::new(),
+            profiler: FrameProfiler::default(),
+            gpu_profiler: None,
+            gpu_resolved: false,
+            surface_size: (0, 0),
+            debug_flags: Arc::new(RwLock::new(RenderDebugFlags::default())),
+        }
+    }
 }
 
 impl RenderGraph {
@@ -155,6 +171,10 @@ impl RenderGraph {
         resource.version += 1;
 
         true
+    }
+
+    pub fn debug_flags_arc(&self) -> Arc<RwLock<RenderDebugFlags>> {
+        Arc::clone(&self.debug_flags)
     }
 
     pub fn add_pass<P: Pass>(&mut self, device: &Device, pass: P) -> NodeId {
