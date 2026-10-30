@@ -45,6 +45,7 @@ pub struct DebugOverlayPass {
 }
 
 impl DebugOverlayPass {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         graph: &mut RenderGraph,
         bvh_nodes_id: ResourceId,

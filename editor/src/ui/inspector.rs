@@ -54,13 +54,13 @@ pub fn draw(ctx: &Context, state: &mut EditorState) {
                     }
                 }
                 Some(Selection::Mesh(idx)) => {
-                    if let Some(doc) = &state.document {
-                        if let Some(mesh) = doc.meshes().find(|m| m.index() == idx) {
-                            ui.label(egui::RichText::new(mesh.name().unwrap_or("(unnamed)")).strong());
-                            ui.separator();
-                            let prim_count = mesh.primitives().count();
-                            ui.label(format!("Primitives: {prim_count}"));
-                        }
+                    if let Some(doc) = &state.document
+                        && let Some(mesh) = doc.meshes().find(|m| m.index() == idx)
+                    {
+                        ui.label(egui::RichText::new(mesh.name().unwrap_or("(unnamed)")).strong());
+                        ui.separator();
+                        let prim_count = mesh.primitives().count();
+                        ui.label(format!("Primitives: {prim_count}"));
                     }
                 }
             }

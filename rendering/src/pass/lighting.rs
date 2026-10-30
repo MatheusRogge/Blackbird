@@ -693,12 +693,8 @@ impl Pass for LightingPass {
                     resource: self.debug_flags_buf.as_ref().unwrap().as_entire_binding(),
                 }],
             }));
-        } else {
-            queue.write_buffer(
-                self.debug_flags_buf.as_ref().unwrap(),
-                0,
-                bytemuck::bytes_of(&gpu_flags),
-            );
+        } else if let Some(buf) = &self.debug_flags_buf {
+            queue.write_buffer(buf, 0, bytemuck::bytes_of(&gpu_flags));
         }
 
         let cluster_bg: &wgpu::BindGroup = self.cluster_bg.as_ref().unwrap();

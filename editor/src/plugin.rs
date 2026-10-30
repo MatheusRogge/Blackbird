@@ -62,7 +62,7 @@ impl EditorPlugin {
 impl Plugin for EditorPlugin {
     fn setup(&mut self, engine: &mut Engine) -> Result<(), EnginePluginError> {
         let camera_key = self.reset_world(engine);
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().expect("editor state mutex poisoned");
         s.editor_camera_key = Some(camera_key);
         Ok(())
     }
@@ -78,7 +78,7 @@ impl Plugin for EditorPlugin {
             scene.load_batch(&mut engine.world(), 10);
         }
 
-        let in_camera_preview = self.state.lock().unwrap().camera_preview_node.is_some();
+        let in_camera_preview = self.state.lock().expect("editor state mutex poisoned").camera_preview_node.is_some();
 
         if !in_camera_preview {
             self.player_controller.tick::<Camera>(engine, delta);
@@ -103,12 +103,12 @@ impl EditorPlugin {
 
     fn handle_new_project(&mut self) {
         let needs_dialog = {
-            let s = self.state.lock().unwrap();
+            let s = self.state.lock().expect("editor state mutex poisoned");
             s.new_project_requested && s.new_project_path.is_none()
         };
         if needs_dialog {
             let picked = rfd::FileDialog::new().pick_folder();
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock().expect("editor state mutex poisoned");
             match picked {
                 Some(dir) => {
                     let name = dir
@@ -121,10 +121,10 @@ impl EditorPlugin {
             }
         }
 
-        let pending = self.state.lock().unwrap().new_project_path.take();
+        let pending = self.state.lock().expect("editor state mutex poisoned").new_project_path.take();
         if let Some((dir, name)) = pending {
             let result = crate::project::Project::create(&dir, &name);
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock().expect("editor state mutex poisoned");
             s.new_project_requested = false;
             match result {
                 Ok(project) => {
@@ -140,26 +140,26 @@ impl EditorPlugin {
 
     fn handle_open_project(&mut self) {
         let needs_dialog = {
-            let s = self.state.lock().unwrap();
+            let s = self.state.lock().expect("editor state mutex poisoned");
             s.open_project_requested && s.open_project_path.is_none()
         };
         if needs_dialog {
             let picked = rfd::FileDialog::new().pick_folder();
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock().expect("editor state mutex poisoned");
             match picked {
                 Some(dir) => s.open_project_path = Some(dir),
                 None => s.open_project_requested = false,
             }
         }
 
-        let pending = self.state.lock().unwrap().open_project_path.take();
+        let pending = self.state.lock().expect("editor state mutex poisoned").open_project_path.take();
         if let Some(dir) = pending {
             self.load_project(dir);
         }
     }
 
     fn handle_open_recent(&mut self, _engine: &mut Engine) {
-        let path = self.state.lock().unwrap().open_recent_path.take();
+        let path = self.state.lock().expect("editor state mutex poisoned").open_recent_path.take();
         if let Some(dir) = path {
             self.load_project(dir);
         }
@@ -167,7 +167,7 @@ impl EditorPlugin {
 
     fn load_project(&mut self, dir: PathBuf) {
         let result = crate::project::Project::load(&dir);
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().expect("editor state mutex poisoned");
         s.open_project_requested = false;
         match result {
             Ok(project) => {
@@ -193,11 +193,11 @@ impl EditorPlugin {
 
     fn handle_open_scene(&mut self, engine: &mut Engine) {
         let needs_dialog = {
-            let s = self.state.lock().unwrap();
+            let s = self.state.lock().expect("editor state mutex poisoned");
             s.open_requested && s.load_path.is_none()
         };
         if needs_dialog {
-            let start_dir = self.state.lock().unwrap()
+            let start_dir = self.state.lock().expect("editor state mutex poisoned")
                 .project_dir.as_ref()
                 .map(|d| crate::project::Project::scenes_dir(d));
             let mut dialog = rfd::FileDialog::new().add_filter("GLTF / GLB", &["gltf", "glb"]);
@@ -205,14 +205,14 @@ impl EditorPlugin {
                 dialog = dialog.set_directory(dir);
             }
             let picked = dialog.pick_file();
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock().expect("editor state mutex poisoned");
             match picked {
                 Some(path) => s.load_path = Some(path),
                 None => s.open_requested = false,
             }
         }
 
-        let load_path = self.state.lock().unwrap().load_path.take();
+        let load_path = self.state.lock().expect("editor state mutex poisoned").load_path.take();
         if let Some(path) = load_path {
             self.start_load(engine, path);
         }
@@ -220,12 +220,12 @@ impl EditorPlugin {
 
     fn handle_export_scene(&mut self) {
         let needs_dialog = {
-            let s = self.state.lock().unwrap();
+            let s = self.state.lock().expect("editor state mutex poisoned");
             s.export_requested && s.export_path.is_none() && s.document.is_some()
         };
         if needs_dialog {
             let default_dir = {
-                let s = self.state.lock().unwrap();
+                let s = self.state.lock().expect("editor state mutex poisoned");
                 s.project_dir.as_ref()
                     .map(|d| crate::project::Project::scenes_dir(d))
                     .or_else(|| s.file_path.as_ref()
@@ -238,20 +238,20 @@ impl EditorPlugin {
                 dialog = dialog.set_directory(dir);
             }
             let picked = dialog.save_file();
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock().expect("editor state mutex poisoned");
             match picked {
                 Some(path) => s.export_path = Some(path),
                 None => s.export_requested = false,
             }
         }
 
-        let export_path = self.state.lock().unwrap().export_path.take();
+        let export_path = self.state.lock().expect("editor state mutex poisoned").export_path.take();
         if let Some(path) = export_path {
             let result = {
-                let s = self.state.lock().unwrap();
+                let s = self.state.lock().expect("editor state mutex poisoned");
                 crate::export::write_gltf(&s, &path)
             };
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock().expect("editor state mutex poisoned");
             s.export_requested = false;
             s.status = match result {
                 Ok(()) => format!("Exported to {}", path.display()),
@@ -268,7 +268,7 @@ impl EditorPlugin {
         let handle = engine.assets().load_async::<GLTFAsset>(path.to_str().unwrap_or(""));
         self.pending_gltf = Some(handle);
 
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().expect("editor state mutex poisoned");
         s.editor_camera_key = Some(camera_key);
         s.lights.clear();
         s.file_path = Some(path);
@@ -295,7 +295,7 @@ impl EditorPlugin {
                 let nodes = build_scene_nodes(&doc);
                 self.scene = Some(GltfScene::new(Arc::clone(&asset)));
                 let scene_path = {
-                    let mut s = self.state.lock().unwrap();
+                    let mut s = self.state.lock().expect("editor state mutex poisoned");
                     let path_display = s.file_path.as_ref()
                         .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
                         .unwrap_or_default();
@@ -309,14 +309,14 @@ impl EditorPlugin {
                 }
             }
             Err(e) => {
-                let mut s = self.state.lock().unwrap();
+                let mut s = self.state.lock().expect("editor state mutex poisoned");
                 s.status = format!("Load error: {e}");
             }
         }
     }
 
     fn handle_light_requests(&mut self, engine: &mut Engine) {
-        let request = self.state.lock().unwrap().add_light_requested.take();
+        let request = self.state.lock().expect("editor state mutex poisoned").add_light_requested.take();
         let Some(kind) = request else { return };
 
         let data = LightData::default_for(kind);
@@ -351,11 +351,11 @@ impl EditorPlugin {
                 intensity: *intensity,
             }),
         };
-        self.state.lock().unwrap().lights.push(SceneLight { key, data });
+        self.state.lock().expect("editor state mutex poisoned").lights.push(SceneLight { key, data });
     }
 
     fn apply_edits(&self, engine: &mut Engine) {
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock().expect("editor state mutex poisoned");
 
         // Update all lights every tick so inspector edits take effect immediately.
         let light_updates: Vec<_> = s.lights.iter()
@@ -406,7 +406,7 @@ impl EditorPlugin {
             }
         }
 
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock().expect("editor state mutex poisoned");
 
         if let (Some(cam_key), Some(idx)) = (s.editor_camera_key, s.camera_preview_node) {
             if let Some(edit) = s.node_edits.get(&idx) {
@@ -478,17 +478,17 @@ impl EditorPlugin {
 
         let base = scene_path.parent().unwrap_or(Path::new("."));
         for buffer in doc.buffers() {
-            if let gltf_api::buffer::Source::Uri(uri) = buffer.source() {
-                if !uri.starts_with("data:") {
-                    watch(&mut watcher, &base.join(uri));
-                }
+            if let gltf_api::buffer::Source::Uri(uri) = buffer.source()
+                && !uri.starts_with("data:")
+            {
+                watch(&mut watcher, &base.join(uri));
             }
         }
         for image in doc.images() {
-            if let gltf_api::image::Source::Uri { uri, .. } = image.source() {
-                if !uri.starts_with("data:") {
-                    watch(&mut watcher, &base.join(uri));
-                }
+            if let gltf_api::image::Source::Uri { uri, .. } = image.source()
+                && !uri.starts_with("data:")
+            {
+                watch(&mut watcher, &base.join(uri));
             }
         }
 
@@ -522,7 +522,7 @@ impl EditorPlugin {
             return;
         }
 
-        let path = match self.state.lock().unwrap().file_path.clone() {
+        let path = match self.state.lock().expect("editor state mutex poisoned").file_path.clone() {
             Some(p) => p,
             None => return,
         };

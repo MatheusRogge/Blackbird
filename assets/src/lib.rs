@@ -118,7 +118,7 @@ impl<A: Asset> AssetLoadHandle<A> {
     }
 
     pub fn try_get(&self) -> Option<Result<Arc<A>, Arc<AssetError>>> {
-        match &*self.inner.lock().unwrap() {
+        match &*self.inner.lock().expect("asset load state mutex poisoned") {
             AssetLoadState::Pending => None,
             AssetLoadState::Ready(a) => Some(Ok(Arc::clone(a))),
             AssetLoadState::Failed(e) => Some(Err(Arc::clone(e))),
@@ -242,7 +242,7 @@ impl AssetManager {
                 Err(e) => AssetLoadState::Failed(Arc::new(e)),
             };
 
-            *state.lock().unwrap() = new_state;
+            *state.lock().expect("asset load state mutex poisoned") = new_state;
         }));
 
         handle

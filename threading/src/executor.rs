@@ -63,7 +63,7 @@ impl Default for DefaultExecutor {
 
 impl Executor for DefaultExecutor {
     fn spawn(&self, task: Box<dyn FnOnce() + Send + 'static>) {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().expect("executor state mutex poisoned");
         if let Some(tx) = &state.task_tx {
             let _ = tx.send(task);
         }
@@ -78,7 +78,7 @@ impl Executor for DefaultExecutor {
             .spawn(move || f(signal))
             .expect("failed to spawn named thread");
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().expect("executor state mutex poisoned");
         state.named_threads.push(NamedThread {
             name,
             shutdown_tx,
@@ -87,7 +87,7 @@ impl Executor for DefaultExecutor {
     }
 
     fn shutdown(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().expect("executor state mutex poisoned");
 
         for t in &state.named_threads {
             let _ = t.shutdown_tx.send(());

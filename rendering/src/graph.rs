@@ -203,13 +203,13 @@ impl RenderGraph {
                     res.resource = None;
                     res.version += 1;
                 }
-                ResourceDescriptor::Texture { size, .. } => {
-                    if size.width != width || size.height != height {
-                        size.width = width;
-                        size.height = height;
-                        res.resource = None;
-                        res.version += 1;
-                    }
+                ResourceDescriptor::Texture { size, .. }
+                    if size.width != width || size.height != height =>
+                {
+                    size.width = width;
+                    size.height = height;
+                    res.resource = None;
+                    res.version += 1;
                 }
                 _ => {}
             }

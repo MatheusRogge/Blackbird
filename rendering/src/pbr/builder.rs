@@ -35,6 +35,7 @@ pub struct RenderGraphPBRBuilder {
 }
 
 impl RenderGraphPBRBuilder {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         gbuffer_shader:       ShaderAsset,
         cluster_shader:       ShaderAsset,
