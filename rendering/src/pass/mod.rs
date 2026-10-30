@@ -12,7 +12,7 @@ pub mod probe_update;
 pub mod shadow;
 
 use crate::{
-    arena::{BufferRange, GeometryArena},
+    arena::{BufferRange, FrameArena, GeometryArena},
     graph::NodeId,
     resource::{BindingResource, ResourceId},
 };
@@ -27,6 +27,7 @@ pub struct PassContext<'a> {
     pub upstream: HashMap<NodeId, &'a wgpu::BindGroup>,
     pub surface_size: (u32, u32),
     pub geometry: &'a GeometryArena,
+    pub frame: &'a FrameArena,
 }
 
 pub trait PassDesc {

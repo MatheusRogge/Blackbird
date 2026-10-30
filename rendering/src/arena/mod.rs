@@ -1,6 +1,8 @@
+mod frame;
 mod geometry;
 mod upload;
 
+pub use frame::{FrameArena, FrameSlice};
 pub use geometry::{GeometryArena, MeshDraw};
 pub use upload::UploadArena;
 

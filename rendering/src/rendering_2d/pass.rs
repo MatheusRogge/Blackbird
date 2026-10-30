@@ -399,37 +399,34 @@ impl Pass for SpritePass {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Group consecutive sprites sharing the same texture into batches
+        // Group consecutive sprites sharing the same texture into instance ranges
         struct Batch {
             tex_key: usize,
-            instances: Vec<SpriteInstance>,
+            instances: std::ops::Range<u32>,
         }
 
+        let mut instances: Vec<SpriteInstance> = Vec::with_capacity(sorted.len());
         let mut batches: Vec<Batch> = Vec::new();
         for sprite in &sorted {
             let tex_key = Arc::as_ptr(&sprite.texture) as usize;
-            let instance = SpriteInstance {
+            let index = instances.len() as u32;
+            instances.push(SpriteInstance {
                 model: Self::sprite_model(sprite),
                 color: sprite.color,
                 uv_rect: sprite.uv_rect,
-            };
+            });
             match batches.last_mut() {
-                Some(b) if b.tex_key == tex_key => b.instances.push(instance),
-                _ => batches.push(Batch { tex_key, instances: vec![instance] }),
+                Some(b) if b.tex_key == tex_key => b.instances.end = index + 1,
+                _ => batches.push(Batch { tex_key, instances: index..index + 1 }),
             }
         }
 
-        // Create instance buffers before starting the render pass (encoder borrow)
-        let instance_buffers: Vec<wgpu::Buffer> = batches
-            .iter()
-            .map(|b| {
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: bytemuck::cast_slice(&b.instances),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-            })
-            .collect();
+        let instance_slice = ctx.frame.alloc(
+            device,
+            queue,
+            bytemuck::cast_slice(&instances),
+            size_of::<SpriteInstance>() as u64,
+        );
 
         let load = match self.clear_color {
             Some(color) => wgpu::LoadOp::Clear(color),
@@ -457,12 +454,12 @@ impl Pass for SpritePass {
         pass.set_bind_group(0, &p.camera_bind_group, &[]);
         pass.set_vertex_buffer(0, p.quad_vb.slice(..));
         pass.set_index_buffer(p.quad_ib.slice(..), wgpu::IndexFormat::Uint16);
+        pass.set_vertex_buffer(1, instance_slice.range().slice());
 
-        for (batch, instance_buf) in batches.iter().zip(instance_buffers.iter()) {
+        for batch in &batches {
             let gpu_tex = &self.texture_cache[&batch.tex_key];
             pass.set_bind_group(1, &gpu_tex.bind_group, &[]);
-            pass.set_vertex_buffer(1, instance_buf.slice(..));
-            pass.draw_indexed(0..6, 0, 0..batch.instances.len() as u32);
+            pass.draw_indexed(0..6, 0, batch.instances.clone());
         }
     }
 }
