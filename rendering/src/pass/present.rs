@@ -12,7 +12,7 @@ pub struct PresentPass {
     shader: ShaderAsset,
     pipeline: Option<wgpu::RenderPipeline>,
     bind_group_layout: Option<wgpu::BindGroupLayout>,
-    albedo_id: ResourceId,
+    lit_id: ResourceId,
     debug_overlay_id: ResourceId,
     surface_id: ResourceId,
     surface_format: wgpu::TextureFormat,
@@ -20,7 +20,7 @@ pub struct PresentPass {
 
 impl PresentPass {
     pub fn new(
-        albedo_id: ResourceId,
+        lit_id: ResourceId,
         debug_overlay_id: ResourceId,
         surface_id: ResourceId,
         surface_format: wgpu::TextureFormat,
@@ -31,7 +31,7 @@ impl PresentPass {
             shader,
             pipeline: None,
             bind_group_layout: None,
-            albedo_id,
+            lit_id,
             debug_overlay_id,
             surface_id,
             surface_format,
@@ -45,7 +45,7 @@ impl PassDesc for PresentPass {
     }
 
     fn reads(&self) -> Vec<ResourceId> {
-        vec![self.albedo_id, self.debug_overlay_id]
+        vec![self.lit_id, self.debug_overlay_id]
     }
 
     fn writes(&self) -> Vec<ResourceId> {
@@ -67,7 +67,7 @@ impl Pass for PresentPass {
         _world: &World,
     ) {
         let surface_view = ctx.views[&self.surface_id];
-        let albedo_view = ctx.views[&self.albedo_id];
+        let lit_view = ctx.views[&self.lit_id];
         let Some(&debug_view) = ctx.views.get(&self.debug_overlay_id) else { return };
 
         if self.pipeline.is_none() {
@@ -163,7 +163,7 @@ impl Pass for PresentPass {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(albedo_view),
+                    resource: wgpu::BindingResource::TextureView(lit_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
