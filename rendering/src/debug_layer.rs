@@ -3,8 +3,13 @@ use std::sync::{Arc, RwLock};
 use engine_core::world::World;
 use ui::UiLayer;
 
+use crate::arena::texture_pool::AliasingReport;
 use crate::debug_flags::RenderDebugFlags;
 use crate::profiler::FrameStats;
+
+const LABEL_WIDTH: f32 = 64.0;
+const HEADER_HEIGHT: f32 = 20.0;
+const ROW_HEIGHT: f32 = 26.0;
 
 pub struct DebugLayer {
     stats: Arc<RwLock<FrameStats>>,
@@ -81,7 +86,11 @@ impl UiLayer for DebugLayer {
                     ));
                     ui.end_row();
                     ui.label("screen textures");
-                    ui.label(format!("{} logical → {} physical", mem.screen_textures.0, mem.screen_textures.1));
+                    ui.label(format!(
+                        "{} logical → {} physical",
+                        mem.screen_textures.logical(),
+                        mem.screen_textures.physical()
+                    ));
                     ui.end_row();
                 });
 
@@ -102,6 +111,7 @@ impl UiLayer for DebugLayer {
                         });
                     }
                     ui.checkbox(&mut flags.show_probes, "DDGI Probes");
+                    ui.checkbox(&mut flags.show_texture_aliasing, "Texture aliasing");
 
                     ui.separator();
                     ui.label("DDGI");
@@ -135,5 +145,131 @@ impl UiLayer for DebugLayer {
                     });
                 }
             });
+
+        let mut open = self
+            .debug_flags
+            .read()
+            .expect("debug_flags RwLock poisoned")
+            .show_texture_aliasing;
+        if open {
+            egui::Window::new("Texture aliasing")
+                .open(&mut open)
+                .resizable(false)
+                .show(ctx, |ui| aliasing_timeline(ui, &stats.memory.screen_textures));
+            if !open {
+                self.debug_flags
+                    .write()
+                    .expect("debug_flags RwLock poisoned")
+                    .show_texture_aliasing = false;
+            }
+        }
     }
+}
+
+/// Passes run left to right, each row is one physical texture, and each bar is
+/// a logical texture spanning the passes it is live for.
+fn aliasing_timeline(ui: &mut egui::Ui, report: &AliasingReport) {
+    let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+    let logical = report.logical_bytes();
+    let physical = report.physical_bytes();
+    ui.label(format!(
+        "{} logical → {} physical    {:.1} MiB → {:.1} MiB (saved {:.1} MiB)",
+        report.logical(),
+        report.physical(),
+        mib(logical),
+        mib(physical),
+        mib(logical.saturating_sub(physical))
+    ));
+    if report.unaliased > 0 {
+        ui.label(format!("{} screen texture(s) not aliased (read before written or unused)", report.unaliased));
+    }
+    ui.separator();
+
+    if report.passes.is_empty() {
+        ui.label("No passes compiled yet");
+        return;
+    }
+
+    let font = egui::FontId::proportional(11.0);
+    let longest = report.passes.iter().map(|p| p.len()).max().unwrap_or(0);
+    let col_width = (longest as f32 * 6.5).max(56.0);
+    let size = egui::vec2(
+        LABEL_WIDTH + col_width * report.passes.len() as f32,
+        HEADER_HEIGHT + ROW_HEIGHT * report.slots as f32,
+    );
+
+    egui::ScrollArea::horizontal().show(ui, |ui| {
+        let (response, painter) = ui.allocate_painter(size, egui::Sense::hover());
+        let origin = response.rect.min;
+        let visuals = ui.visuals();
+        let text_color = visuals.text_color();
+        let grid_color = visuals.widgets.noninteractive.bg_stroke.color;
+
+        for (i, pass) in report.passes.iter().enumerate() {
+            let x = origin.x + LABEL_WIDTH + col_width * i as f32;
+            painter.line_segment(
+                [egui::pos2(x, origin.y), egui::pos2(x, origin.y + size.y)],
+                egui::Stroke::new(1.0, grid_color),
+            );
+            painter.text(
+                egui::pos2(x + col_width * 0.5, origin.y + HEADER_HEIGHT * 0.5),
+                egui::Align2::CENTER_CENTER,
+                pass,
+                font.clone(),
+                text_color,
+            );
+        }
+
+        for slot in 0..report.slots {
+            painter.text(
+                egui::pos2(origin.x + 4.0, origin.y + HEADER_HEIGHT + ROW_HEIGHT * (slot as f32 + 0.5)),
+                egui::Align2::LEFT_CENTER,
+                format!("phys {slot}"),
+                font.clone(),
+                text_color,
+            );
+        }
+
+        let mut hovered = None;
+        for texture in &report.textures {
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(
+                    origin.x + LABEL_WIDTH + col_width * texture.first as f32,
+                    origin.y + HEADER_HEIGHT + ROW_HEIGHT * texture.slot as f32,
+                ),
+                egui::pos2(
+                    origin.x + LABEL_WIDTH + col_width * (texture.last + 1) as f32,
+                    origin.y + HEADER_HEIGHT + ROW_HEIGHT * (texture.slot + 1) as f32,
+                ),
+            )
+            .shrink(3.0);
+
+            let hue = (texture.id as f32 * 0.618_034).fract();
+            painter.rect_filled(bar, 4.0, egui::ecolor::Hsva::new(hue, 0.45, 0.65, 1.0));
+            painter.with_clip_rect(bar).text(
+                bar.left_center() + egui::vec2(6.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                format!("{} #{} {:?}", texture.writer, texture.id, texture.format),
+                font.clone(),
+                egui::Color32::BLACK,
+            );
+
+            if response.hover_pos().is_some_and(|p| bar.contains(p)) {
+                hovered = Some(texture);
+                painter.rect_stroke(bar, 4.0, egui::Stroke::new(2.0, text_color), egui::StrokeKind::Outside);
+            }
+        }
+
+        if let Some(texture) = hovered {
+            response.on_hover_ui_at_pointer(|ui| {
+                ui.label(format!("resource #{} written by {}", texture.id, texture.writer));
+                ui.label(format!("{:?}, {:.2} MiB", texture.format, mib(texture.bytes)));
+                ui.label(format!(
+                    "live: {} → {}",
+                    report.passes[texture.first], report.passes[texture.last]
+                ));
+                ui.label(format!("physical texture {}", texture.slot));
+            });
+        }
+    });
 }

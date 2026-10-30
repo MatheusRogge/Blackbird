@@ -19,6 +19,7 @@ pub struct RenderDebugFlags {
     pub bvh_leaves_only: bool,
     pub show_probes:     bool,
     pub show_grid:       bool,
+    pub show_texture_aliasing: bool,
 
     pub ddgi_hysteresis:    f32,
     pub ddgi_normal_bias:   f32,
@@ -39,6 +40,7 @@ impl Default for RenderDebugFlags {
             bvh_leaves_only: false,
             show_probes:     false,
             show_grid:       false,
+            show_texture_aliasing: false,
 
             ddgi_hysteresis:    0.97,
             ddgi_normal_bias:   0.2,

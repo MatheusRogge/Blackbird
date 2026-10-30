@@ -8,7 +8,7 @@ use wgpu::{BindGroup, BindGroupLayout, Device};
 use crate::{
     arena::{
         ArenaStats, BufferRange, FrameArena, GeometryArena, UploadArena,
-        texture_pool::{self, Lifetime},
+        texture_pool::{self, AliasedTexture, AliasingReport, Lifetime},
     },
     debug_flags::RenderDebugFlags,
     pass::{Pass, PassContext},
@@ -31,7 +31,7 @@ pub struct GraphContext {
     upload_arena: Option<UploadArena>,
     geometry: Option<GeometryArena>,
     frame: Option<FrameArena>,
-    screen_textures: (usize, usize),
+    screen_textures: Arc<AliasingReport>,
 }
 
 impl GraphContext {
@@ -114,7 +114,7 @@ impl GraphContext {
 
     fn arena_stats(&self) -> ArenaStats {
         let mut stats = ArenaStats {
-            screen_textures: self.screen_textures,
+            screen_textures: Arc::clone(&self.screen_textures),
             ..ArenaStats::default()
         };
         if let Some(upload) = &self.upload_arena {
@@ -155,6 +155,7 @@ impl GraphContext {
         }
 
         let mut spans: HashMap<ResourceId, (usize, usize)> = HashMap::new();
+        let mut first_writer: HashMap<ResourceId, &'static str> = HashMap::new();
         let mut written: HashSet<ResourceId> = HashSet::new();
         let mut read_before_write: HashSet<ResourceId> = HashSet::new();
         for (index, node) in order.iter().enumerate() {
@@ -163,6 +164,9 @@ impl GraphContext {
             let writes = pass.writes();
             read_before_write.extend(reads.iter().filter(|r| !written.contains(r)));
             written.extend(&writes);
+            for &id in &writes {
+                first_writer.entry(id).or_insert(pass.name());
+            }
             for &id in reads.iter().chain(&writes) {
                 spans.entry(id).and_modify(|s| s.1 = index).or_insert((index, index));
             }
@@ -198,17 +202,47 @@ impl GraphContext {
             allocated.push(AllocatedResource::Texture(tex.clone(), view.clone()));
         }
 
+        let textures = ids
+            .iter()
+            .zip(&lifetimes)
+            .zip(&slots)
+            .map(|((&id, lifetime), &slot)| {
+                let ResourceDescriptor::ScreenTexture { format, .. } = *lifetime.key else {
+                    unreachable!("only screen textures are aliased")
+                };
+                let texel_bytes = format.block_copy_size(None).unwrap_or(0) as u64;
+                AliasedTexture {
+                    id,
+                    writer: first_writer.get(&id).copied().unwrap_or("?"),
+                    format,
+                    first: lifetime.first,
+                    last: lifetime.last,
+                    slot,
+                    bytes: width as u64 * height as u64 * texel_bytes,
+                }
+            })
+            .collect();
+
         for (id, resource) in ids.iter().zip(allocated) {
             self.resources.get_mut(id).expect("screen texture").resource = Some(resource);
         }
 
-        let unaliased = self.resources.values().filter(|r| is_screen(r) && r.resource.is_none()).count();
-        self.screen_textures = (ids.len() + unaliased, slot_count + unaliased);
+        let report = AliasingReport {
+            passes: order.iter().map(|node| self.passes[node].name()).collect(),
+            textures,
+            slots: slot_count,
+            unaliased: self
+                .resources
+                .values()
+                .filter(|r| is_screen(r) && r.resource.is_none())
+                .count(),
+        };
         log::debug!(
             "screen textures: {} logical -> {} physical",
-            self.screen_textures.0,
-            self.screen_textures.1
+            report.logical(),
+            report.physical()
         );
+        self.screen_textures = Arc::new(report);
     }
 }
 

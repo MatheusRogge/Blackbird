@@ -1,3 +1,51 @@
+use crate::resource::ResourceId;
+
+/// One logical screen texture and the physical slot it was assigned to.
+#[derive(Debug, Clone)]
+pub struct AliasedTexture {
+    pub id: ResourceId,
+    pub writer: &'static str,
+    pub format: wgpu::TextureFormat,
+    pub first: usize,
+    pub last: usize,
+    pub slot: usize,
+    pub bytes: u64,
+}
+
+/// Result of the last screen texture assignment, for debug views.
+#[derive(Debug, Clone, Default)]
+pub struct AliasingReport {
+    /// Pass names in execution order; `first` / `last` index into this.
+    pub passes: Vec<&'static str>,
+    pub textures: Vec<AliasedTexture>,
+    pub slots: usize,
+    /// Screen textures allocated outside aliasing (read before written, or
+    /// not used by any pass in the order).
+    pub unaliased: usize,
+}
+
+impl AliasingReport {
+    pub fn logical(&self) -> usize {
+        self.textures.len() + self.unaliased
+    }
+
+    pub fn physical(&self) -> usize {
+        self.slots + self.unaliased
+    }
+
+    pub fn logical_bytes(&self) -> u64 {
+        self.textures.iter().map(|t| t.bytes).sum()
+    }
+
+    pub fn physical_bytes(&self) -> u64 {
+        let mut slot_bytes = vec![0; self.slots];
+        for t in &self.textures {
+            slot_bytes[t.slot] = slot_bytes[t.slot].max(t.bytes);
+        }
+        slot_bytes.iter().sum()
+    }
+}
+
 /// Span of pass indices (inclusive) during which a transient texture is live.
 #[derive(Clone, Debug)]
 pub struct Lifetime<K> {
@@ -64,6 +112,29 @@ mod tests {
     fn different_keys_never_share() {
         let (_, count) = assign(&[lt(0, 0, 0), lt(1, 1, 1)]);
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn report_counts_shared_slot_once() {
+        let texture = |id, slot, bytes| AliasedTexture {
+            id,
+            writer: "pass",
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            first: 0,
+            last: 0,
+            slot,
+            bytes,
+        };
+        let report = AliasingReport {
+            passes: vec!["pass"],
+            textures: vec![texture(0, 0, 100), texture(1, 0, 100), texture(2, 1, 40)],
+            slots: 2,
+            unaliased: 1,
+        };
+        assert_eq!(report.logical(), 4);
+        assert_eq!(report.physical(), 3);
+        assert_eq!(report.logical_bytes(), 240);
+        assert_eq!(report.physical_bytes(), 140);
     }
 
     #[test]

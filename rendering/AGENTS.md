@@ -27,7 +27,7 @@ wgpu 30 renderer (Vulkan backend forced). Contains the render graph, every rende
 | `cache` | `PipelineCache`, `PipelineLayoutCache`, `BindGroupCache` helpers |
 | `profiler` | `FrameProfiler` (CPU per-pass, 60-frame avg), `GpuProfiler` (timestamp queries, async readback), `FrameStats`, `PassStats` |
 | `debug_flags` | `RenderDebugFlags` (shared `Arc<RwLock<_>>`), `DebugFlagsGpu` |
-| `debug_layer` | `DebugLayer` (feature `debug`): egui frame stats + debug flag toggles |
+| `debug_layer` | `DebugLayer` (feature `debug`): egui frame stats, arena occupancy, debug flag toggles, and the "Texture aliasing" timeline (passes × physical textures, fed by `ArenaStats.screen_textures: Arc<AliasingReport>`) |
 
 ## Render graph
 

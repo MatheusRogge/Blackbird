@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use texture_pool::AliasingReport;
+
 mod frame;
 mod geometry;
 mod upload;
@@ -20,8 +24,7 @@ pub struct ArenaStats {
     /// (used this frame, capacity) in bytes.
     pub frame_bytes: (u64, u64),
     pub frame_generation: u64,
-    /// (logical, physical) screen textures.
-    pub screen_textures: (usize, usize),
+    pub screen_textures: Arc<AliasingReport>,
 }
 
 /// A byte range inside a GPU buffer. Packed resources share their backing
