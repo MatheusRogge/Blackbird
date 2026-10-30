@@ -1,6 +1,6 @@
 # Blackbird
 
-Rust game engine on wgpu (Vulkan backend only). Cargo workspace. Each crate sets edition 2024 and `rust-version = 1.96` in its own manifest (there is no `[workspace.package]`).
+Rust game engine on wgpu (Vulkan backend only). Cargo workspace. Each crate sets edition 2024 and `rust-version = 1.99` in its own manifest (there is no `[workspace.package]`).
 
 Each member crate has its own `AGENTS.md` with architecture, public API and gotchas. Read the one for the crate you are touching.
 

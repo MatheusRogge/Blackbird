@@ -65,8 +65,10 @@ fn image_to_texture_asset(img: &gltf::image::Data) -> Option<Arc<TextureAsset>> 
         Format::R8G8B8A8 => img.pixels.clone(),
         Format::R8G8B8 => img
             .pixels
-            .chunks_exact(3)
-            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b]| [r, g, b, 255])
             .collect(),
         other => {
             log::warn!("Unsupported image format: {:?} — skipping texture", other);
