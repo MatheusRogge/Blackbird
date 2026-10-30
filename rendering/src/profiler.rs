@@ -195,7 +195,7 @@ impl GpuProfiler {
         }
 
         {
-            let raw = self.staging_buf.slice(..).get_mapped_range();
+            let raw = self.staging_buf.slice(..).get_mapped_range().expect("profiler staging buffer not mapped");
             let timestamps: &[u64] = bytemuck::cast_slice(&raw);
             for i in 0..self.num_passes as usize {
                 let delta = timestamps[i * 2 + 1].saturating_sub(timestamps[i * 2]);

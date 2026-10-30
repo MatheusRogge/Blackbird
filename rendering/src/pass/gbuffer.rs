@@ -413,7 +413,7 @@ impl Pass for GBufferPass {
                 vertex: wgpu::VertexState {
                     module: &shader_module,
                     entry_point: Some("vs_main"),
-                    buffers: &[Vertex::buffer_descriptor()],
+                    buffers: &[Some(Vertex::buffer_descriptor())],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {

@@ -1,39 +1,39 @@
-#![allow(deprecated)]
-use egui::Context;
+use egui::Ui;
 
 use crate::state::{EditorState, LightKind, NodeKind, SceneNode, Selection};
 
-pub fn draw(ctx: &Context, state: &mut EditorState) {
+pub fn draw(root: &mut Ui, state: &mut EditorState) {
+    let ctx = &root.ctx().clone();
     egui::Panel::left("hierarchy")
         .min_size(180.0)
         .default_size(220.0)
-        .show(ctx, |ui| {
+        .show(root, |ui| {
             ui.heading("Scene");
             ui.separator();
 
             // Right-click the panel background to add lights.
             let bg_response = ui.interact(
                 ui.available_rect_before_wrap(),
-                ui.id().with("scene_ctx"),
+                ui.scope_id().with("scene_ctx"),
                 egui::Sense::click(),
             );
             bg_response.context_menu(|ui| {
                 ui.menu_button("Add Light", |ui| {
                     if ui.button("☀ Sky Light").clicked() {
                         state.add_light_requested = Some(LightKind::Sky);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("● Point Light").clicked() {
                         state.add_light_requested = Some(LightKind::Point);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("◎ Spot Light").clicked() {
                         state.add_light_requested = Some(LightKind::Spot);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("▪ Area Light").clicked() {
                         state.add_light_requested = Some(LightKind::Area);
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             });

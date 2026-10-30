@@ -1,10 +1,9 @@
-#![allow(deprecated)]
-use egui::Context;
+use egui::Ui;
 
 use crate::state::EditorState;
 
-pub fn draw(ctx: &Context, state: &mut EditorState) {
-    egui::Panel::top("toolbar").show(ctx, |ui| {
+pub fn draw(root: &mut Ui, state: &mut EditorState) {
+    egui::Panel::top("toolbar").show(root, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("New Project…").clicked() {
@@ -44,7 +43,7 @@ pub fn draw(ctx: &Context, state: &mut EditorState) {
         });
     });
 
-    egui::Panel::bottom("statusbar").show(ctx, |ui| {
+    egui::Panel::bottom("statusbar").show(root, |ui| {
         ui.label(&state.status);
     });
 }

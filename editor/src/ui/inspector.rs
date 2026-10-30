@@ -1,13 +1,12 @@
-#![allow(deprecated)]
-use egui::Context;
+use egui::Ui;
 
 use crate::state::{EditorState, LightData, NodeEdit, NodeKind, Selection};
 
-pub fn draw(ctx: &Context, state: &mut EditorState) {
+pub fn draw(root: &mut Ui, state: &mut EditorState) {
     egui::Panel::right("inspector")
         .min_size(240.0)
         .default_size(280.0)
-        .show(ctx, |ui| {
+        .show(root, |ui| {
             ui.heading("Inspector");
             ui.separator();
 

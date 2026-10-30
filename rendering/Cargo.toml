@@ -14,7 +14,7 @@ debug = ["dep:egui", "dep:ui"]
 
 [dependencies]
 bytemuck = { version = "1.25.0", features = ["derive"] }
-wgpu = { version = "29.0.1", features = ["wgsl"] }
+wgpu = { version = "30.0.1", features = ["wgsl"] }
 
 log = { workspace = true }
 thiserror = { workspace = true }
@@ -23,5 +23,5 @@ ultraviolet = { workspace = true }
 assets = { path = "../assets/" }
 engine_core = { path = "../core/" }
 
-egui = { version = "0.34", optional = true }
+egui = { version = "0.37", optional = true }
 ui   = { path = "../ui/", optional = true }

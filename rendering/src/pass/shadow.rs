@@ -263,7 +263,7 @@ impl Pass for ShadowPass {
                 vertex: wgpu::VertexState {
                     module: &module,
                     entry_point: Some("vs_main"),
-                    buffers: &[crate::mesh::Vertex::buffer_descriptor()],
+                    buffers: &[Some(crate::mesh::Vertex::buffer_descriptor())],
                     compilation_options: Default::default(),
                 },
                 fragment: None,

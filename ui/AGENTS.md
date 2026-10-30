@@ -1,6 +1,6 @@
 # ui
 
-egui (0.34) integration on top of wgpu. Re-exports `egui`. Depends only on `engine_core`, so it knows nothing about `rendering` or `engine`.
+egui (0.37) integration on top of wgpu. Re-exports `egui`. Depends only on `engine_core`, so it knows nothing about `rendering` or `engine`.
 
 ## API
 
@@ -30,3 +30,8 @@ Layers get `&World` under the render thread's **read** lock. Don't mutate game s
 - `Key::Scancode(_)` is not forwarded as an egui key. Letter keys reach egui only as `TextInput`.
 - `command` modifier = ctrl, and `mac_cmd` is always false.
 - The match over `InputEvent` is exhaustive. New variants must be handled here.
+
+## egui 0.37 gotchas
+- Panels (`egui::Panel`, `CentralPanel`) only show inside a `Ui`. From a `UiLayer`, wrap them in `ctx.root_ui(|ui| …)`. Windows and `Area`s still take `&Context`.
+- `egui` no longer enables `default_fonts` by default. It is turned on in this crate's `Cargo.toml`. Without it, no text renders.
+- `TexturesDelta` debug-asserts on drop if it still holds deltas, so `execute` drains it (`set` before painting, `free` after).

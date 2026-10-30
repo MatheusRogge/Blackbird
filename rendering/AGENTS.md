@@ -1,6 +1,6 @@
 # rendering
 
-wgpu 29 renderer (Vulkan backend forced). Contains the render graph, every render/compute pass, the deferred PBR + clustered lighting + CSM shadows + DDGI pipeline, the 2D sprite renderer, camera/light entities and the GPU profiler. Depends on `engine_core` and `assets` only. Re-exports `wgpu`.
+wgpu 30 renderer (Vulkan backend forced). Contains the render graph, every render/compute pass, the deferred PBR + clustered lighting + CSM shadows + DDGI pipeline, the 2D sprite renderer, camera/light entities and the GPU profiler. Depends on `engine_core` and `assets` only. Re-exports `wgpu`.
 
 ## Features
 - `rendering_2d` (default): the `rendering_2d` module.

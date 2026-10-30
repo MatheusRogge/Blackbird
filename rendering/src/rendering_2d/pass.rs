@@ -154,16 +154,16 @@ impl SpritePass {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 buffers: &[
-                    wgpu::VertexBufferLayout {
+                    Some(wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<QuadVertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &vertex_attrs,
-                    },
-                    wgpu::VertexBufferLayout {
+                    }),
+                    Some(wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<SpriteInstance>() as u64,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &instance_attrs,
-                    },
+                    }),
                 ],
                 compilation_options: Default::default(),
             },

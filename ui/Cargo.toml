@@ -8,8 +8,8 @@ rust-version = "1.99"
 workspace = true
 
 [dependencies]
-egui     = "0.34"
-egui-wgpu = "0.34"
-wgpu     = { version = "29", features = ["wgsl"] }
+egui     = { version = "0.37", features = ["default_fonts"] }
+egui-wgpu = "0.37"
+wgpu     = { version = "30", features = ["wgsl"] }
 
 engine_core = { path = "../core/" }

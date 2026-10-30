@@ -87,6 +87,7 @@ impl Renderer {
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
                 power_preference: PowerPreference::None,
+                apply_limit_buckets: false,
             })
             .await?;
 
@@ -233,6 +234,6 @@ impl Renderer {
         }
 
         self.graph.schedule_gpu_readback(&self.device);
-        surface_texture.present();
+        self.queue.present(surface_texture);
     }
 }

@@ -78,7 +78,7 @@ impl EguiRenderer {
                 }
                 InputEvent::ModifiersChanged(m) => {
                     self.current_modifiers = to_egui_mods(*m);
-                    self.raw_input.modifiers = self.current_modifiers;
+                    self.raw_input.events.push(Event::ModifiersChanged(self.current_modifiers));
                 }
                 InputEvent::MouseButtonPressed { button, modifiers } => {
                     self.current_modifiers = to_egui_mods(*modifiers);
@@ -114,6 +114,7 @@ impl EguiRenderer {
                         delta: Vec2::new(*x, *y),
                         modifiers: self.current_modifiers,
                         phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                     });
                 }
                 InputEvent::CursorLeft => {
@@ -163,18 +164,18 @@ impl EguiRenderer {
         for layer in self.layers.iter_mut() {
             layer.ui(&self.ctx, world);
         }
-        let full_output = self.ctx.end_pass();
+        let mut full_output = self.ctx.end_pass();
 
         self.ui_wants_pointer
             .store(self.ctx.egui_wants_pointer_input(), Ordering::Relaxed);
         self.ui_wants_keyboard
             .store(self.ctx.egui_wants_keyboard_input(), Ordering::Relaxed);
 
-        for (id, delta) in &full_output.textures_delta.set {
-            self.renderer.update_texture(device, queue, *id, delta);
-        }
-        for id in &full_output.textures_delta.free {
-            self.renderer.free_texture(id);
+        let mut textures_delta = std::mem::take(&mut full_output.textures_delta);
+        for (id, deltas) in textures_delta.set.drain() {
+            for delta in &deltas {
+                self.renderer.update_texture(device, queue, id, delta);
+            }
         }
 
         let primitives = self.ctx.tessellate(full_output.shapes, ppp);
@@ -201,6 +202,10 @@ impl EguiRenderer {
                 })
                 .forget_lifetime();
             self.renderer.render(&mut rpass, &primitives, &screen_desc);
+        }
+
+        for id in textures_delta.free.drain() {
+            self.renderer.free_texture(&id);
         }
 
         if !extra_cmds.is_empty() {

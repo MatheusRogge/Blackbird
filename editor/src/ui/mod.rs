@@ -20,9 +20,11 @@ impl EditorUiLayer {
 impl UiLayer for EditorUiLayer {
     fn ui(&mut self, ctx: &egui::Context, _world: &World) {
         let Ok(mut state) = self.state.try_lock() else { return };
-        toolbar::draw(ctx, &mut state);
-        hierarchy::draw(ctx, &mut state);
-        inspector::draw(ctx, &mut state);
+        ctx.root_ui(|root| {
+            toolbar::draw(root, &mut state);
+            hierarchy::draw(root, &mut state);
+            inspector::draw(root, &mut state);
+        });
         draw_camera_hints(ctx);
     }
 }
@@ -31,7 +33,7 @@ fn draw_camera_hints(ctx: &egui::Context) {
     let screen = ctx.content_rect();
     let margin = 12.0;
 
-    egui::Area::new(egui::Id::new("camera_hints"))
+    egui::Area::new(egui::Id::unique("camera_hints"))
         .fixed_pos(egui::pos2(screen.right() - margin, screen.bottom() - margin))
         .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(0.0, 0.0))
         .interactable(false)
