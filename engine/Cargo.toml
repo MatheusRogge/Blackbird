@@ -23,7 +23,7 @@ ultraviolet = { workspace = true }
 default  = []
 assets   = ["dep:assets"]
 gltf     = ["dep:gltf", "dep:assets", "assets"]
-window   = ["dep:rendering", "dep:winit", "dep:pollster"]
+window   = ["dep:rendering", "dep:winit", "dep:pollster", "assets"]
 ui       = ["dep:ui", "window"]
 full     = ["assets", "gltf", "window", "ui"]
 debug    = ["window", "ui", "rendering/debug"]

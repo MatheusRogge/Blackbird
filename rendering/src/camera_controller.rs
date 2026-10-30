@@ -77,7 +77,7 @@ impl CameraController {
             }
         }
 
-        for event in unhandled.into_iter().rev() {
+        for event in unhandled {
             input.push(event);
         }
 

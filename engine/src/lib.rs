@@ -77,8 +77,6 @@ impl Engine {
         &mut self.input
     }
 
-    /// Split borrow: returns `(&mut InputBuffer, RwLockWriteGuard<World>)` simultaneously.
-    /// Useful when a subsystem needs both input and world without passing `&mut Engine`.
     pub fn ui_wants_pointer(&self) -> bool {
         self.ui_wants_pointer.load(Ordering::Relaxed)
     }
@@ -91,6 +89,8 @@ impl Engine {
         (Arc::clone(&self.ui_wants_pointer), Arc::clone(&self.ui_wants_keyboard))
     }
 
+    /// Split borrow: returns `(&mut InputBuffer, RwLockWriteGuard<World>)` simultaneously.
+    /// Useful when a subsystem needs both input and world without passing `&mut Engine`.
     pub fn input_and_world(&mut self) -> (&mut InputBuffer, RwLockWriteGuard<'_, World>) {
         let world = self.world.write().expect("world RwLock poisoned");
         (&mut self.input, world)

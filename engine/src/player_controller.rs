@@ -55,7 +55,7 @@ impl PlayerController {
             }
         }
 
-        for event in unhandled.into_iter().rev() {
+        for event in unhandled {
             engine.input().push(event);
         }
 
