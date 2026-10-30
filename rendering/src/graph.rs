@@ -6,7 +6,7 @@ use std::time::Instant;
 use wgpu::{BindGroup, BindGroupLayout, Device};
 
 use crate::{
-    arena::{BufferRange, UploadArena},
+    arena::{BufferRange, GeometryArena, UploadArena},
     debug_flags::RenderDebugFlags,
     pass::{Pass, PassContext},
     profiler::{FrameProfiler, FrameStats, GpuProfiler},
@@ -26,6 +26,7 @@ pub struct GraphContext {
     bind_group_layouts: HashMap<NodeId, BindGroupLayout>,
     bind_group_resources: HashMap<NodeId, BindGroup>,
     upload_arena: Option<UploadArena>,
+    geometry: Option<GeometryArena>,
 }
 
 impl GraphContext {
@@ -377,6 +378,11 @@ impl RenderGraph {
         if self.ctx.upload_arena.is_none() {
             self.ctx.build_upload_arena(device);
         }
+        self.ctx
+            .geometry
+            .get_or_insert_with(|| GeometryArena::new(device))
+            .sync(device, queue, world);
+        let geometry = self.ctx.geometry.as_ref().expect("geometry arena");
 
         let (sw, sh) = surface_size;
         for res in self.ctx.resources.values_mut() {
@@ -517,6 +523,7 @@ impl RenderGraph {
                 bind_group,
                 upstream,
                 surface_size,
+                geometry,
             };
 
             if let Some(gpu) = &self.gpu_profiler {

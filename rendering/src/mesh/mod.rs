@@ -3,10 +3,6 @@ use std::sync::Arc;
 use engine_core::entity::Entity;
 
 pub use ultraviolet::Vec3;
-use wgpu::{
-    Buffer, BufferUsages, Device,
-    util::{BufferInitDescriptor, DeviceExt},
-};
 
 use crate::texture::TextureAsset;
 
@@ -70,22 +66,6 @@ impl Mesh {
 
     pub fn get_indices_buffer_content(&self) -> &[u8] {
         bytemuck::cast_slice(self.indices.as_slice())
-    }
-
-    pub fn get_vertex_buffer(&self, device: &Device) -> Buffer {
-        device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("vertex_buffer"),
-            usage: BufferUsages::VERTEX,
-            contents: bytemuck::cast_slice(self.vertices.as_slice()),
-        })
-    }
-
-    pub fn get_index_buffer(&self, device: &Device) -> Buffer {
-        device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("index_buffer"),
-            usage: BufferUsages::INDEX,
-            contents: bytemuck::cast_slice(self.indices.as_slice()),
-        })
     }
 }
 

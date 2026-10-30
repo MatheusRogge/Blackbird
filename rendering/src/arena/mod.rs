@@ -1,5 +1,7 @@
+mod geometry;
 mod upload;
 
+pub use geometry::{GeometryArena, MeshDraw};
 pub use upload::UploadArena;
 
 /// A byte range inside a GPU buffer. Packed resources share their backing

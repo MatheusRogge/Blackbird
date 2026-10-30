@@ -1,7 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
-use wgpu::util::DeviceExt;
 
-use engine_core::{entity::EntityKey, world::World};
+use engine_core::world::World;
 
 use crate::{
     graph::{NodeId, RenderGraph},
@@ -34,8 +33,6 @@ pub struct GBufferPass {
     fallback_normal: Option<(wgpu::Texture, wgpu::TextureView)>,
     fallback_bind_group: Option<wgpu::BindGroup>,
     camera_bind_group: Option<wgpu::BindGroup>,
-    vertex_buffer_cache: HashMap<EntityKey, wgpu::Buffer>,
-    index_buffer_cache: HashMap<EntityKey, wgpu::Buffer>,
 
     camera_buffer_id: ResourceId,
     albedo_id: ResourceId,
@@ -93,8 +90,6 @@ impl GBufferPass {
                 fallback_normal: None,
                 fallback_bind_group: None,
                 camera_bind_group: None,
-                vertex_buffer_cache: HashMap::new(),
-                index_buffer_cache: HashMap::new(),
                 camera_buffer_id,
                 albedo_id,
                 normal_id,
@@ -606,25 +601,6 @@ impl Pass for GBufferPass {
             }
         }
 
-        // Upload vertex/index buffers for any new meshes before the render pass.
-        for handle in meshes.iter() {
-            let mesh = handle.entity;
-            self.vertex_buffer_cache.entry(handle.id).or_insert_with(|| {
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("vertex_buffer"),
-                    usage: wgpu::BufferUsages::VERTEX,
-                    contents: mesh.get_vertex_buffer_content(),
-                })
-            });
-            self.index_buffer_cache.entry(handle.id).or_insert_with(|| {
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("index_buffer"),
-                    usage: wgpu::BufferUsages::INDEX,
-                    contents: mesh.get_indices_buffer_content(),
-                })
-            });
-        }
-
         // Sort draw order by bind group key so consecutive meshes that share a
         // material don't trigger a GPU bind group switch.
         let mut draw_order: Vec<usize> = (0..meshes.len()).collect();
@@ -636,6 +612,8 @@ impl Pass for GBufferPass {
         });
 
         pass.set_pipeline(pipeline);
+        pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
+        pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
 
         if let Some(camera_bg) = self.camera_bind_group.as_ref() {
             pass.set_bind_group(0, camera_bg, &[]);
@@ -645,6 +623,9 @@ impl Pass for GBufferPass {
 
         for i in draw_order {
             let handle = &meshes[i];
+            let Some(draw) = ctx.geometry.get(handle.id) else {
+                continue;
+            };
             let mesh = handle.entity;
             let albedo_key = mesh.albedo_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
             let normal_key = mesh.normal_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
@@ -662,13 +643,7 @@ impl Pass for GBufferPass {
                 }
             }
 
-            let vertex_buffer = &self.vertex_buffer_cache[&handle.id];
-            let index_buffer = &self.index_buffer_cache[&handle.id];
-            let index_count = mesh.get_indices_count() as u32;
-
-            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..index_count, 0, 0..1);
+            pass.draw_indexed(draw.indices.clone(), draw.base_vertex, 0..1);
         }
     }
 }

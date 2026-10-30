@@ -1,9 +1,7 @@
-use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
-use engine_core::{entity::EntityKey, world::World};
+use engine_core::world::World;
 use ultraviolet::{Mat4, Vec3, Vec4};
-use wgpu::util::DeviceExt;
 
 use crate::{
     camera::Camera,
@@ -49,9 +47,6 @@ pub struct ShadowPass {
 
     cascade_views: Vec<wgpu::TextureView>,
     cascade_bind_group: Option<wgpu::BindGroup>,
-
-    vertex_buffer_cache: HashMap<EntityKey, wgpu::Buffer>,
-    index_buffer_cache: HashMap<EntityKey, wgpu::Buffer>,
 }
 
 impl ShadowPass {
@@ -89,8 +84,6 @@ impl ShadowPass {
                 cascade_vp_id,
                 cascade_views: Vec::new(),
                 cascade_bind_group: None,
-                vertex_buffer_cache: HashMap::new(),
-                index_buffer_cache: HashMap::new(),
             },
             outputs,
         )
@@ -328,25 +321,7 @@ impl Pass for ShadowPass {
             return;
         }
 
-        // Upload mesh buffers once.
         let meshes = world.get_entity_handles::<Mesh>();
-        for handle in meshes.iter() {
-            let mesh = handle.entity;
-            self.vertex_buffer_cache.entry(handle.id).or_insert_with(|| {
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    usage: wgpu::BufferUsages::VERTEX,
-                    contents: mesh.get_vertex_buffer_content(),
-                })
-            });
-            self.index_buffer_cache.entry(handle.id).or_insert_with(|| {
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    usage: wgpu::BufferUsages::INDEX,
-                    contents: mesh.get_indices_buffer_content(),
-                })
-            });
-        }
 
         let pipeline = self.pipeline.as_ref().unwrap();
         let inv_cam_view = camera.view_matrix().inversed();
@@ -388,16 +363,11 @@ impl Pass for ShadowPass {
 
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bg, &[vp_offset as u32]);
+            pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
+            pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
 
-            for handle in meshes.iter() {
-                if let (Some(vb), Some(ib)) = (
-                    self.vertex_buffer_cache.get(&handle.id),
-                    self.index_buffer_cache.get(&handle.id),
-                ) {
-                    pass.set_vertex_buffer(0, vb.slice(..));
-                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..handle.entity.get_indices_count() as u32, 0, 0..1);
-                }
+            for draw in meshes.iter().filter_map(|h| ctx.geometry.get(h.id)) {
+                pass.draw_indexed(draw.indices.clone(), draw.base_vertex, 0..1);
             }
         }
 

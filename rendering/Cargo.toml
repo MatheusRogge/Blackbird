@@ -25,3 +25,4 @@ engine_core = { path = "../core/" }
 
 egui = { version = "0.37", optional = true }
 ui   = { path = "../ui/", optional = true }
+offset-allocator = "0.2"
