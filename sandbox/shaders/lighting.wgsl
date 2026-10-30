@@ -166,11 +166,47 @@ struct GpuSkyLight {
     _pad: f32,
 }
 
+// Scalar padding: a trailing vec3 would be 16-aligned and break the 64-byte Rust layout.
+struct GpuSpotLight {
+    position_vs: vec3<f32>,
+    radius: f32,
+    direction_vs: vec3<f32>,
+    inner_cos: f32,
+    color: vec3<f32>,
+    outer_cos: f32,
+    intensity: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+
+// right_vs / up_vs are half-extent vectors of the rectangle.
+struct GpuAreaLight {
+    position_vs: vec3<f32>,
+    intensity: f32,
+    right_vs: vec3<f32>,
+    _pad0: f32,
+    up_vs: vec3<f32>,
+    _pad1: f32,
+    color: vec3<f32>,
+    _pad2: f32,
+}
+
+struct LightCounts {
+    num_point: u32,
+    num_spot: u32,
+    num_area: u32,
+    num_sky: u32,
+}
+
 @group(1) @binding(0) var<uniform>         cp:            ClusterParams;
 @group(1) @binding(1) var<storage, read>   point_lights:  array<GpuPointLight>;
 @group(1) @binding(2) var<storage, read>   light_grid:    array<u32>;
 @group(1) @binding(3) var<storage, read>   light_indices: array<u32>;
 @group(1) @binding(4) var<storage, read>   sky_lights:    array<GpuSkyLight>;
+@group(1) @binding(5) var<storage, read>   spot_lights:   array<GpuSpotLight>;
+@group(1) @binding(6) var<storage, read>   area_lights:   array<GpuAreaLight>;
+@group(1) @binding(7) var<uniform>         light_counts:  LightCounts;
 
 // Shadow
 struct ShadowParams {
@@ -269,6 +305,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Decode world-space normal (stored as (N + 1) / 2 in GBuffer)
     let N = normalize(norm_enc * 2.0 - vec3<f32>(1.0));
+    // Local lights are in view space. inv_view is rigid, so N * M == transpose(M) * N maps world -> view.
+    let N_vs = normalize(N * mat3x3<f32>(camera.inv_view[0].xyz, camera.inv_view[1].xyz, camera.inv_view[2].xyz));
 
     // Reconstruct world-space position from NDC + raw depth
     let pos_ws4 = camera.inv_view_proj * vec4f(ndc_x, ndc_y, depth_v, 1.0);
@@ -310,9 +348,54 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             }
 
             let L           = to_light / dist;
-            let diff        = max(dot(N, L), 0.0);
+            let diff        = max(dot(N_vs, L), 0.0);
             let attenuation = 1.0 - dist / light.radius;
             color += albedo * light.color * (light.intensity * diff * attenuation * attenuation);
+        }
+
+        for (var i = 0u; i < light_counts.num_spot; i++) {
+            let light = spot_lights[i];
+
+            let to_light = light.position_vs - pos_vs;
+            let dist     = length(to_light);
+            if dist >= light.radius {
+                continue;
+            }
+
+            let L           = to_light / dist;
+            let cone        = smoothstep(light.outer_cos, light.inner_cos, dot(-L, normalize(light.direction_vs)));
+            let diff        = max(dot(N_vs, L), 0.0);
+            let attenuation = 1.0 - dist / light.radius;
+            color += albedo * light.color * (light.intensity * diff * cone * attenuation * attenuation);
+        }
+
+        // Representative-point approximation: light from the closest point on the rectangle,
+        // scaled by its area so the falloff stays bounded as the surface approaches the light.
+        for (var i = 0u; i < light_counts.num_area; i++) {
+            let light = area_lights[i];
+
+            let half_r = length(light.right_vs);
+            let half_u = length(light.up_vs);
+            if half_r <= 0.0 || half_u <= 0.0 {
+                continue;
+            }
+            let r_dir = light.right_vs / half_r;
+            let u_dir = light.up_vs / half_u;
+
+            let rel     = pos_vs - light.position_vs;
+            let closest = light.position_vs
+                + r_dir * clamp(dot(rel, r_dir), -half_r, half_r)
+                + u_dir * clamp(dot(rel, u_dir), -half_u, half_u);
+
+            let to_light = closest - pos_vs;
+            let dist2    = max(dot(to_light, to_light), 1e-4);
+            let L        = to_light * inverseSqrt(dist2);
+
+            let area    = 4.0 * half_r * half_u;
+            let facing  = abs(dot(L, normalize(cross(r_dir, u_dir))));
+            let diff    = max(dot(N_vs, L), 0.0);
+            let falloff = area / (dist2 + area);
+            color += albedo * light.color * (light.intensity * diff * facing * falloff);
         }
 
         for (var i = 0u; i < cp.num_sky_lights; i++) {

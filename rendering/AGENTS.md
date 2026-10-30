@@ -75,7 +75,7 @@ The pass constructor convention is `XPass::new(&mut graph, upstream_outputs…, 
 | `shadow` | raster | first `SkyLight`, camera, meshes | 4-cascade 2048² depth array + `ShadowParams` (PSSM λ=0.75, sphere-fit, texel-snapped) |
 | `gbuffer` | raster | camera, meshes | albedo, normal, material, depth (reverse-Z, clear 0.0) |
 | `cluster_assignment` | compute | camera, point + sky lights | 16×9×24 cluster grid, ≤128 lights/cluster |
-| `lighting` | fullscreen | gbuffer, clusters, lights, shadows, probe atlas, debug flags | `lit` (HDR) |
+| `lighting` | fullscreen | gbuffer, clusters, point/spot/area/sky lights + counts, shadows, probe atlas, debug flags | `lit` (HDR) |
 | `debug_overlay` | raster | BVH, camera, probe params, debug flags | overlay texture (Rgba16Float): BVH boxes, probes, grid |
 | `present` | fullscreen | `lit` + overlay | surface |
 
@@ -86,6 +86,8 @@ Coordinate conventions: right-handed, Y-up, camera looks down -Z. Light data is 
 - The BVH only rebuilds when the mesh count changes. Moving or editing geometry at a constant count leaves DDGI tracing stale geometry.
 - "Main camera" is `get_entities::<Camera>().first()` in several passes. With multiple cameras, which one wins depends on slotmap order.
 - WGSL structs/constants are duplicated by hand (no shader includes). Keep the Rust `#[repr(C)]` structs (`ClusterParams`, `ProbeGridParams`, `ShadowParams`, `CameraUniform`, `DebugFlagsGpu`, `Gpu*Light`) and constants (`PROBE_GRID_DIM`, `PROBES_PER_ROW/COL`, `CLUSTER_*`, `NUM_CASCADES`) in sync with `sandbox/shaders/*.wgsl`.
+- Only point lights are clustered. Spot (≤64) and area (≤32) lights are looped over for every pixel in `lighting.wgsl`, so keep their counts low. Area lights use a representative-point approximation, are two-sided, and treat `right` / `up` as **half-extent** vectors.
+- The GBuffer stores **world-space** normals but local lights are in view space. `lighting.wgsl` converts the normal to view space (`N_vs`) for point/spot/area lights. Sky lights convert `L` to world space instead.
 - `pass/sdf_voxelize.rs` is **not** in `pass/mod.rs`, so it is dead code. Wire it in or delete it.
 - `Renderer::new` uses `adapter.limits()` and only the timestamp features the adapter supports. The GPU profiler activates only if `TIMESTAMP_QUERY | TIMESTAMP_QUERY_INSIDE_ENCODERS` are present.
 - The surface is sRGB, so passes output linear color. The egui overlay gets a non-sRGB view of the same texture.

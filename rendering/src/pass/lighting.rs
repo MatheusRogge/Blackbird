@@ -40,6 +40,9 @@ pub struct LightingPass {
     light_grid_id: ResourceId,
     light_indices_id: ResourceId,
     sky_buffer_id: ResourceId,
+    spot_buffer_id: ResourceId,
+    area_buffer_id: ResourceId,
+    counts_buffer_id: ResourceId,
 
     shadow_map_id: ResourceId,
     shadow_params_id: ResourceId,
@@ -112,6 +115,9 @@ impl LightingPass {
                 light_grid_id: cluster.light_grid_id,
                 light_indices_id: cluster.light_indices_id,
                 sky_buffer_id: light_buffers.sky_buffer_id,
+                spot_buffer_id: light_buffers.spot_buffer_id,
+                area_buffer_id: light_buffers.area_buffer_id,
+                counts_buffer_id: light_buffers.counts_buffer_id,
                 shadow_map_id: shadow.shadow_map_id,
                 shadow_params_id: shadow.shadow_params_id,
                 lit_id,
@@ -159,6 +165,9 @@ impl PassDesc for LightingPass {
             self.light_grid_id,
             self.light_indices_id,
             self.sky_buffer_id,
+            self.spot_buffer_id,
+            self.area_buffer_id,
+            self.counts_buffer_id,
             self.shadow_map_id,
             self.shadow_params_id,
             self.irradiance_atlas_ids[0],
@@ -230,6 +239,18 @@ impl Pass for LightingPass {
         };
 
         let Some(&sky_buf) = ctx.buffers.get(&self.sky_buffer_id) else {
+            return;
+        };
+
+        let Some(&spot_buf) = ctx.buffers.get(&self.spot_buffer_id) else {
+            return;
+        };
+
+        let Some(&area_buf) = ctx.buffers.get(&self.area_buffer_id) else {
+            return;
+        };
+
+        let Some(&counts_buf) = ctx.buffers.get(&self.counts_buffer_id) else {
             return;
         };
 
@@ -363,6 +384,36 @@ impl Pass for LightingPass {
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -563,6 +614,18 @@ impl Pass for LightingPass {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: sky_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: spot_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: area_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: counts_buf.as_entire_binding(),
                     },
                 ],
             }));
