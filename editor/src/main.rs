@@ -1,4 +1,5 @@
 mod export;
+mod math;
 mod plugin;
 mod project;
 mod recent;

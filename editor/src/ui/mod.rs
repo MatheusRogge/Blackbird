@@ -1,3 +1,4 @@
+mod gizmo;
 mod hierarchy;
 mod inspector;
 mod toolbar;
@@ -18,13 +19,15 @@ impl EditorUiLayer {
 }
 
 impl UiLayer for EditorUiLayer {
-    fn ui(&mut self, ctx: &egui::Context, _world: &World) {
+    fn ui(&mut self, ctx: &egui::Context, world: &World) {
         let Ok(mut state) = self.state.try_lock() else { return };
-        ctx.root_ui(|root| {
+        let viewport = ctx.root_ui(|root| {
             toolbar::draw(root, &mut state);
             hierarchy::draw(root, &mut state);
             inspector::draw(root, &mut state);
+            root.available_rect_before_wrap()
         });
+        gizmo::draw(ctx, &mut state, world, viewport);
         draw_camera_hints(ctx);
     }
 }
@@ -52,6 +55,8 @@ fn draw_camera_hints(ctx: &egui::Context) {
                         ("WASD",     "Move"),
                         ("LMB drag", "Orbit"),
                         ("Scroll",   "Zoom"),
+                        ("Click",    "Select"),
+                        ("1 / 2 / 3", "Move / Rotate / Scale"),
                     ] {
                         ui.horizontal(|ui| {
                             ui.add(egui::Label::new(

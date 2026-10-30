@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -12,8 +13,13 @@ use engine::rendering::camera::Camera;
 use engine::player_controller::PlayerController;
 use engine::rendering::camera_controller::{CameraController, CameraMode};
 use engine::rendering::light::{AreaLight, PointLight, SkyLight, SpotLight};
+use engine::rendering::mesh::Mesh;
 
+use crate::math;
 use crate::state::{LightData, NodeKind, SceneLight, SceneNode, Selection, SharedState};
+
+/// TRS of every edited node, used to detect when transforms must be reapplied.
+type TransformSnapshot = Vec<(usize, [f32; 10])>;
 
 pub struct EditorPlugin {
     state: SharedState,
@@ -24,6 +30,8 @@ pub struct EditorPlugin {
     watcher: Option<notify::RecommendedWatcher>,
     watch_rx: Option<mpsc::Receiver<notify::Result<notify::Event>>>,
     last_reload: Option<Instant>,
+    applied_transforms: TransformSnapshot,
+    applied_entities: usize,
 }
 
 impl EditorPlugin {
@@ -37,6 +45,8 @@ impl EditorPlugin {
             watcher: None,
             watch_rx: None,
             last_reload: None,
+            applied_transforms: Vec::new(),
+            applied_entities: 0,
         }
     }
 
@@ -77,6 +87,7 @@ impl Plugin for EditorPlugin {
         if let Some(scene) = &mut self.scene {
             scene.load_batch(&mut engine.world(), 10);
         }
+        self.apply_node_transforms(engine);
 
         let in_camera_preview = self.state.lock().expect("editor state mutex poisoned").camera_preview_node.is_some();
 
@@ -265,6 +276,8 @@ impl EditorPlugin {
         self.watch_rx = None;
         let camera_key = self.reset_world(engine);
         self.scene = None;
+        self.applied_transforms.clear();
+        self.applied_entities = 0;
         let handle = engine.assets().load_async::<GLTFAsset>(path.to_str().unwrap_or(""));
         self.pending_gltf = Some(handle);
 
@@ -274,6 +287,8 @@ impl EditorPlugin {
         s.file_path = Some(path);
         s.document = None;
         s.scene_nodes.clear();
+        s.node_parents.clear();
+        s.entity_nodes.clear();
         s.node_edits.clear();
         s.selected = None;
         s.camera_preview_node = None;
@@ -301,6 +316,10 @@ impl EditorPlugin {
                         .unwrap_or_default();
                     s.document = Some(doc.clone());
                     s.scene_nodes = nodes;
+                    s.node_parents = doc
+                        .nodes()
+                        .flat_map(|parent| parent.children().map(move |child| (child.index(), parent.index())))
+                        .collect();
                     s.status = format!("Loaded: {path_display}");
                     s.file_path.clone()
                 };
@@ -418,8 +437,9 @@ impl EditorPlugin {
                 drop(s);
 
                 let eye = ultraviolet::Vec3::new(tx, ty, tz);
-                let forward = rotate_by_quat(ultraviolet::Vec3::new(0.0, 0.0, -1.0), qx, qy, qz, qw);
-                let up = rotate_by_quat(ultraviolet::Vec3::new(0.0, 1.0, 0.0), qx, qy, qz, qw);
+                let rotation = [qx, qy, qz, qw];
+                let forward = math::rotate(rotation, ultraviolet::Vec3::new(0.0, 0.0, -1.0));
+                let up = math::rotate(rotation, ultraviolet::Vec3::new(0.0, 1.0, 0.0));
 
                 let mut world = engine.world();
                 if let Some(cam) = world.get_entity_mut::<Camera>(cam_key) {
@@ -454,6 +474,57 @@ impl EditorPlugin {
         } else {
             drop(s);
         }
+    }
+
+    /// Pushes node world transforms into their mesh entities whenever a node
+    /// edit changes or new meshes have streamed in.
+    fn apply_node_transforms(&mut self, engine: &mut Engine) {
+        let Some(scene) = &self.scene else { return };
+        let loaded: usize = scene.node_entities().values().map(Vec::len).sum();
+
+        let mut s = self.state.lock().expect("editor state mutex poisoned");
+        let mut snapshot: TransformSnapshot = s
+            .node_edits
+            .iter()
+            .map(|(&idx, e)| {
+                let [tx, ty, tz] = e.translation;
+                let [rx, ry, rz, rw] = e.rotation;
+                let [sx, sy, sz] = e.scale;
+                (idx, [tx, ty, tz, rx, ry, rz, rw, sx, sy, sz])
+            })
+            .collect();
+        snapshot.sort_unstable_by_key(|(idx, _)| *idx);
+
+        if snapshot == self.applied_transforms && loaded == self.applied_entities {
+            return;
+        }
+
+        if loaded != self.applied_entities {
+            s.entity_nodes = scene
+                .node_entities()
+                .iter()
+                .flat_map(|(&node, keys)| keys.iter().map(move |&key| (key, node)))
+                .collect();
+        }
+
+        let worlds: HashMap<usize, ultraviolet::Mat4> = scene
+            .node_entities()
+            .keys()
+            .map(|&node| (node, s.node_world(node)))
+            .collect();
+        drop(s);
+
+        let mut world = engine.world();
+        for (node, keys) in scene.node_entities() {
+            for &key in keys {
+                if let Some(mesh) = world.get_entity_mut::<Mesh>(key) {
+                    mesh.transform = worlds[node];
+                }
+            }
+        }
+
+        self.applied_transforms = snapshot;
+        self.applied_entities = loaded;
     }
 
     fn setup_watcher(&mut self, scene_path: &Path, doc: &gltf_api::Document) {
@@ -530,12 +601,6 @@ impl EditorPlugin {
         self.last_reload = Some(now);
         self.start_load(engine, path);
     }
-}
-
-fn rotate_by_quat(v: ultraviolet::Vec3, qx: f32, qy: f32, qz: f32, qw: f32) -> ultraviolet::Vec3 {
-    let q = ultraviolet::Vec3::new(qx, qy, qz);
-    let t = q.cross(v) * 2.0;
-    v + t * qw + q.cross(t)
 }
 
 fn build_scene_nodes(doc: &gltf_api::Document) -> Vec<SceneNode> {

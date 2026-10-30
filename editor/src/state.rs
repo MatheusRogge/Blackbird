@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use engine_core::entity::EntityKey;
 use gltf_api::Document;
+use ultraviolet::Mat4;
 
+use crate::math;
 use crate::project::Project;
 use crate::recent::RecentProjects;
 
@@ -54,6 +56,14 @@ impl Default for NodeEdit {
             far_plane: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GizmoMode {
+    #[default]
+    Translate,
+    Rotate,
+    Scale,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -159,9 +169,15 @@ pub struct EditorState {
     pub file_path: Option<PathBuf>,
     pub document: Option<Document>,
     pub scene_nodes: Vec<SceneNode>,
+    /// Child node index → parent node index.
+    pub node_parents: HashMap<usize, usize>,
+    /// Mesh entity → glTF node it was loaded from. Filled by the plugin as the
+    /// scene streams in.
+    pub entity_nodes: HashMap<EntityKey, usize>,
 
     pub selected: Option<Selection>,
     pub node_edits: HashMap<usize, NodeEdit>,
+    pub gizmo_mode: GizmoMode,
 
     pub editor_camera_key: Option<EntityKey>,
 
@@ -192,8 +208,11 @@ impl EditorState {
             file_path: None,
             document: None,
             scene_nodes: Vec::new(),
+            node_parents: HashMap::new(),
+            entity_nodes: HashMap::new(),
             selected: None,
             node_edits: HashMap::new(),
+            gizmo_mode: GizmoMode::default(),
             camera_preview_node: None,
             editor_camera_key: None,
             lights: Vec::new(),
@@ -219,14 +238,10 @@ impl EditorState {
         if let Some(doc) = &self.document
             && let Some(node) = doc.nodes().nth(node_idx)
         {
-            match node.transform() {
-                gltf_api::scene::Transform::Decomposed { translation, rotation, scale } => {
-                    edit.translation = translation;
-                    edit.rotation = rotation;
-                    edit.scale = scale;
-                }
-                gltf_api::scene::Transform::Matrix { .. } => {}
-            }
+            let (translation, rotation, scale) = node.transform().decomposed();
+            edit.translation = translation;
+            edit.rotation = rotation;
+            edit.scale = scale;
             if let Some(mesh) = node.mesh()
                 && let Some(prim) = mesh.primitives().next()
             {
@@ -246,5 +261,32 @@ impl EditorState {
             }
         }
         self.node_edits.insert(node_idx, edit);
+    }
+
+    /// Node transform relative to its parent, with any edit applied.
+    pub fn node_local(&self, node_idx: usize) -> Mat4 {
+        if let Some(edit) = self.node_edits.get(&node_idx) {
+            return math::trs(edit.translation, edit.rotation, edit.scale);
+        }
+        self.document
+            .as_ref()
+            .and_then(|doc| doc.nodes().nth(node_idx))
+            .map(|node| node.transform().matrix().into())
+            .unwrap_or_else(Mat4::identity)
+    }
+
+    pub fn node_world(&self, node_idx: usize) -> Mat4 {
+        self.parent_world(node_idx) * self.node_local(node_idx)
+    }
+
+    /// World transform of the node's parent (identity for a root node).
+    pub fn parent_world(&self, node_idx: usize) -> Mat4 {
+        let mut world = Mat4::identity();
+        let mut current = self.node_parents.get(&node_idx).copied();
+        while let Some(parent) = current {
+            world = self.node_local(parent) * world;
+            current = self.node_parents.get(&parent).copied();
+        }
+        world
     }
 }
