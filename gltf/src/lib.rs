@@ -1,12 +1,13 @@
 use assets::{Asset, AssetError, AssetResolver};
-use engine_core::world::World;
+use engine_core::{entity::EntityKey, world::World};
 use gltf::{Gltf, image::Format, import_buffers, import_images, mesh::util::ReadIndices};
 use rendering::{
     TextureAsset,
     camera::Camera,
-    mesh::{Mesh, Vertex},
+    mesh::{Mat4, Mesh, Vertex},
 };
 use std::{
+    collections::HashMap,
     fs::File,
     io::{self},
     path::Path,
@@ -79,10 +80,28 @@ fn image_to_texture_asset(img: &gltf::image::Data) -> Option<Arc<TextureAsset>> 
     Some(Arc::new(TextureAsset::new(img.width, img.height, rgba)))
 }
 
+/// Decodes each image at most once, so primitives sharing a texture share one
+/// `Arc` (and one GPU texture).
+#[derive(Default)]
+struct TextureCache {
+    textures: HashMap<usize, Option<Arc<TextureAsset>>>,
+}
+
+impl TextureCache {
+    fn get(&mut self, images: &[gltf::image::Data], texture: gltf::Texture<'_>) -> Option<Arc<TextureAsset>> {
+        let index = texture.source().index();
+        self.textures
+            .entry(index)
+            .or_insert_with(|| images.get(index).and_then(image_to_texture_asset))
+            .clone()
+    }
+}
+
 fn build_mesh_primitives(
     mesh: &gltf::Mesh<'_>,
     buffers: &[gltf::buffer::Data],
     images: &[gltf::image::Data],
+    textures: &mut TextureCache,
 ) -> Vec<Mesh> {
     let mut out = Vec::new();
 
@@ -149,13 +168,11 @@ fn build_mesh_primitives(
 
         let albedo_texture = pbr
             .base_color_texture()
-            .and_then(|tex_info| images.get(tex_info.texture().source().index()))
-            .and_then(image_to_texture_asset);
+            .and_then(|info| textures.get(images, info.texture()));
 
         let normal_texture = material
             .normal_texture()
-            .and_then(|tex_info| images.get(tex_info.texture().source().index()))
-            .and_then(image_to_texture_asset);
+            .and_then(|info| textures.get(images, info.texture()));
 
         out.push(Mesh::new(vertices, indices, albedo_texture, normal_texture));
     }
@@ -163,50 +180,94 @@ fn build_mesh_primitives(
     out
 }
 
+/// Matrix of a node's own transform, relative to its parent.
+pub fn local_matrix(node: &gltf::Node<'_>) -> Mat4 {
+    node.transform().matrix().into()
+}
+
+/// Every node of the default scene (or of all root nodes if there is none)
+/// that has a mesh, paired with its world matrix, in depth-first order.
+fn mesh_nodes(document: &gltf::Document) -> Vec<(usize, Mat4)> {
+    fn visit(node: gltf::Node<'_>, parent: Mat4, out: &mut Vec<(usize, Mat4)>) {
+        let world = parent * local_matrix(&node);
+        if node.mesh().is_some() {
+            out.push((node.index(), world));
+        }
+        for child in node.children() {
+            visit(child, world, out);
+        }
+    }
+
+    let roots: Vec<gltf::Node<'_>> = match document.default_scene().or_else(|| document.scenes().next()) {
+        Some(scene) => scene.nodes().collect(),
+        None => {
+            let children: std::collections::HashSet<usize> = document
+                .nodes()
+                .flat_map(|n| n.children().map(|c| c.index()))
+                .collect();
+            document.nodes().filter(|n| !children.contains(&n.index())).collect()
+        }
+    };
+
+    let mut out = Vec::new();
+    for root in roots {
+        visit(root, Mat4::identity(), &mut out);
+    }
+    out
+}
+
 pub struct GltfScene {
     asset: Arc<GLTFAsset>,
-    next_mesh: usize,
+    pending: Vec<(usize, Mat4)>,
+    next_node: usize,
     cameras_loaded: bool,
+    textures: TextureCache,
+    node_entities: HashMap<usize, Vec<EntityKey>>,
 }
 
 impl GltfScene {
     pub fn new(asset: Arc<GLTFAsset>) -> Self {
         Self {
+            pending: mesh_nodes(&asset.document),
             asset,
-            next_mesh: 0,
+            next_node: 0,
             cameras_loaded: false,
+            textures: TextureCache::default(),
+            node_entities: HashMap::new(),
         }
     }
 
     pub fn is_complete(&self) -> bool {
-        let total = self.asset.document.meshes().count();
-        self.next_mesh >= total && self.cameras_loaded
+        self.next_node >= self.pending.len() && self.cameras_loaded
     }
 
-    /// Inserts up to `count` meshes into `world`. Returns `true` if more remain.
+    /// Mesh entities created so far, keyed by glTF node index. Each primitive of
+    /// the node's mesh is one entity.
+    pub fn node_entities(&self) -> &HashMap<usize, Vec<EntityKey>> {
+        &self.node_entities
+    }
+
+    /// Inserts the meshes of up to `count` nodes into `world`, each placed at its
+    /// node's world transform. Returns `true` if more remain.
     pub fn load_batch(&mut self, world: &mut World, count: usize) -> bool {
         if !self.cameras_loaded {
             load_cameras(&self.asset.document, world);
             self.cameras_loaded = true;
         }
 
-        let meshes = self
-            .asset
-            .document
-            .meshes()
-            .skip(self.next_mesh)
-            .take(count);
-
-        if meshes.len() == 0 {
-            return false;
-        }
-
-        for mesh in meshes {
-            self.next_mesh = mesh.index() + 1;
-            for entity in build_mesh_primitives(&mesh, &self.asset.buffers, &self.asset.images) {
-                world.add_entity(entity);
+        let end = (self.next_node + count).min(self.pending.len());
+        for &(node_index, transform) in &self.pending[self.next_node..end] {
+            let Some(mesh) = self.asset.document.nodes().nth(node_index).and_then(|n| n.mesh()) else {
+                continue;
+            };
+            let primitives =
+                build_mesh_primitives(&mesh, &self.asset.buffers, &self.asset.images, &mut self.textures);
+            let keys = self.node_entities.entry(node_index).or_default();
+            for entity in primitives {
+                keys.push(world.add_entity(entity.with_transform(transform)));
             }
         }
+        self.next_node = end;
 
         !self.is_complete()
     }

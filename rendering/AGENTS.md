@@ -20,7 +20,7 @@ wgpu 30 renderer (Vulkan backend forced). Contains the render graph, every rende
 | `camera` | `Camera` entity (`eye/target/up/fovy/aspect/near/far`). **Reversed-Z** projection. Implements `Controllable`. |
 | `camera_controller` | `CameraController` (`FirstPerson` / `ThirdPerson` orbit + scroll zoom; respects `ui_wants_pointer`) |
 | `light` | Entities `PointLight`, `SpotLight`, `AreaLight`, `SkyLight` + `Gpu*` structs, `LightCounts`, `MAX_*_LIGHTS` (256/64/32/4) |
-| `mesh` | `Vertex` (pos, normal, color, uv, tangent), `Mesh` entity (+ optional albedo/normal `Arc<TextureAsset>`), `MeshBatch` |
+| `mesh` | `Vertex` (pos, normal, color, uv, tangent), `Mesh` entity (+ optional albedo/normal `Arc<TextureAsset>`, `transform: Mat4` local→world), `MeshBatch` |
 | `texture` | `TextureAsset` (RGBA8) |
 | `shader` | `ShaderAsset::from_raw(wgsl)`, `ShaderAssetResolver` |
 | `bvh` | CPU BVH builder (`build(Vec<GpuTriangle>) -> BvhBuild`), `BvhNode`, `BvhInfo`, limits 1M nodes / 500k tris |
@@ -60,7 +60,7 @@ The pass constructor convention is `XPass::new(&mut graph, upstream_outputs…, 
 - Most passes build their pipelines **lazily on first execute** and own extra wgpu objects themselves (own bind groups, material texture caches). Graph bind groups are only for the simple case. Pass-cached bind groups that reference screen textures must be dropped in `on_resize`, which is when aliasing is reassigned.
 
 ### Arenas
-- `GeometryArena` (`ctx.geometry`): one vertex + one index buffer for every `Mesh`, sub-allocated with `offset-allocator`, keyed by `EntityKey`. Bind `vertex_buffer()` / `index_buffer()` once per pass, then `draw_indexed(draw.indices.clone(), draw.base_vertex, ..)` with `ctx.geometry.get(key)`. When full it rebuilds bigger buffers and re-uploads every live mesh (`generation` bumps). Never hold a buffer across frames.
+- `GeometryArena` (`ctx.geometry`): one vertex + one index buffer for every `Mesh`, sub-allocated with `offset-allocator`, keyed by `EntityKey`, plus an **instance buffer** of `GpuModel { model, normal }` (normal = inverse-transpose) with one slot per mesh, rewritten from `Mesh::transform` every frame. Bind `vertex_buffer()` / `index_buffer()` and a bind group on `instance_buffer()` (layout `GeometryArena::instance_layout_entry`) once per pass, then `draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances())` with `ctx.geometry.get(key)`. Shaders read `models[instance_index]` (`gbuffer.wgsl` group 2, `shadow.wgsl` group 1; keep the WGSL `Model` struct in sync with `GpuModel`). When full it rebuilds bigger buffers and re-uploads every live mesh (`generation` bumps). Never hold a buffer across frames.
 - `FrameArena` (`ctx.frame`): `alloc(device, queue, data, align) -> FrameSlice` for data that changes every frame (sprite instances). It resets each frame. On overflow that frame falls back to a one-off buffer and the arena grows at the next `begin_frame` (`generation` bumps). A bind group built on it must be rebuilt when `generation` changes.
 
 ### Writing a new pass
@@ -75,7 +75,7 @@ The pass constructor convention is `XPass::new(&mut graph, upstream_outputs…, 
 |------|------|------------------------|--------|
 | `camera` | upload | first `Camera` | camera uniform (view_proj, inv_view_proj, inv_view) |
 | `light_upload` | upload | camera + all lights → **view space** | point/spot/area/sky buffers, counts |
-| `bvh_upload` | CPU build + upload | all `Mesh` (rebuilt only when the mesh **count** changes) | BVH nodes/tris/info |
+| `bvh_upload` | CPU build + upload | all `Mesh`, in world space via `transform`. Rebuilt when the mesh **count** changes, or once transforms have been unchanged for 10 frames after a change (so dragging doesn't rebuild every frame) | BVH nodes/tris/info |
 | `probe_atlas` | upload | camera eye, `RenderDebugFlags` DDGI params | probe grid params (grid snaps to `probe_spacing`, scrolls with the camera) |
 | `probe_trace` | compute | BVH, probe params, sky lights | per-ray radiance + direction (864 probes × 128 rays) |
 | `probe_update` | compute | rays, atlas[current] | atlas[1-current] (irradiance 8², visibility 16², 1px border), then flips `current_atlas` |
@@ -89,8 +89,8 @@ The pass constructor convention is `XPass::new(&mut graph, upstream_outputs…, 
 Coordinate conventions: right-handed, Y-up, camera looks down -Z. Light data is in **view space** on the GPU. Camera/GBuffer depth is reversed-Z (`GreaterEqual`, clear to 0). Shadow maps use standard Z (`LessEqual`).
 
 ## Gotchas
-- **Mesh geometry is keyed by `EntityKey`** in `GeometryArena`, and gbuffer material textures by `Arc` pointer. Changing a `Mesh`'s vertices in place is never re-uploaded, but replacing the entity (new key) works. Removed meshes are freed on the next frame. Material textures are still never freed.
-- The BVH only rebuilds when the mesh count changes. Moving or editing geometry at a constant count leaves DDGI tracing stale geometry.
+- **Mesh geometry is keyed by `EntityKey`** in `GeometryArena`, and gbuffer material textures by `Arc` pointer. Changing a `Mesh`'s vertices in place is never re-uploaded, but replacing the entity (new key) works. `Mesh::transform` *is* picked up every frame. Removed meshes are freed on the next frame. Material textures are still never freed.
+- Editing vertices in place at a constant mesh count leaves DDGI tracing stale geometry (the BVH only watches count and transforms). Negative-determinant transforms (mirroring) flip winding and get back-face culled.
 - "Main camera" is `get_entities::<Camera>().first()` in several passes. With multiple cameras, which one wins depends on slotmap order.
 - WGSL structs/constants are duplicated by hand (no shader includes). Keep the Rust `#[repr(C)]` structs (`ClusterParams`, `ProbeGridParams`, `ShadowParams`, `CameraUniform`, `DebugFlagsGpu`, `Gpu*Light`) and constants (`PROBE_GRID_DIM`, `PROBES_PER_ROW/COL`, `CLUSTER_*`, `NUM_CASCADES`) in sync with `sandbox/shaders/*.wgsl`.
 - Only point lights are clustered. Spot (≤64) and area (≤32) lights are looped over for every pixel in `lighting.wgsl`, so keep their counts low. Area lights use a representative-point approximation, are two-sided, and treat `right` / `up` as **half-extent** vectors.

@@ -12,6 +12,15 @@ var normal_tex: texture_2d<f32>;
 @group(1) @binding(2)
 var tex_sampler: sampler;
 
+// Mirrors rendering::arena::GpuModel.
+struct Model {
+    model: mat4x4<f32>,
+    normal: mat4x4<f32>,
+};
+
+@group(2) @binding(0)
+var<storage, read> models: array<Model>;
+
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
@@ -35,14 +44,15 @@ struct GBufferOutput {
 };
 
 @vertex
-fn vs_main(in: VertexInput) -> VertexOutput {
+fn vs_main(in: VertexInput, @builtin(instance_index) instance: u32) -> VertexOutput {
     var out: VertexOutput;
+    let m = models[instance];
 
-    out.clip_position = camera.view_proj * vec4<f32>(in.position, 1.0);
-    out.world_normal = normalize(in.normal);
+    out.clip_position = camera.view_proj * m.model * vec4<f32>(in.position, 1.0);
+    out.world_normal = normalize((m.normal * vec4<f32>(in.normal, 0.0)).xyz);
     out.color = in.color;
     out.uv = in.uv;
-    out.world_tangent = in.tangent;
+    out.world_tangent = vec4<f32>(normalize((m.model * vec4<f32>(in.tangent.xyz, 0.0)).xyz), in.tangent.w);
 
     return out;
 }

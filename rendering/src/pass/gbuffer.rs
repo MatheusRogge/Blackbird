@@ -5,6 +5,7 @@ use engine_core::world::World;
 use crate::{
     graph::{NodeId, RenderGraph},
     mesh::{Mesh, Vertex},
+    arena::GeometryArena,
     pass::{Pass, PassContext, PassDesc},
     resource::{BindingResource, ResourceDescriptor, ResourceId},
     shader::ShaderAsset,
@@ -25,6 +26,8 @@ pub struct GBufferPass {
     pipeline: Option<wgpu::RenderPipeline>,
     camera_bind_group_layout: Option<wgpu::BindGroupLayout>,
     texture_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    instance_layout: Option<wgpu::BindGroupLayout>,
+    instance_bind_group: Option<(u64, wgpu::BindGroup)>,
 
     texture_sampler: Option<wgpu::Sampler>,
     texture_cache: HashMap<usize, (wgpu::Texture, wgpu::TextureView)>,
@@ -83,6 +86,8 @@ impl GBufferPass {
                 pipeline: None,
                 camera_bind_group_layout: None,
                 texture_bind_group_layout: None,
+                instance_layout: None,
+                instance_bind_group: None,
                 texture_sampler: None,
                 texture_cache: HashMap::new(),
                 texture_bind_groups: HashMap::new(),
@@ -396,9 +401,14 @@ impl Pass for GBufferPass {
                     ],
                 });
 
+            let instance_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gbuffer_instance_layout"),
+                entries: &[GeometryArena::instance_layout_entry(0)],
+            });
+
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("gbuffer_pipeline_layout"),
-                bind_group_layouts: &[Some(&camera_layout), Some(&texture_layout)],
+                bind_group_layouts: &[Some(&camera_layout), Some(&texture_layout), Some(&instance_layout)],
                 immediate_size: 0,
             });
 
@@ -492,6 +502,7 @@ impl Pass for GBufferPass {
             self.pipeline = Some(pipeline);
             self.camera_bind_group_layout = Some(camera_layout);
             self.texture_bind_group_layout = Some(texture_layout);
+            self.instance_layout = Some(instance_layout);
             self.texture_sampler = Some(sampler);
             self.fallback_albedo = Some((fallback_albedo_tex, fallback_albedo_view));
             self.fallback_normal = Some((fallback_normal_tex, fallback_normal_view));
@@ -560,6 +571,21 @@ impl Pass for GBufferPass {
 
         let meshes = world.get_entity_handles::<Mesh>();
 
+        let generation = ctx.geometry.generation();
+        if self.instance_bind_group.as_ref().is_none_or(|(g, _)| *g != generation)
+            && let Some(layout) = self.instance_layout.as_ref()
+        {
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gbuffer_instances"),
+                layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ctx.geometry.instance_buffer().as_entire_binding(),
+                }],
+            });
+            self.instance_bind_group = Some((generation, bind_group));
+        }
+
         // Upload any new textures and build missing bind groups before the render
         // pass opens, so no resource creation happens during command recording.
         for handle in meshes.iter() {
@@ -612,6 +638,9 @@ impl Pass for GBufferPass {
         });
 
         pass.set_pipeline(pipeline);
+        if let Some((_, instance_bg)) = self.instance_bind_group.as_ref() {
+            pass.set_bind_group(2, instance_bg, &[]);
+        }
         pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
         pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
 
@@ -643,7 +672,7 @@ impl Pass for GBufferPass {
                 }
             }
 
-            pass.draw_indexed(draw.indices.clone(), draw.base_vertex, 0..1);
+            pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
         }
     }
 }

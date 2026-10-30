@@ -8,7 +8,7 @@ mod upload;
 pub mod texture_pool;
 
 pub use frame::{FrameArena, FrameSlice};
-pub use geometry::{GeometryArena, MeshDraw};
+pub use geometry::{GeometryArena, GpuModel, MeshDraw};
 pub use upload::UploadArena;
 
 /// Occupancy of the graph's arenas, published with `FrameStats`.

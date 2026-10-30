@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytemuck::bytes_of;
 use engine_core::world::World;
+use ultraviolet::{Mat4, Vec3};
 
 use crate::{
     bvh::{self, BvhInfo, BvhNode, GpuTriangle, MAX_BVH_NODES, MAX_BVH_TRIS},
@@ -11,6 +12,10 @@ use crate::{
     pass::{Pass, PassContext, PassDesc},
     resource::{ResourceDescriptor, ResourceId},
 };
+
+/// Frames a transform change must stay unchanged before the BVH is rebuilt, so
+/// dragging a mesh doesn't rebuild it every frame.
+const SETTLE_FRAMES: u32 = 10;
 
 pub struct BvhOutputs {
     pub nodes_id: ResourceId,
@@ -26,6 +31,9 @@ pub struct BvhUploadPass {
     info_id: ResourceId,
     last_mesh_count: usize,
     dirty: bool,
+    built_transforms: Vec<Mat4>,
+    seen_transforms: Vec<Mat4>,
+    settled_frames: u32,
     node_count: Arc<AtomicU32>,
 }
 
@@ -54,6 +62,9 @@ impl BvhUploadPass {
                 info_id,
                 last_mesh_count: 0,
                 dirty: true,
+                built_transforms: Vec::new(),
+                seen_transforms: Vec::new(),
+                settled_frames: 0,
                 node_count,
             },
             outputs,
@@ -99,10 +110,25 @@ impl Pass for BvhUploadPass {
             self.dirty = true;
         }
 
+        let transforms: Vec<Mat4> = meshes.iter().map(|m| m.transform).collect();
+        if transforms != self.built_transforms {
+            if transforms == self.seen_transforms {
+                self.settled_frames += 1;
+            } else {
+                self.settled_frames = 0;
+                self.seen_transforms.clone_from(&transforms);
+            }
+            if self.settled_frames >= SETTLE_FRAMES {
+                self.dirty = true;
+            }
+        }
+
         if !self.dirty {
             return;
         }
         self.dirty = false;
+        self.settled_frames = 0;
+        self.built_transforms = transforms;
 
         if meshes.is_empty() {
             self.node_count.store(0, Ordering::Relaxed);
@@ -113,14 +139,15 @@ impl Pass for BvhUploadPass {
         // Collect triangles from all meshes.
         let mut gpu_tris: Vec<GpuTriangle> = Vec::new();
         for mesh in &meshes {
+            let world_pos = |i: usize| -> [f32; 3] {
+                mesh.transform.transform_point3(Vec3::from(mesh.vertices[i].position)).into()
+            };
             let verts = &mesh.vertices;
             for chunk in mesh.indices.chunks(3) {
                 if chunk.len() < 3 { continue; }
                 let (i0, i1, i2) = (chunk[0] as usize, chunk[1] as usize, chunk[2] as usize);
                 if i0 >= verts.len() || i1 >= verts.len() || i2 >= verts.len() { continue; }
-                let v0 = verts[i0].position;
-                let v1 = verts[i1].position;
-                let v2 = verts[i2].position;
+                let (v0, v1, v2) = (world_pos(i0), world_pos(i1), world_pos(i2));
                 gpu_tris.push(GpuTriangle { v0, _pad0: 0, v1, _pad1: 0, v2, _pad2: 0 });
             }
         }

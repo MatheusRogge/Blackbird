@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use engine_core::entity::Entity;
 
-pub use ultraviolet::Vec3;
+pub use ultraviolet::{Mat4, Vec3};
 
 use crate::texture::TextureAsset;
 
@@ -29,12 +29,26 @@ impl Vertex {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Mesh {
     pub indices: Vec<u32>,
     pub vertices: Vec<Vertex>,
     pub albedo_texture: Option<Arc<TextureAsset>>,
     pub normal_texture: Option<Arc<TextureAsset>>,
+    /// Local-to-world transform, read every frame. Vertices stay in local space.
+    pub transform: Mat4,
+}
+
+impl Default for Mesh {
+    fn default() -> Self {
+        Self {
+            indices: Vec::new(),
+            vertices: Vec::new(),
+            albedo_texture: None,
+            normal_texture: None,
+            transform: Mat4::identity(),
+        }
+    }
 }
 
 impl Mesh {
@@ -49,7 +63,13 @@ impl Mesh {
             vertices,
             albedo_texture,
             normal_texture,
+            transform: Mat4::identity(),
         }
+    }
+
+    pub fn with_transform(mut self, transform: Mat4) -> Self {
+        self.transform = transform;
+        self
     }
 
     pub fn get_indices_count(&self) -> usize {

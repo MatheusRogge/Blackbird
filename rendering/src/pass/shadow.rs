@@ -4,6 +4,7 @@ use engine_core::world::World;
 use ultraviolet::{Mat4, Vec3, Vec4};
 
 use crate::{
+    arena::GeometryArena,
     camera::Camera,
     graph::{NodeId, RenderGraph},
     light::SkyLight,
@@ -40,6 +41,8 @@ pub struct ShadowPass {
     shader: ShaderAsset,
     pipeline: Option<wgpu::RenderPipeline>,
     bgl: Option<wgpu::BindGroupLayout>,
+    instance_layout: Option<wgpu::BindGroupLayout>,
+    instance_bind_group: Option<(u64, wgpu::BindGroup)>,
 
     shadow_map_id: ResourceId,
     shadow_params_id: ResourceId,
@@ -79,6 +82,8 @@ impl ShadowPass {
                 shader,
                 pipeline: None,
                 bgl: None,
+                instance_layout: None,
+                instance_bind_group: None,
                 shadow_map_id,
                 shadow_params_id,
                 cascade_vp_id,
@@ -254,9 +259,14 @@ impl Pass for ShadowPass {
                 }],
             });
 
+            let instance_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shadow_instance_layout"),
+                entries: &[GeometryArena::instance_layout_entry(0)],
+            });
+
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("shadow_pipeline_layout"),
-                bind_group_layouts: &[Some(&bgl)],
+                bind_group_layouts: &[Some(&bgl), Some(&instance_layout)],
                 immediate_size: 0,
             });
 
@@ -299,6 +309,7 @@ impl Pass for ShadowPass {
             }));
 
             self.bgl = Some(bgl);
+            self.instance_layout = Some(instance_layout);
             self.pipeline = Some(pipeline);
         }
 
@@ -322,6 +333,24 @@ impl Pass for ShadowPass {
         }
 
         let meshes = world.get_entity_handles::<Mesh>();
+
+        let generation = ctx.geometry.generation();
+        if self.instance_bind_group.as_ref().is_none_or(|(g, _)| *g != generation)
+            && let Some(layout) = self.instance_layout.as_ref()
+        {
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shadow_instances"),
+                layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ctx.geometry.instance_buffer().as_entire_binding(),
+                }],
+            });
+            self.instance_bind_group = Some((generation, bind_group));
+        }
+        let Some((_, instance_bg)) = self.instance_bind_group.as_ref() else {
+            return;
+        };
 
         let pipeline = self.pipeline.as_ref().unwrap();
         let inv_cam_view = camera.view_matrix().inversed();
@@ -363,11 +392,12 @@ impl Pass for ShadowPass {
 
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bg, &[vp_offset as u32]);
+            pass.set_bind_group(1, instance_bg, &[]);
             pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
             pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
 
             for draw in meshes.iter().filter_map(|h| ctx.geometry.get(h.id)) {
-                pass.draw_indexed(draw.indices.clone(), draw.base_vertex, 0..1);
+                pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
             }
         }
 

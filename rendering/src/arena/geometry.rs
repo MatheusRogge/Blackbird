@@ -5,18 +5,38 @@ use engine_core::{
     entity::EntityKey,
     world::{EntityHandle, World},
 };
+use bytemuck::Zeroable;
 use offset_allocator::{Allocation, Allocator};
 
 use crate::mesh::{Mesh, Vertex};
 
 const INITIAL_VERTICES: u32 = 256 * 1024;
 const INITIAL_INDICES: u32 = 1024 * 1024;
+const INITIAL_INSTANCES: u32 = 1024;
 
-/// Where a mesh lives inside the shared geometry buffers.
+/// Per-mesh entry of the instance buffer. Mirrors `Model` in `gbuffer.wgsl`
+/// and `shadow.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuModel {
+    pub model: [[f32; 4]; 4],
+    /// Inverse-transpose of `model`, for normals.
+    pub normal: [[f32; 4]; 4],
+}
+
+/// Where a mesh lives inside the shared geometry buffers. `instance` indexes
+/// the instance buffer and is passed as the draw's first instance.
 #[derive(Clone, Debug)]
 pub struct MeshDraw {
     pub base_vertex: i32,
     pub indices: Range<u32>,
+    pub instance: u32,
+}
+
+impl MeshDraw {
+    pub fn instances(&self) -> Range<u32> {
+        self.instance..self.instance + 1
+    }
 }
 
 struct MeshAlloc {
@@ -64,21 +84,49 @@ impl Pool {
 }
 
 /// Vertex and index data for every `Mesh` in the world, sub-allocated from one
-/// vertex buffer and one index buffer that grow on demand. Draw with
-/// `draw_indexed(draw.indices, draw.base_vertex, ..)` after binding both buffers.
+/// vertex buffer and one index buffer that grow on demand, plus a storage
+/// buffer of per-mesh model matrices rewritten every frame. Draw with
+/// `draw_indexed(draw.indices, draw.base_vertex, draw.instances())` after binding
+/// both buffers and the instance buffer.
 pub struct GeometryArena {
     vertices: Pool,
     indices: Pool,
+    instances: wgpu::Buffer,
+    instance_capacity: u32,
+    free_instances: Vec<u32>,
+    next_instance: u32,
     meshes: HashMap<EntityKey, MeshAlloc>,
     generation: u64,
 }
 
 impl GeometryArena {
     pub fn new(device: &wgpu::Device) -> Self {
-        Self::with_capacity(device, INITIAL_VERTICES, INITIAL_INDICES)
+        Self::with_capacity(device, INITIAL_VERTICES, INITIAL_INDICES, INITIAL_INSTANCES)
     }
 
-    fn with_capacity(device: &wgpu::Device, vertices: u32, indices: u32) -> Self {
+    pub fn instance_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+        wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(size_of::<GpuModel>() as u64),
+            },
+            count: None,
+        }
+    }
+
+    fn create_instances(device: &wgpu::Device, capacity: u32) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("geometry_instances"),
+            size: capacity as u64 * size_of::<GpuModel>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn with_capacity(device: &wgpu::Device, vertices: u32, indices: u32, instances: u32) -> Self {
         Self {
             vertices: Pool::new(
                 device,
@@ -94,23 +142,30 @@ impl GeometryArena {
                 size_of::<u32>() as u64,
                 indices,
             ),
+            instances: Self::create_instances(device, instances),
+            instance_capacity: instances,
+            free_instances: Vec::new(),
+            next_instance: 0,
             meshes: HashMap::new(),
             generation: 0,
         }
     }
 
-    /// Uploads meshes that are new since the last call and frees the ones whose
-    /// entity is gone. Meshes edited in place keep their old GPU data.
+    /// Uploads meshes that are new since the last call, frees the ones whose
+    /// entity is gone and rewrites every mesh's transform. Vertices edited in
+    /// place keep their old GPU data.
     pub fn sync(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, world: &World) {
         let meshes = world.get_entity_handles::<Mesh>();
         let live: HashSet<EntityKey> = meshes.iter().map(|h| h.id).collect();
 
-        let (vertices, indices) = (&mut self.vertices, &mut self.indices);
+        let (vertices, indices, free_instances) =
+            (&mut self.vertices, &mut self.indices, &mut self.free_instances);
         self.meshes.retain(|key, alloc| {
             let keep = live.contains(key);
             if !keep {
                 vertices.free(alloc.vertex);
                 indices.free(alloc.index);
+                free_instances.push(alloc.draw.instance);
             }
             keep
         });
@@ -121,8 +176,33 @@ impl GeometryArena {
             }
             if !self.insert(queue, handle.id, handle.entity) {
                 self.grow(device, queue, &meshes);
-                return;
+                break;
             }
+        }
+
+        self.write_instances(device, queue, &meshes);
+    }
+
+    fn write_instances(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, meshes: &[EntityHandle<'_, Mesh>]) {
+        if self.next_instance > self.instance_capacity {
+            self.instance_capacity = self.next_instance.next_power_of_two();
+            self.instances = Self::create_instances(device, self.instance_capacity);
+            self.generation += 1;
+        }
+
+        let mut models = vec![GpuModel::zeroed(); self.next_instance as usize];
+        for handle in meshes {
+            if let Some(alloc) = self.meshes.get(&handle.id) {
+                let transform = handle.entity.transform;
+                models[alloc.draw.instance as usize] = GpuModel {
+                    model: transform.into(),
+                    normal: transform.inversed().transposed().into(),
+                };
+            }
+        }
+
+        if !models.is_empty() {
+            queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&models));
         }
     }
 
@@ -135,9 +215,14 @@ impl GeometryArena {
             return false;
         };
 
+        let instance = self.free_instances.pop().unwrap_or_else(|| {
+            self.next_instance += 1;
+            self.next_instance - 1
+        });
         let draw = MeshDraw {
             base_vertex: vertex.offset as i32,
             indices: index.offset..index.offset + mesh.indices.len() as u32,
+            instance,
         };
         self.meshes.insert(key, MeshAlloc { vertex, index, draw });
         true
@@ -152,9 +237,10 @@ impl GeometryArena {
         let mut vertex_cap = grown_capacity(self.vertices.capacity, needed_vertices);
         let mut index_cap = grown_capacity(self.indices.capacity, needed_indices);
         let generation = self.generation + 1;
+        let instance_cap = self.instance_capacity;
 
         loop {
-            *self = Self::with_capacity(device, vertex_cap, index_cap);
+            *self = Self::with_capacity(device, vertex_cap, index_cap, instance_cap);
             self.generation = generation;
 
             let fits = meshes
@@ -186,7 +272,12 @@ impl GeometryArena {
         &self.indices.buffer
     }
 
-    /// Bumped every time the backing buffers are replaced.
+    pub fn instance_buffer(&self) -> &wgpu::Buffer {
+        &self.instances
+    }
+
+    /// Bumped every time a backing buffer is replaced. Rebuild bind groups that
+    /// reference `instance_buffer()` when it changes.
     pub fn generation(&self) -> u64 {
         self.generation
     }
