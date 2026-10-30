@@ -7,7 +7,7 @@ use wgpu::{BindGroup, BindGroupLayout, Device};
 
 use crate::{
     arena::{
-        BufferRange, FrameArena, GeometryArena, UploadArena,
+        ArenaStats, BufferRange, FrameArena, GeometryArena, UploadArena,
         texture_pool::{self, Lifetime},
     },
     debug_flags::RenderDebugFlags,
@@ -110,6 +110,27 @@ impl GraphContext {
         }
 
         self.upload_arena = Some(arena);
+    }
+
+    fn arena_stats(&self) -> ArenaStats {
+        let mut stats = ArenaStats {
+            screen_textures: self.screen_textures,
+            ..ArenaStats::default()
+        };
+        if let Some(upload) = &self.upload_arena {
+            stats.upload_bytes = upload.used_bytes();
+            stats.upload_pages = upload.page_count();
+        }
+        if let Some(geometry) = &self.geometry {
+            stats.geometry_vertices = geometry.vertex_usage();
+            stats.geometry_indices = geometry.index_usage();
+            stats.geometry_generation = geometry.generation();
+        }
+        if let Some(frame) = &self.frame {
+            stats.frame_bytes = frame.usage();
+            stats.frame_generation = frame.generation();
+        }
+        stats
     }
 
     /// Allocates every `ScreenTexture`, letting textures with the same format
@@ -645,6 +666,7 @@ impl RenderGraph {
             .is_some_and(|gpu| gpu.resolve(&mut encoder));
 
         self.profiler.end_frame();
+        self.profiler.set_arena_stats(self.ctx.arena_stats());
         encoder.finish()
     }
 

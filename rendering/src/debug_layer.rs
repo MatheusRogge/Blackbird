@@ -56,6 +56,36 @@ impl UiLayer for DebugLayer {
                 }
 
                 ui.separator();
+                let mem = &stats.memory;
+                let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+                egui::Grid::new("arenas").striped(true).show(ui, |ui| {
+                    ui.label("upload arena");
+                    ui.label(format!("{:.2} MiB in {} page(s)", mib(mem.upload_bytes), mem.upload_pages));
+                    ui.end_row();
+                    ui.label("geometry");
+                    ui.label(format!(
+                        "{}/{} verts  {}/{} indices  (gen {})",
+                        mem.geometry_vertices.0,
+                        mem.geometry_vertices.1,
+                        mem.geometry_indices.0,
+                        mem.geometry_indices.1,
+                        mem.geometry_generation
+                    ));
+                    ui.end_row();
+                    ui.label("frame arena");
+                    ui.label(format!(
+                        "{:.1}/{:.1} KiB  (gen {})",
+                        mem.frame_bytes.0 as f64 / 1024.0,
+                        mem.frame_bytes.1 as f64 / 1024.0,
+                        mem.frame_generation
+                    ));
+                    ui.end_row();
+                    ui.label("screen textures");
+                    ui.label(format!("{} logical → {} physical", mem.screen_textures.0, mem.screen_textures.1));
+                    ui.end_row();
+                });
+
+                ui.separator();
                 ui.label("Layers");
                 if let Ok(mut flags) = self.debug_flags.write() {
                     ui.checkbox(&mut flags.albedo, "Albedo");

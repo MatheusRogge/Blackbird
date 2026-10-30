@@ -35,7 +35,6 @@ pub struct FrameArena {
     buffer: wgpu::Buffer,
     capacity: u64,
     cursor: Cell<u64>,
-    high_water: u64,
     generation: u64,
 }
 
@@ -45,7 +44,6 @@ impl FrameArena {
             buffer: Self::create(device, INITIAL_CAPACITY),
             capacity: INITIAL_CAPACITY,
             cursor: Cell::new(0),
-            high_water: 0,
             generation: 0,
         }
     }
@@ -63,7 +61,6 @@ impl FrameArena {
     /// with one big enough for it and `generation` is bumped.
     pub fn begin_frame(&mut self, device: &wgpu::Device) {
         let used = self.cursor.replace(0);
-        self.high_water = used;
         if used > self.capacity {
             self.capacity = used.next_power_of_two();
             self.buffer = Self::create(device, self.capacity);
@@ -96,9 +93,9 @@ impl FrameArena {
         }
     }
 
-    /// Bytes allocated last frame and the current capacity.
+    /// Bytes allocated so far this frame and the current capacity.
     pub fn usage(&self) -> (u64, u64) {
-        (self.high_water, self.capacity)
+        (self.cursor.get(), self.capacity)
     }
 
     pub fn generation(&self) -> u64 {

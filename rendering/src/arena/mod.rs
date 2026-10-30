@@ -7,6 +7,23 @@ pub use frame::{FrameArena, FrameSlice};
 pub use geometry::{GeometryArena, MeshDraw};
 pub use upload::UploadArena;
 
+/// Occupancy of the graph's arenas, published with `FrameStats`.
+#[derive(Debug, Clone, Default)]
+pub struct ArenaStats {
+    pub upload_bytes: u64,
+    pub upload_pages: usize,
+    /// (used, capacity) in vertices.
+    pub geometry_vertices: (u32, u32),
+    /// (used, capacity) in indices.
+    pub geometry_indices: (u32, u32),
+    pub geometry_generation: u64,
+    /// (used this frame, capacity) in bytes.
+    pub frame_bytes: (u64, u64),
+    pub frame_generation: u64,
+    /// (logical, physical) screen textures.
+    pub screen_textures: (usize, usize),
+}
+
 /// A byte range inside a GPU buffer. Packed resources share their backing
 /// buffer with others, so always bind, write and slice through the range.
 #[derive(Clone, Copy)]

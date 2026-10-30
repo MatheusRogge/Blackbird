@@ -5,6 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::arena::ArenaStats;
+
 const HISTORY: usize = 60;
 
 #[derive(Debug, Clone)]
@@ -22,6 +24,7 @@ pub struct FrameStats {
     pub avg_ms: f32,
     pub fps: f32,
     pub passes: Vec<PassStats>,
+    pub memory: ArenaStats,
 }
 
 impl fmt::Display for FrameStats {
@@ -97,7 +100,18 @@ impl FrameProfiler {
             })
         }).collect();
 
-        self.last_stats = FrameStats { frame: self.frame, last_ms: elapsed_ms, avg_ms, fps, passes };
+        self.last_stats = FrameStats {
+            frame: self.frame,
+            last_ms: elapsed_ms,
+            avg_ms,
+            fps,
+            passes,
+            memory: ArenaStats::default(),
+        };
+    }
+
+    pub fn set_arena_stats(&mut self, memory: ArenaStats) {
+        self.last_stats.memory = memory;
     }
 
     pub fn apply_gpu_times(&mut self, gpu_times_ms: &[f32]) {
