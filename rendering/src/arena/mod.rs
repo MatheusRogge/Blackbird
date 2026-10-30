@@ -1,6 +1,7 @@
 mod frame;
 mod geometry;
 mod upload;
+pub mod texture_pool;
 
 pub use frame::{FrameArena, FrameSlice};
 pub use geometry::{GeometryArena, MeshDraw};

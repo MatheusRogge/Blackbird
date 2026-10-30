@@ -6,7 +6,10 @@ use std::time::Instant;
 use wgpu::{BindGroup, BindGroupLayout, Device};
 
 use crate::{
-    arena::{BufferRange, FrameArena, GeometryArena, UploadArena},
+    arena::{
+        BufferRange, FrameArena, GeometryArena, UploadArena,
+        texture_pool::{self, Lifetime},
+    },
     debug_flags::RenderDebugFlags,
     pass::{Pass, PassContext},
     profiler::{FrameProfiler, FrameStats, GpuProfiler},
@@ -28,6 +31,7 @@ pub struct GraphContext {
     upload_arena: Option<UploadArena>,
     geometry: Option<GeometryArena>,
     frame: Option<FrameArena>,
+    screen_textures: (usize, usize),
 }
 
 impl GraphContext {
@@ -106,6 +110,84 @@ impl GraphContext {
         }
 
         self.upload_arena = Some(arena);
+    }
+
+    /// Allocates every `ScreenTexture`, letting textures with the same format
+    /// and usage share one physical texture when their lifetimes in `order` do
+    /// not overlap. Runs only when some screen texture is unallocated (first
+    /// frame, resize, graph change) so pass-cached views stay valid otherwise.
+    fn alias_screen_textures(
+        &mut self,
+        device: &Device,
+        order: &[NodeId],
+        output: ResourceId,
+        (width, height): (u32, u32),
+    ) {
+        let is_screen = |r: &GraphResource| matches!(r.desc, ResourceDescriptor::ScreenTexture { .. });
+        if !self.resources.values().any(|r| is_screen(r) && r.resource.is_none()) {
+            return;
+        }
+
+        for res in self.resources.values_mut().filter(|r| is_screen(r)) {
+            res.resource = None;
+            res.version += 1;
+        }
+
+        let mut spans: HashMap<ResourceId, (usize, usize)> = HashMap::new();
+        let mut written: HashSet<ResourceId> = HashSet::new();
+        let mut read_before_write: HashSet<ResourceId> = HashSet::new();
+        for (index, node) in order.iter().enumerate() {
+            let pass = &self.passes[node];
+            let reads = pass.reads();
+            let writes = pass.writes();
+            read_before_write.extend(reads.iter().filter(|r| !written.contains(r)));
+            written.extend(&writes);
+            for &id in reads.iter().chain(&writes) {
+                spans.entry(id).and_modify(|s| s.1 = index).or_insert((index, index));
+            }
+        }
+
+        let mut ids: Vec<ResourceId> = spans
+            .keys()
+            .copied()
+            .filter(|id| *id != output && !read_before_write.contains(id))
+            .filter(|id| self.resources.get(id).is_some_and(is_screen))
+            .collect();
+        ids.sort_unstable();
+
+        let lifetimes: Vec<Lifetime<&ResourceDescriptor>> = ids
+            .iter()
+            .map(|id| Lifetime {
+                key: &self.resources[id].desc,
+                first: spans[id].0,
+                last: spans[id].1,
+            })
+            .collect();
+        let (slots, slot_count) = texture_pool::assign(&lifetimes);
+
+        let mut physical: Vec<Option<AllocatedResource>> = (0..slot_count).map(|_| None).collect();
+        let mut allocated = Vec::with_capacity(ids.len());
+        for (lifetime, &slot) in lifetimes.iter().zip(&slots) {
+            let texture = physical[slot].get_or_insert_with(|| {
+                RenderGraph::allocate_resource(device, lifetime.key, width, height)
+            });
+            let AllocatedResource::Texture(tex, view) = texture else {
+                unreachable!("screen textures allocate as textures")
+            };
+            allocated.push(AllocatedResource::Texture(tex.clone(), view.clone()));
+        }
+
+        for (id, resource) in ids.iter().zip(allocated) {
+            self.resources.get_mut(id).expect("screen texture").resource = Some(resource);
+        }
+
+        let unaliased = self.resources.values().filter(|r| is_screen(r) && r.resource.is_none()).count();
+        self.screen_textures = (ids.len() + unaliased, slot_count + unaliased);
+        log::debug!(
+            "screen textures: {} logical -> {} physical",
+            self.screen_textures.0,
+            self.screen_textures.1
+        );
     }
 }
 
@@ -387,6 +469,8 @@ impl RenderGraph {
             .frame
             .get_or_insert_with(|| FrameArena::new(device))
             .begin_frame(device);
+        self.ctx
+            .alias_screen_textures(device, order, output, surface_size);
         let geometry = self.ctx.geometry.as_ref().expect("geometry arena");
         let frame = self.ctx.frame.as_ref().expect("frame arena");
 
