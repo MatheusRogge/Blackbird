@@ -31,15 +31,15 @@ pub struct BvhUploadPass {
 
 impl BvhUploadPass {
     pub fn new(graph: &mut RenderGraph) -> (Self, BvhOutputs) {
-        let nodes_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
+        let nodes_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: MAX_BVH_NODES * std::mem::size_of::<BvhNode>() as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-        let tris_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
+        let tris_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: MAX_BVH_TRIS * std::mem::size_of::<GpuTriangle>() as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-        let info_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
+        let info_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: std::mem::size_of::<BvhInfo>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -106,7 +106,7 @@ impl Pass for BvhUploadPass {
 
         if meshes.is_empty() {
             self.node_count.store(0, Ordering::Relaxed);
-            queue.write_buffer(info_buf, 0, bytes_of(&BvhInfo { node_count: 0, tri_count: 0, enabled: 0, _pad: 0 }));
+            info_buf.write(queue, bytes_of(&BvhInfo { node_count: 0, tri_count: 0, enabled: 0, _pad: 0 }));
             return;
         }
 
@@ -128,7 +128,7 @@ impl Pass for BvhUploadPass {
         let tri_count = gpu_tris.len() as u64;
         if tri_count > MAX_BVH_TRIS {
             log::warn!("bvh_upload: {} triangles exceeds limit ({MAX_BVH_TRIS}), skipping", tri_count);
-            queue.write_buffer(info_buf, 0, bytes_of(&BvhInfo { node_count: 0, tri_count: 0, enabled: 0, _pad: 0 }));
+            info_buf.write(queue, bytes_of(&BvhInfo { node_count: 0, tri_count: 0, enabled: 0, _pad: 0 }));
             return;
         }
 
@@ -139,17 +139,14 @@ impl Pass for BvhUploadPass {
         if node_count > MAX_BVH_NODES {
             log::warn!("bvh_upload: {} nodes exceeds limit ({MAX_BVH_NODES}), skipping", node_count);
             self.node_count.store(0, Ordering::Relaxed);
-            queue.write_buffer(info_buf, 0, bytes_of(&BvhInfo { node_count: 0, tri_count: 0, enabled: 0, _pad: 0 }));
+            info_buf.write(queue, bytes_of(&BvhInfo { node_count: 0, tri_count: 0, enabled: 0, _pad: 0 }));
             return;
         }
 
         let n = built.nodes.len() as u32;
-        queue.write_buffer(nodes_buf, 0, bytemuck::cast_slice(&built.nodes));
-        queue.write_buffer(tris_buf, 0, bytemuck::cast_slice(&built.triangles));
-        queue.write_buffer(
-            info_buf,
-            0,
-            bytes_of(&BvhInfo {
+        nodes_buf.write(queue, bytemuck::cast_slice(&built.nodes));
+        tris_buf.write(queue, bytemuck::cast_slice(&built.triangles));
+        info_buf.write(queue, bytes_of(&BvhInfo {
                 node_count: n,
                 tri_count: built.triangles.len() as u32,
                 enabled: 1,

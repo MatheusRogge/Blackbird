@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use engine_core::world::World;
 
 use crate::{
+    arena::BufferRange,
     graph::{NodeId, RenderGraph},
     pass::{
         Pass, PassContext, PassDesc,
@@ -60,9 +61,9 @@ impl ProbeUpdatePass {
     fn build_bind_groups(
         &mut self,
         device: &wgpu::Device,
-        radiance_buf:    &wgpu::Buffer,
-        direction_buf:   &wgpu::Buffer,
-        probe_params_buf: &wgpu::Buffer,
+        radiance_buf:    BufferRange,
+        direction_buf:   BufferRange,
+        probe_params_buf: BufferRange,
         irr_views:  [&wgpu::TextureView; 2],
         vis_views:  [&wgpu::TextureView; 2],
     ) {
@@ -167,9 +168,9 @@ impl ProbeUpdatePass {
                 label: Some("probe_update_bg"),
                 layout: &bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: radiance_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: direction_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: probe_params_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 0, resource: radiance_buf.binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: direction_buf.binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: probe_params_buf.binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(irr_prev) },
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(irr_next) },
                     wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(vis_prev) },

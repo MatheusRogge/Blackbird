@@ -19,6 +19,8 @@ pub const NUM_CASCADES: usize = 4;
 pub const SHADOW_MAP_SIZE: u32 = 2048;
 
 const CASCADE_LAMBDA: f32 = 0.75;
+const CASCADE_VP_STRIDE: u64 = 256;
+const VP_SIZE: u64 = std::mem::size_of::<[[f32; 4]; 4]>() as u64;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -43,10 +45,10 @@ pub struct ShadowPass {
 
     shadow_map_id: ResourceId,
     shadow_params_id: ResourceId,
+    cascade_vp_id: ResourceId,
 
     cascade_views: Vec<wgpu::TextureView>,
-    cascade_vp_bufs: Vec<wgpu::Buffer>,
-    cascade_bind_groups: Vec<wgpu::BindGroup>,
+    cascade_bind_group: Option<wgpu::BindGroup>,
 
     vertex_buffer_cache: HashMap<EntityKey, wgpu::Buffer>,
     index_buffer_cache: HashMap<EntityKey, wgpu::Buffer>,
@@ -64,8 +66,13 @@ impl ShadowPass {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         });
 
-        let shadow_params_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
+        let shadow_params_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: std::mem::size_of::<ShadowParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let cascade_vp_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
+            size: CASCADE_VP_STRIDE * NUM_CASCADES as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -79,9 +86,9 @@ impl ShadowPass {
                 bgl: None,
                 shadow_map_id,
                 shadow_params_id,
+                cascade_vp_id,
                 cascade_views: Vec::new(),
-                cascade_vp_bufs: Vec::new(),
-                cascade_bind_groups: Vec::new(),
+                cascade_bind_group: None,
                 vertex_buffer_cache: HashMap::new(),
                 index_buffer_cache: HashMap::new(),
             },
@@ -191,7 +198,7 @@ impl PassDesc for ShadowPass {
     }
 
     fn writes(&self) -> Vec<ResourceId> {
-        vec![self.shadow_map_id, self.shadow_params_id]
+        vec![self.shadow_map_id, self.shadow_params_id, self.cascade_vp_id]
     }
 }
 
@@ -209,6 +216,9 @@ impl Pass for ShadowPass {
         world: &World,
     ) {
         let Some(&params_buf) = ctx.buffers.get(&self.shadow_params_id) else {
+            return;
+        };
+        let Some(&cascade_vp_buf) = ctx.buffers.get(&self.cascade_vp_id) else {
             return;
         };
 
@@ -233,7 +243,7 @@ impl Pass for ShadowPass {
 
         let splits = compute_cascade_splits(camera.near, camera.far);
 
-        // Lazy init: pipeline + per-cascade buffers + per-layer views.
+        // Lazy init: pipeline + cascade bind group + per-layer views.
         if self.pipeline.is_none() {
             let module = self.shader.compile(device).expect("shadow shader compile failed");
 
@@ -244,8 +254,8 @@ impl Pass for ShadowPass {
                     visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(VP_SIZE),
                     },
                     count: None,
                 }],
@@ -283,24 +293,17 @@ impl Pass for ShadowPass {
                 cache: None,
             });
 
-            for i in 0..NUM_CASCADES {
-                let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("shadow_vp_cascade{i}")),
-                    size: std::mem::size_of::<[[f32; 4]; 4]>() as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&format!("shadow_bg_cascade{i}")),
-                    layout: &bgl,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: buf.as_entire_binding(),
-                    }],
-                });
-                self.cascade_vp_bufs.push(buf);
-                self.cascade_bind_groups.push(bg);
-            }
+            self.cascade_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shadow_cascade_bg"),
+                layout: &bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        size: wgpu::BufferSize::new(VP_SIZE),
+                        ..cascade_vp_buf.buffer_binding()
+                    }),
+                }],
+            }));
 
             self.bgl = Some(bgl);
             self.pipeline = Some(pipeline);
@@ -363,10 +366,11 @@ impl Pass for ShadowPass {
             let vp_raw: [[f32; 4]; 4] = [
                 lp_cols[0].into(), lp_cols[1].into(), lp_cols[2].into(), lp_cols[3].into(),
             ];
-            queue.write_buffer(&self.cascade_vp_bufs[i], 0, bytemuck::bytes_of(&vp_raw));
+            let vp_offset = CASCADE_VP_STRIDE * i as u64;
+            cascade_vp_buf.write_at(queue, vp_offset, bytemuck::bytes_of(&vp_raw));
 
             let layer_view = &self.cascade_views[i];
-            let bg = &self.cascade_bind_groups[i];
+            let bg = self.cascade_bind_group.as_ref().expect("shadow cascade bind group");
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(&format!("shadow_cascade{i}")),
@@ -383,7 +387,7 @@ impl Pass for ShadowPass {
             });
 
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bg, &[]);
+            pass.set_bind_group(0, bg, &[vp_offset as u32]);
 
             for handle in meshes.iter() {
                 if let (Some(vb), Some(ib)) = (
@@ -404,6 +408,6 @@ impl Pass for ShadowPass {
             inv_shadow_map_size: 1.0 / SHADOW_MAP_SIZE as f32,
             _pad: [0.0; 2],
         };
-        queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
+        params_buf.write(queue, bytemuck::bytes_of(&params));
     }
 }

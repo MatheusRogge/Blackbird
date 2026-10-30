@@ -106,7 +106,7 @@ impl ProbeAtlasPass {
             }),
         ];
 
-        let probe_params_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
+        let probe_params_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: std::mem::size_of::<ProbeGridParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -219,6 +219,6 @@ impl Pass for ProbeAtlasPass {
             _pad: 0.0,
         };
 
-        queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
+        params_buf.write(queue, bytemuck::bytes_of(&params));
     }
 }

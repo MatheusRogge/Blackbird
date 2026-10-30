@@ -6,8 +6,11 @@ pub enum ResourceDescriptor {
         size: u64,
         usage: wgpu::BufferUsages,
     },
-    BufferInit {
-        data: Vec<u8>,
+    /// CPU-written (`queue.write_buffer`), GPU read-only buffer. Packed with the
+    /// graph's other upload buffers into a shared `UploadArena` page. Never use
+    /// this for anything bound as `read_write` storage.
+    UploadBuffer {
+        size: u64,
         usage: wgpu::BufferUsages,
     },
     Texture {
@@ -35,7 +38,11 @@ pub enum ResourceDescriptor {
 }
 
 pub enum AllocatedResource {
-    Buffer(wgpu::Buffer),
+    Buffer {
+        buffer: wgpu::Buffer,
+        offset: u64,
+        size: u64,
+    },
     Texture(wgpu::Texture, wgpu::TextureView),
     ExternalView(wgpu::TextureView),
 }

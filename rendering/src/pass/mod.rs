@@ -12,6 +12,7 @@ pub mod probe_update;
 pub mod shadow;
 
 use crate::{
+    arena::BufferRange,
     graph::NodeId,
     resource::{BindingResource, ResourceId},
 };
@@ -21,7 +22,7 @@ use std::collections::HashMap;
 pub struct PassContext<'a> {
     pub views: HashMap<ResourceId, &'a wgpu::TextureView>,
     pub textures: HashMap<ResourceId, &'a wgpu::Texture>,
-    pub buffers: HashMap<ResourceId, &'a wgpu::Buffer>,
+    pub buffers: HashMap<ResourceId, BufferRange<'a>>,
     pub bind_group: Option<&'a wgpu::BindGroup>,
     pub upstream: HashMap<NodeId, &'a wgpu::BindGroup>,
     pub surface_size: (u32, u32),

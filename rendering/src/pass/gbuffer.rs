@@ -558,7 +558,7 @@ impl Pass for GBufferPass {
                 layout,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: buf.as_entire_binding(),
+                    resource: buf.binding(),
                 }],
             }));
         }

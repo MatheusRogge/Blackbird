@@ -30,27 +30,27 @@ pub struct LightUploadPass {
 
 impl LightUploadPass {
     pub fn new(graph: &mut RenderGraph) -> (Self, LightBuffers) {
-        let point_buffer_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
+        let point_buffer_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: (MAX_POINT_LIGHTS * size_of::<GpuPointLight>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        let spot_buffer_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
+        let spot_buffer_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: (MAX_SPOT_LIGHTS * size_of::<GpuSpotLight>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        let area_buffer_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
+        let area_buffer_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: (MAX_AREA_LIGHTS * size_of::<GpuAreaLight>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        let sky_buffer_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
+        let sky_buffer_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: (MAX_SKY_LIGHTS * size_of::<GpuSkyLight>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        let counts_buffer_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
+        let counts_buffer_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: size_of::<LightCounts>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -191,41 +191,26 @@ impl Pass for LightUploadPass {
         };
 
         if !point_lights.is_empty() {
-            queue.write_buffer(
-                ctx.buffers[&self.buffers.point_buffer_id],
-                0,
-                bytemuck::cast_slice(&point_lights),
+            ctx.buffers[&self.buffers.point_buffer_id].write(queue, bytemuck::cast_slice(&point_lights),
             );
         }
 
         if !spot_lights.is_empty() {
-            queue.write_buffer(
-                ctx.buffers[&self.buffers.spot_buffer_id],
-                0,
-                bytemuck::cast_slice(&spot_lights),
+            ctx.buffers[&self.buffers.spot_buffer_id].write(queue, bytemuck::cast_slice(&spot_lights),
             );
         }
 
         if !area_lights.is_empty() {
-            queue.write_buffer(
-                ctx.buffers[&self.buffers.area_buffer_id],
-                0,
-                bytemuck::cast_slice(&area_lights),
+            ctx.buffers[&self.buffers.area_buffer_id].write(queue, bytemuck::cast_slice(&area_lights),
             );
         }
 
         if !sky_lights.is_empty() {
-            queue.write_buffer(
-                ctx.buffers[&self.buffers.sky_buffer_id],
-                0,
-                bytemuck::cast_slice(&sky_lights),
+            ctx.buffers[&self.buffers.sky_buffer_id].write(queue, bytemuck::cast_slice(&sky_lights),
             );
         }
 
-        queue.write_buffer(
-            ctx.buffers[&self.buffers.counts_buffer_id],
-            0,
-            bytemuck::bytes_of(&counts),
+        ctx.buffers[&self.buffers.counts_buffer_id].write(queue, bytemuck::bytes_of(&counts),
         );
     }
 }

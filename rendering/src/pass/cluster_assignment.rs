@@ -66,7 +66,7 @@ impl ClusterAssignmentPass {
         light_buffers: &LightBuffers,
         shader: ShaderAsset,
     ) -> (Self, ClusterOutputs) {
-        let cluster_params_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
+        let cluster_params_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: std::mem::size_of::<ClusterParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -193,7 +193,7 @@ impl Pass for ClusterAssignmentPass {
             return;
         };
 
-        queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
+        params_buf.write(queue, bytemuck::bytes_of(&params));
 
         if self.pipeline.is_none() {
             let module = self
@@ -268,19 +268,19 @@ impl Pass for ClusterAssignmentPass {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: params_buf.as_entire_binding(),
+                        resource: params_buf.binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: point_buf.as_entire_binding(),
+                        resource: point_buf.binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: grid_buf.as_entire_binding(),
+                        resource: grid_buf.binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: indices_buf.as_entire_binding(),
+                        resource: indices_buf.binding(),
                     },
                 ],
             });

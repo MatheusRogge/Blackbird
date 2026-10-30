@@ -1,10 +1,12 @@
 use engine_core::world::World;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use wgpu::{BindGroup, BindGroupLayout, Device, util::DeviceExt};
+use wgpu::{BindGroup, BindGroupLayout, Device};
 
 use crate::{
+    arena::{BufferRange, UploadArena},
     debug_flags::RenderDebugFlags,
     pass::{Pass, PassContext},
     profiler::{FrameProfiler, FrameStats, GpuProfiler},
@@ -23,6 +25,7 @@ pub struct GraphContext {
     passes: HashMap<NodeId, Box<dyn Pass>>,
     bind_group_layouts: HashMap<NodeId, BindGroupLayout>,
     bind_group_resources: HashMap<NodeId, BindGroup>,
+    upload_arena: Option<UploadArena>,
 }
 
 impl GraphContext {
@@ -71,6 +74,36 @@ impl GraphContext {
 
         self.passes.insert(node_id, Box::new(pass));
         node_id
+    }
+
+    fn build_upload_arena(&mut self, device: &Device) {
+        let mut ids: Vec<ResourceId> = self
+            .resources
+            .iter()
+            .filter(|(_, r)| matches!(r.desc, ResourceDescriptor::UploadBuffer { .. }))
+            .map(|(&id, _)| id)
+            .collect();
+        ids.sort_unstable();
+
+        let entries: Vec<(u64, wgpu::BufferUsages)> = ids
+            .iter()
+            .map(|id| match self.resources[id].desc {
+                ResourceDescriptor::UploadBuffer { size, usage } => (size, usage),
+                _ => unreachable!(),
+            })
+            .collect();
+
+        let (arena, placed) = UploadArena::build(device, &entries);
+        for ((id, (buffer, offset)), (size, _)) in ids.iter().zip(placed).zip(&entries) {
+            let res = self.resources.get_mut(id).expect("upload resource");
+            res.resource = Some(AllocatedResource::Buffer {
+                buffer,
+                offset,
+                size: *size,
+            });
+        }
+
+        self.upload_arena = Some(arena);
     }
 }
 
@@ -125,7 +158,14 @@ pub struct RenderGraph {
     gpu_profiler: Option<GpuProfiler>,
     gpu_resolved: bool,
     surface_size: (u32, u32),
+    compiled: Option<CompiledGraph>,
     pub debug_flags: Arc<RwLock<RenderDebugFlags>>,
+}
+
+struct CompiledGraph {
+    output: ResourceId,
+    order: Vec<NodeId>,
+    writer_of: HashMap<ResourceId, NodeId>,
 }
 
 impl Default for RenderGraph {
@@ -137,6 +177,7 @@ impl Default for RenderGraph {
             gpu_profiler: None,
             gpu_resolved: false,
             surface_size: (0, 0),
+            compiled: None,
             debug_flags: Arc::new(RwLock::new(RenderDebugFlags::default())),
         }
     }
@@ -180,12 +221,14 @@ impl RenderGraph {
     pub fn add_pass<P: Pass>(&mut self, device: &Device, pass: P) -> NodeId {
         let node_id = self.ctx.register_pass(device, pass);
         self.nodes.push(GraphNode::Pass(node_id));
+        self.compiled = None;
 
         node_id
     }
 
     pub fn add_subgraph(&mut self, nodes: Vec<GraphNode>) {
         self.nodes.push(GraphNode::SubGraph(nodes));
+        self.compiled = None;
     }
 
     pub fn subgraph(&mut self) -> SubGraphBuilder<'_> {
@@ -226,12 +269,11 @@ impl RenderGraph {
         self.nodes.iter().flat_map(|n| n.flatten()).collect()
     }
 
-    fn compile(&self, output: ResourceId) -> Vec<NodeId> {
-        let all_ids = self.flat_node_ids();
-
-        let writer_of: HashMap<ResourceId, NodeId> = all_ids
-            .iter()
-            .flat_map(|&id| {
+    fn compile(&self, output: ResourceId) -> CompiledGraph {
+        let writer_of: HashMap<ResourceId, NodeId> = self
+            .flat_node_ids()
+            .into_iter()
+            .flat_map(|id| {
                 self.ctx.passes[&id]
                     .writes()
                     .into_iter()
@@ -253,7 +295,8 @@ impl RenderGraph {
             }
         }
 
-        // Kahn's topological sort over the needed nodes
+        // Kahn's topological sort over the needed nodes. The min-heap keeps the
+        // order stable across frames, which texture aliasing depends on.
         let mut in_degree: HashMap<NodeId, usize> = needed.iter().map(|&k| (k, 0)).collect();
         let mut edges: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
 
@@ -262,34 +305,38 @@ impl RenderGraph {
                 let Some(&writer) = writer_of.get(&res) else {
                     continue;
                 };
-                if needed.contains(&writer) {
+                if needed.contains(&writer) && writer != id {
                     edges.entry(writer).or_default().push(id);
                     *in_degree.entry(id).or_insert(0) += 1;
                 }
             }
         }
 
-        let mut queue: Vec<NodeId> = in_degree
+        let mut queue: BinaryHeap<Reverse<NodeId>> = in_degree
             .iter()
             .filter(|(_, d)| **d == 0)
-            .map(|(id, _)| *id)
+            .map(|(id, _)| Reverse(*id))
             .collect();
 
         let mut order = Vec::new();
-        while let Some(id) = queue.pop() {
+        while let Some(Reverse(id)) = queue.pop() {
             order.push(id);
             if let Some(deps) = edges.get(&id) {
                 for &dep in deps {
                     let d = in_degree.get_mut(&dep).unwrap();
                     *d -= 1;
                     if *d == 0 {
-                        queue.push(dep);
+                        queue.push(Reverse(dep));
                     }
                 }
             }
         }
 
-        order
+        CompiledGraph {
+            output,
+            order,
+            writer_of,
+        }
     }
 
     pub fn frame_stats(&self) -> &FrameStats {
@@ -313,7 +360,12 @@ impl RenderGraph {
         }
 
         self.profiler.begin_frame();
-        let order = self.compile(output);
+        if self.compiled.as_ref().is_none_or(|c| c.output != output) {
+            self.compiled = Some(self.compile(output));
+        }
+        let compiled = self.compiled.as_ref().expect("graph compiled");
+        let order = &compiled.order;
+        let writer_of = &compiled.writer_of;
 
         let timing_features =
             wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
@@ -322,26 +374,27 @@ impl RenderGraph {
         }
 
         self.surface_size = surface_size;
+        if self.ctx.upload_arena.is_none() {
+            self.ctx.build_upload_arena(device);
+        }
+
         let (sw, sh) = surface_size;
         for res in self.ctx.resources.values_mut() {
-            let skip = matches!(res.desc, ResourceDescriptor::ExternalView);
+            let skip = matches!(
+                res.desc,
+                ResourceDescriptor::ExternalView | ResourceDescriptor::UploadBuffer { .. }
+            );
+            debug_assert!(
+                res.resource.is_some()
+                    || !matches!(res.desc, ResourceDescriptor::UploadBuffer { .. }),
+                "UploadBuffer registered after the upload arena was sealed"
+            );
             if res.resource.is_none() && !skip {
                 res.resource = Some(Self::allocate_resource(device, &res.desc, sw, sh));
             }
         }
 
-        let all_ids = self.flat_node_ids();
-        let writer_of: HashMap<ResourceId, NodeId> = all_ids
-            .iter()
-            .flat_map(|&id| {
-                self.ctx.passes[&id]
-                    .writes()
-                    .into_iter()
-                    .map(move |r| (r, id))
-            })
-            .collect();
-
-        for &node_id in &all_ids {
+        for node_id in self.flat_node_ids() {
             let Some(layout) = self.ctx.bind_group_layouts.get(&node_id) else {
                 continue;
             };
@@ -362,9 +415,18 @@ impl RenderGraph {
                 .filter_map(|br| {
                     let res = self.ctx.resources.get(&br.resource_id)?.resource.as_ref()?;
                     Some(match res {
-                        AllocatedResource::Buffer(buf) => wgpu::BindGroupEntry {
+                        AllocatedResource::Buffer {
+                            buffer,
+                            offset,
+                            size,
+                        } => wgpu::BindGroupEntry {
                             binding: br.slot,
-                            resource: buf.as_entire_binding(),
+                            resource: BufferRange {
+                                buffer,
+                                offset: *offset,
+                                size: *size,
+                            }
+                            .binding(),
                         },
                         AllocatedResource::Texture(_, view)
                         | AllocatedResource::ExternalView(view) => wgpu::BindGroupEntry {
@@ -398,7 +460,7 @@ impl RenderGraph {
 
             let mut views: HashMap<ResourceId, &wgpu::TextureView> = HashMap::new();
             let mut textures: HashMap<ResourceId, &wgpu::Texture> = HashMap::new();
-            let mut buffers: HashMap<ResourceId, &wgpu::Buffer> = HashMap::new();
+            let mut buffers: HashMap<ResourceId, BufferRange> = HashMap::new();
 
             for id in reads.iter().chain(writes.iter()) {
                 if *id == output {
@@ -413,8 +475,19 @@ impl RenderGraph {
                     Some(AllocatedResource::ExternalView(view)) => {
                         views.insert(*id, view);
                     }
-                    Some(AllocatedResource::Buffer(buf)) => {
-                        buffers.insert(*id, buf);
+                    Some(AllocatedResource::Buffer {
+                        buffer,
+                        offset,
+                        size,
+                    }) => {
+                        buffers.insert(
+                            *id,
+                            BufferRange {
+                                buffer,
+                                offset: *offset,
+                                size: *size,
+                            },
+                        );
                     }
                     None => {}
                 }
@@ -551,21 +624,19 @@ impl RenderGraph {
                 };
                 make_texture(size, *format, *usage)
             }
-            ResourceDescriptor::Buffer { size, usage } => {
-                AllocatedResource::Buffer(device.create_buffer(&wgpu::BufferDescriptor {
+            ResourceDescriptor::Buffer { size, usage } => AllocatedResource::Buffer {
+                buffer: device.create_buffer(&wgpu::BufferDescriptor {
                     label: None,
                     size: *size,
                     usage: *usage,
                     mapped_at_creation: false,
-                }))
-            }
-            ResourceDescriptor::BufferInit { data, usage } => AllocatedResource::Buffer(
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: data,
-                    usage: *usage,
                 }),
-            ),
+                offset: 0,
+                size: *size,
+            },
+            ResourceDescriptor::UploadBuffer { .. } => {
+                unreachable!("UploadBuffer is placed by the UploadArena")
+            }
         }
     }
 }

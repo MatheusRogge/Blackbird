@@ -43,7 +43,7 @@ pub struct ProbeTracePass {
     ray_direction_id: ResourceId,
     pipeline: Option<wgpu::ComputePipeline>,
     bind_group: Option<wgpu::BindGroup>,
-    frame_uniform_buf: Option<wgpu::Buffer>,
+    frame_uniform_id: ResourceId,
     frame_index: u32,
     shader: ShaderAsset,
 }
@@ -65,6 +65,11 @@ impl ProbeTracePass {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        let frame_uniform_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
+            size: std::mem::size_of::<ProbeTraceFrame>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         let outputs = ProbeTraceOutputs { ray_radiance_id, ray_direction_id };
 
         (
@@ -80,7 +85,7 @@ impl ProbeTracePass {
                 ray_direction_id,
                 pipeline: None,
                 bind_group: None,
-                frame_uniform_buf: None,
+                frame_uniform_id,
                 frame_index: 0,
                 shader,
             },
@@ -129,7 +134,7 @@ impl PassDesc for ProbeTracePass {
     }
 
     fn writes(&self) -> Vec<ResourceId> {
-        vec![self.ray_radiance_id, self.ray_direction_id]
+        vec![self.ray_radiance_id, self.ray_direction_id, self.frame_uniform_id]
     }
 }
 
@@ -160,6 +165,7 @@ impl Pass for ProbeTracePass {
         let Some(&counts_buf) = ctx.buffers.get(&self.counts_buffer_id) else { return };
         let Some(&radiance_buf) = ctx.buffers.get(&self.ray_radiance_id) else { return };
         let Some(&direction_buf) = ctx.buffers.get(&self.ray_direction_id) else { return };
+        let Some(&frame_buf) = ctx.buffers.get(&self.frame_uniform_id) else { return };
 
         let cameras = world.get_entities::<Camera>();
         let inv_view = cameras
@@ -167,30 +173,15 @@ impl Pass for ProbeTracePass {
             .map(|c| c.view_matrix().inversed())
             .unwrap_or(Mat4::identity());
 
-        if self.frame_uniform_buf.is_none() {
-            self.frame_uniform_buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("probe_trace_frame"),
-                size: std::mem::size_of::<ProbeTraceFrame>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-        }
-
         let frame_data = ProbeTraceFrame {
             frame_rotation: make_frame_rotation(self.frame_index),
             inv_view: mat4_to_cols(inv_view),
             frame_index: self.frame_index,
             _pad: [0; 3],
         };
-        queue.write_buffer(
-            self.frame_uniform_buf.as_ref().unwrap(),
-            0,
-            bytemuck::bytes_of(&frame_data),
-        );
+        frame_buf.write(queue, bytemuck::bytes_of(&frame_data));
 
         if self.pipeline.is_none() {
-            let frame_buf = self.frame_uniform_buf.as_ref().unwrap();
-
             let module = self
                 .shader
                 .compile(device)
@@ -323,15 +314,15 @@ impl Pass for ProbeTracePass {
                 label: Some("probe_trace_bg"),
                 layout: &bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: bvh_nodes_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: bvh_tris_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: bvh_info_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: probe_params_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: sky_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: counts_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: frame_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 7, resource: radiance_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 8, resource: direction_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 0, resource: bvh_nodes_buf.binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: bvh_tris_buf.binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: bvh_info_buf.binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: probe_params_buf.binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: sky_buf.binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: counts_buf.binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: frame_buf.binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: radiance_buf.binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: direction_buf.binding() },
                 ],
             }));
         }

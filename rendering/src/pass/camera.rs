@@ -31,7 +31,7 @@ pub struct CameraPass {
 
 impl CameraPass {
     pub fn new(graph: &mut RenderGraph) -> (Self, ResourceId) {
-        let camera_buffer_id = graph.alloc_resource_id(ResourceDescriptor::Buffer {
+        let camera_buffer_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: std::mem::size_of::<CameraUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -76,7 +76,7 @@ impl PassDesc for CameraPass {
         vec![BindingResource {
             slot: 0,
             resource_id: self.camera_buffer_id,
-            descriptor: ResourceDescriptor::Buffer {
+            descriptor: ResourceDescriptor::UploadBuffer {
                 size: std::mem::size_of::<CameraUniform>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             },
@@ -105,6 +105,6 @@ impl Pass for CameraPass {
         let uniform = CameraUniform::from_camera(main_camera);
         let data = bytemuck::bytes_of(&uniform);
 
-        queue.write_buffer(ctx.buffers[&self.camera_buffer_id], 0, data);
+        ctx.buffers[&self.camera_buffer_id].write(queue, data);
     }
 }

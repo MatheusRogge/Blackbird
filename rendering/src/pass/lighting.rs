@@ -3,10 +3,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytemuck;
 use engine_core::world::World;
-use wgpu::util::DeviceExt;
 
 use crate::{
-    debug_flags::RenderDebugFlags,
+    debug_flags::{DebugFlagsGpu, RenderDebugFlags},
     graph::{NodeId, RenderGraph},
     pass::cluster_assignment::ClusterOutputs,
     pass::gbuffer::GBufferOutputs,
@@ -72,7 +71,7 @@ pub struct LightingPass {
     probe_sampler: Option<wgpu::Sampler>,
 
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
-    debug_flags_buf: Option<wgpu::Buffer>,
+    debug_flags_id: ResourceId,
     debug_flags_bgl: Option<wgpu::BindGroupLayout>,
     debug_flags_bg: Option<wgpu::BindGroup>,
 }
@@ -94,6 +93,11 @@ impl LightingPass {
         let lit_id = graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
             format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        });
+
+        let debug_flags_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
+            size: std::mem::size_of::<DebugFlagsGpu>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let outputs = LightingOutputs { lit_id };
@@ -140,7 +144,7 @@ impl LightingPass {
                 probe_sampler: None,
 
                 debug_flags,
-                debug_flags_buf: None,
+                debug_flags_id,
                 debug_flags_bgl: None,
                 debug_flags_bg: None,
             },
@@ -180,7 +184,7 @@ impl PassDesc for LightingPass {
     }
 
     fn writes(&self) -> Vec<ResourceId> {
-        vec![self.lit_id]
+        vec![self.lit_id, self.debug_flags_id]
     }
 }
 
@@ -597,35 +601,35 @@ impl Pass for LightingPass {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: params_buf.as_entire_binding(),
+                        resource: params_buf.binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: point_buf.as_entire_binding(),
+                        resource: point_buf.binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: grid_buf.as_entire_binding(),
+                        resource: grid_buf.binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: indices_buf.as_entire_binding(),
+                        resource: indices_buf.binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: sky_buf.as_entire_binding(),
+                        resource: sky_buf.binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
-                        resource: spot_buf.as_entire_binding(),
+                        resource: spot_buf.binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
-                        resource: area_buf.as_entire_binding(),
+                        resource: area_buf.binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 7,
-                        resource: counts_buf.as_entire_binding(),
+                        resource: counts_buf.binding(),
                     },
                 ],
             }));
@@ -680,7 +684,7 @@ impl Pass for LightingPass {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: shadow_params_buf.as_entire_binding(),
+                        resource: shadow_params_buf.binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -719,7 +723,7 @@ impl Pass for LightingPass {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: probe_params_buf.as_entire_binding(),
+                        resource: probe_params_buf.binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
@@ -727,7 +731,7 @@ impl Pass for LightingPass {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: camera_buf.as_entire_binding(),
+                        resource: camera_buf.binding(),
                     },
                 ],
             }));
@@ -739,25 +743,19 @@ impl Pass for LightingPass {
             .expect("debug_flags RwLock poisoned")
             .to_gpu();
 
-        if self.debug_flags_buf.is_none() {
-            self.debug_flags_buf = Some(device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label: Some("debug_flags_buf"),
-                    contents: bytemuck::bytes_of(&gpu_flags),
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                },
-            ));
+        let Some(&debug_flags_buf) = ctx.buffers.get(&self.debug_flags_id) else { return };
+        debug_flags_buf.write(queue, bytemuck::bytes_of(&gpu_flags));
+
+        if self.debug_flags_bg.is_none() {
             let debug_flags_bgl = self.debug_flags_bgl.as_ref().unwrap();
             self.debug_flags_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("lighting_debug_flags_bg"),
                 layout: debug_flags_bgl,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.debug_flags_buf.as_ref().unwrap().as_entire_binding(),
+                    resource: debug_flags_buf.binding(),
                 }],
             }));
-        } else if let Some(buf) = &self.debug_flags_buf {
-            queue.write_buffer(buf, 0, bytemuck::bytes_of(&gpu_flags));
         }
 
         let cluster_bg: &wgpu::BindGroup = self.cluster_bg.as_ref().unwrap();

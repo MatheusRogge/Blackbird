@@ -5,6 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use engine_core::world::World;
 
 use crate::{
+    arena::BufferRange,
     debug_flags::RenderDebugFlags,
     graph::{NodeId, RenderGraph},
     pass::{Pass, PassContext, PassDesc},
@@ -37,7 +38,7 @@ pub struct DebugOverlayPass {
     probe_pipeline: Option<wgpu::RenderPipeline>,
     grid_pipeline:  Option<wgpu::RenderPipeline>,
     bind_group:     Option<wgpu::BindGroup>,
-    overlay_params_buf: Option<wgpu::Buffer>,
+    overlay_params_id: ResourceId,
 
     bvh_node_count: Arc<AtomicU32>,
     debug_flags:    Arc<RwLock<RenderDebugFlags>>,
@@ -61,6 +62,11 @@ impl DebugOverlayPass {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         });
 
+        let overlay_params_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
+            size: std::mem::size_of::<OverlayParamsGpu>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         let outputs = DebugOverlayOutputs { debug_overlay_id };
 
         (
@@ -75,7 +81,7 @@ impl DebugOverlayPass {
                 probe_pipeline: None,
                 grid_pipeline: None,
                 bind_group: None,
-                overlay_params_buf: None,
+                overlay_params_id,
                 bvh_node_count,
                 debug_flags,
                 shader,
@@ -87,19 +93,13 @@ impl DebugOverlayPass {
     fn build_pipelines(
         &mut self,
         device: &wgpu::Device,
-        bvh_nodes_buf: &wgpu::Buffer,
-        bvh_info_buf: &wgpu::Buffer,
-        camera_buf: &wgpu::Buffer,
-        probe_params_buf: &wgpu::Buffer,
+        bvh_nodes_buf: BufferRange,
+        bvh_info_buf: BufferRange,
+        camera_buf: BufferRange,
+        probe_params_buf: BufferRange,
+        overlay_params_buf: BufferRange,
     ) {
         let module = self.shader.compile(device).expect("debug_overlay shader compile failed");
-
-        let overlay_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("overlay_params"),
-            size: std::mem::size_of::<OverlayParamsGpu>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("debug_overlay_bgl"),
@@ -248,15 +248,14 @@ impl DebugOverlayPass {
             label: Some("debug_overlay_bg"),
             layout: &bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: bvh_nodes_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: bvh_info_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: camera_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: probe_params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: overlay_params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: bvh_nodes_buf.binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: bvh_info_buf.binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: camera_buf.binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: probe_params_buf.binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: overlay_params_buf.binding() },
             ],
         }));
 
-        self.overlay_params_buf = Some(overlay_params_buf);
     }
 }
 
@@ -270,7 +269,7 @@ impl PassDesc for DebugOverlayPass {
     }
 
     fn writes(&self) -> Vec<ResourceId> {
-        vec![self.debug_overlay_id]
+        vec![self.debug_overlay_id, self.overlay_params_id]
     }
 }
 
@@ -292,9 +291,10 @@ impl Pass for DebugOverlayPass {
         let Some(&bvh_info_buf) = ctx.buffers.get(&self.bvh_info_id) else { return };
         let Some(&camera_buf) = ctx.buffers.get(&self.camera_id) else { return };
         let Some(&probe_params_buf) = ctx.buffers.get(&self.probe_params_id) else { return };
+        let Some(&overlay_params_buf) = ctx.buffers.get(&self.overlay_params_id) else { return };
 
         if self.bvh_pipeline.is_none() {
-            self.build_pipelines(device, bvh_nodes_buf, bvh_info_buf, camera_buf, probe_params_buf);
+            self.build_pipelines(device, bvh_nodes_buf, bvh_info_buf, camera_buf, probe_params_buf, overlay_params_buf);
         }
 
         let (show_bvh, bvh_leaves_only, show_probes, show_grid) = self
@@ -307,11 +307,7 @@ impl Pass for DebugOverlayPass {
             bvh_leaves_only: bvh_leaves_only as u32,
             _pad: [0; 3],
         };
-        queue.write_buffer(
-            self.overlay_params_buf.as_ref().unwrap(),
-            0,
-            bytemuck::bytes_of(&overlay_data),
-        );
+        overlay_params_buf.write(queue, bytemuck::bytes_of(&overlay_data));
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("debug_overlay"),
