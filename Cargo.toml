@@ -20,3 +20,16 @@ tracing = { version = "0.1.44" }
 winit = { version = "0.30.13" }
 slotmap = { version = "1.1.1" }
 ultraviolet = { version = "0.10.0", features = ["int", "f64"] }
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

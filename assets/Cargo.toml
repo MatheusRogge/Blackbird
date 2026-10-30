@@ -2,6 +2,10 @@
 name = "assets"
 version = "1.0.0"
 edition = "2024"
+rust-version = "1.96"
+
+[lints]
+workspace = true
 
 [dependencies]
 downcast-rs = "2.0.2"
