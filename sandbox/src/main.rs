@@ -28,7 +28,7 @@ impl Default for MyGame {
         Self {
             scene: None,
             camera_controller: None,
-            player_controller: PlayerController::new(50.0),
+            player_controller: PlayerController::new(5.0),
             pending_gltf: None,
             tick: 0,
         }
@@ -48,12 +48,12 @@ impl Plugin for MyGame {
 
         let camera_key: EntityKey = engine.world().add_entity(Camera {
             up: (0.0, 1.0, 0.0).into(),
-            eye: (0.0, 40.0, 150.0).into(),
-            target: (0.0, 40.0, 0.0).into(),
+            eye: (8.0, 2.0, 0.0).into(),
+            target: (0.0, 2.0, 0.0).into(),
             aspect: 800.0 / 600.0,
             fovy: 45.0_f32.to_radians(),
             near: 0.01,
-            far: 10000.0,
+            far: 100.0,
         });
 
         self.player_controller.attach(camera_key);

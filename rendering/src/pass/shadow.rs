@@ -1,6 +1,11 @@
 
+use std::collections::{HashMap, HashSet};
+
 use bytemuck::{Pod, Zeroable};
-use engine_core::world::World;
+use engine_core::{
+    entity::EntityKey,
+    world::{EntityHandle, World},
+};
 use ultraviolet::{Mat4, Vec3, Vec4};
 
 use crate::{
@@ -50,6 +55,39 @@ pub struct ShadowPass {
 
     cascade_views: Vec<wgpu::TextureView>,
     cascade_bind_group: Option<wgpu::BindGroup>,
+
+    local_bounds: HashMap<EntityKey, Aabb>,
+}
+
+#[derive(Clone, Copy)]
+struct Aabb {
+    min: Vec3,
+    max: Vec3,
+}
+
+impl Aabb {
+    fn empty() -> Self {
+        Self { min: Vec3::broadcast(f32::MAX), max: Vec3::broadcast(f32::MIN) }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.min.x > self.max.x
+    }
+
+    fn extend(&mut self, p: Vec3) {
+        self.min = self.min.min_by_component(p);
+        self.max = self.max.max_by_component(p);
+    }
+
+    fn corners(&self) -> [Vec3; 8] {
+        let (a, b) = (self.min, self.max);
+        [
+            Vec3::new(a.x, a.y, a.z), Vec3::new(b.x, a.y, a.z),
+            Vec3::new(a.x, b.y, a.z), Vec3::new(b.x, b.y, a.z),
+            Vec3::new(a.x, a.y, b.z), Vec3::new(b.x, a.y, b.z),
+            Vec3::new(a.x, b.y, b.z), Vec3::new(b.x, b.y, b.z),
+        ]
+    }
 }
 
 impl ShadowPass {
@@ -89,9 +127,35 @@ impl ShadowPass {
                 cascade_vp_id,
                 cascade_views: Vec::new(),
                 cascade_bind_group: None,
+                local_bounds: HashMap::new(),
             },
             outputs,
         )
+    }
+
+    /// World-space bounds of every mesh. Local bounds are computed once per
+    /// entity, so only the transforms are re-applied each frame.
+    fn scene_bounds(&mut self, meshes: &[EntityHandle<'_, Mesh>]) -> Aabb {
+        let live: HashSet<EntityKey> = meshes.iter().map(|h| h.id).collect();
+        self.local_bounds.retain(|key, _| live.contains(key));
+
+        let mut scene = Aabb::empty();
+        for handle in meshes {
+            let local = self.local_bounds.entry(handle.id).or_insert_with(|| {
+                let mut bounds = Aabb::empty();
+                for v in &handle.entity.vertices {
+                    bounds.extend(Vec3::from(v.position));
+                }
+                bounds
+            });
+            if local.is_empty() {
+                continue;
+            }
+            for corner in local.corners() {
+                scene.extend(handle.entity.transform.transform_point3(corner));
+            }
+        }
+        scene
     }
 }
 
@@ -113,8 +177,9 @@ fn ortho_rh_wgpu(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) -> Mat4 {
 /// projection size is rotation-invariant — the camera rotating no longer changes
 /// the projection bounds, eliminating the warping artefact. The sphere centre is
 /// then snapped to the nearest shadow texel so the grid only shifts by whole-
-/// texel steps during camera translation.
-fn cascade_vp(camera: &Camera, light_view: &Mat4, near_z: f32, far_z: f32) -> Mat4 {
+/// texel steps during camera translation. `depth_range` is the light-space
+/// near/far of the whole scene, so every caster lands in every cascade.
+fn cascade_vp(camera: &Camera, light_view: &Mat4, near_z: f32, far_z: f32, depth_range: (f32, f32)) -> Mat4 {
     let th = (camera.fovy * 0.5).tan();
     let nh = near_z * th;
     let nw = nh * camera.aspect;
@@ -160,18 +225,7 @@ fn cascade_vp(camera: &Camera, light_view: &Mat4, near_z: f32, far_z: f32) -> Ma
     let b = sy - radius;
     let t = sy + radius;
 
-    // Z range from actual corners; extend backwards to capture casters outside the slice.
-    let mut min_z = f32::MAX;
-    let mut max_z = f32::MIN;
-    for c in &corners_ws {
-        let ls = *light_view * Vec4::new(c.x, c.y, c.z, 1.0);
-        min_z = min_z.min(ls.z);
-        max_z = max_z.max(ls.z);
-    }
-    let ortho_near = (-max_z - far_z * 0.5).max(0.1);
-    let ortho_far  = -min_z + 10.0;
-
-    ortho_rh_wgpu(l, r, b, t, ortho_near, ortho_far) * *light_view
+    ortho_rh_wgpu(l, r, b, t, depth_range.0, depth_range.1) * *light_view
 }
 
 /// PSSM split scheme blending logarithmic and uniform distributions.
@@ -236,10 +290,31 @@ impl Pass for ShadowPass {
         } else {
             Vec3::unit_y()
         };
-        let light_push = camera.far;
-        let light_view = Mat4::look_at(camera.eye - dir * light_push, camera.eye, up);
+        let light_view = Mat4::look_at(camera.eye - dir, camera.eye, up);
 
-        let splits = compute_cascade_splits(camera.near, camera.far);
+        let meshes = world.get_entity_handles::<Mesh>();
+        let scene = self.scene_bounds(&meshes);
+        if scene.is_empty() {
+            return;
+        }
+
+        // Cascades only need to reach the farthest scene point, and their depth
+        // range only needs to span the scene, so precision and bias follow the
+        // scene's scale rather than the camera's far plane.
+        let view = camera.view_matrix();
+        let (mut min_z, mut max_z) = (f32::MAX, f32::MIN);
+        let mut shadow_far = 0f32;
+        for corner in scene.corners() {
+            shadow_far = shadow_far.max(-view.transform_point3(corner).z);
+            let z = light_view.transform_point3(corner).z;
+            min_z = min_z.min(z);
+            max_z = max_z.max(z);
+        }
+        let shadow_far = shadow_far.clamp(camera.near * 2.0, camera.far);
+        let pad = (max_z - min_z) * 0.01 + 1e-3;
+        let depth_range = (-max_z - pad, -min_z + pad);
+
+        let splits = compute_cascade_splits(camera.near, shadow_far);
 
         // Lazy init: pipeline + cascade bind group + per-layer views.
         if self.pipeline.is_none() {
@@ -332,8 +407,6 @@ impl Pass for ShadowPass {
             return;
         }
 
-        let meshes = world.get_entity_handles::<Mesh>();
-
         let generation = ctx.geometry.generation();
         if self.instance_bind_group.as_ref().is_none_or(|(g, _)| *g != generation)
             && let Some(layout) = self.instance_layout.as_ref()
@@ -360,7 +433,7 @@ impl Pass for ShadowPass {
         for i in 0..NUM_CASCADES {
             let near_z = if i == 0 { camera.near } else { splits[i - 1] };
             let far_z  = splits[i];
-            let light_vp = cascade_vp(camera, &light_view, near_z, far_z);
+            let light_vp = cascade_vp(camera, &light_view, near_z, far_z, depth_range);
 
             let v2s = light_vp * inv_cam_view;
             let cols = v2s.cols;

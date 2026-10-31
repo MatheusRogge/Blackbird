@@ -79,7 +79,7 @@ The pass constructor convention is `XPass::new(&mut graph, upstream_outputs…, 
 | `probe_atlas` | upload | camera eye, `RenderDebugFlags` DDGI params | probe grid params (grid snaps to `probe_spacing`, scrolls with the camera) |
 | `probe_trace` | compute | BVH, probe params, sky lights | per-ray radiance + direction (864 probes × 128 rays) |
 | `probe_update` | compute | rays, atlas[current] | atlas[1-current] (irradiance 8², visibility 16², 1px border), then flips `current_atlas` |
-| `shadow` | raster | first `SkyLight`, camera, meshes | 4-cascade 2048² depth array + `ShadowParams` (PSSM λ=0.75, sphere-fit, texel-snapped) |
+| `shadow` | raster | first `SkyLight`, camera, meshes | 4-cascade 2048² depth array + `ShadowParams` (PSSM λ=0.75, sphere-fit, texel-snapped). Splits end at the farthest scene point and each cascade's depth range spans the world-space scene AABB, so shadows work at any scene scale |
 | `gbuffer` | raster | camera, meshes | albedo, normal, material, depth (reverse-Z, clear 0.0) |
 | `cluster_assignment` | compute | camera, point + sky lights | 16×9×24 cluster grid, ≤128 lights/cluster |
 | `lighting` | fullscreen | gbuffer, clusters, point/spot/area/sky lights + counts, shadows, probe atlas, debug flags | `lit` (HDR) |
