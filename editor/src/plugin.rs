@@ -15,10 +15,14 @@ use engine::rendering::mesh::Mesh;
 
 use crate::camera::EditorCameraController;
 use crate::math;
+use crate::project::Project;
 use crate::state::{LightData, NodeKind, SceneLight, SceneNode, Selection, SharedState};
 
 /// TRS of every edited node, used to detect when transforms must be reapplied.
 type TransformSnapshot = Vec<(usize, [f32; 10])>;
+
+/// Quiet period after the last project change before `project.json` is written.
+const PROJECT_SAVE_DELAY: Duration = Duration::from_millis(500);
 
 pub struct EditorPlugin {
     state: SharedState,
@@ -31,6 +35,10 @@ pub struct EditorPlugin {
     ignore_changes_until: Option<Instant>,
     applied_transforms: TransformSnapshot,
     applied_entities: usize,
+    /// Project as last written to (or read from) `project.json`.
+    saved_project: Option<Project>,
+    /// Unsaved project contents and when they were last changed.
+    pending_project: Option<(Project, Instant)>,
 }
 
 impl EditorPlugin {
@@ -46,6 +54,8 @@ impl EditorPlugin {
             ignore_changes_until: None,
             applied_transforms: Vec::new(),
             applied_entities: 0,
+            saved_project: None,
+            pending_project: None,
         }
     }
 
@@ -81,6 +91,7 @@ impl Plugin for EditorPlugin {
         self.check_file_changes(engine);
         self.handle_light_requests(engine);
         self.apply_edits(engine);
+        self.sync_project();
 
         if let Some(scene) = &mut self.scene {
             scene.load_batch(&mut engine.world(), 10);
@@ -139,15 +150,15 @@ impl EditorPlugin {
 
         let pending = self.state.lock().expect("editor state mutex poisoned").new_project_path.take();
         if let Some((dir, name)) = pending {
-            let result = crate::project::Project::create(&dir, &name);
-            let mut s = self.state.lock().expect("editor state mutex poisoned");
+            let result = Project::create(&dir, &name);
+            let state = Arc::clone(&self.state);
+            let mut s = state.lock().expect("editor state mutex poisoned");
             s.new_project_requested = false;
             match result {
                 Ok(project) => {
                     s.status = format!("Created project \"{}\"", project.name);
                     Self::record_recent(&mut s, &project.name, &dir);
-                    s.project = Some(project);
-                    s.project_dir = Some(dir);
+                    self.set_project(&mut s, project, dir);
                 }
                 Err(e) => s.status = format!("New project failed: {e}"),
             }
@@ -182,21 +193,70 @@ impl EditorPlugin {
     }
 
     fn load_project(&mut self, dir: PathBuf) {
-        let result = crate::project::Project::load(&dir);
-        let mut s = self.state.lock().expect("editor state mutex poisoned");
+        let result = Project::load(&dir);
+        let state = Arc::clone(&self.state);
+        let mut s = state.lock().expect("editor state mutex poisoned");
         s.open_project_requested = false;
         match result {
             Ok(project) => {
                 let default_scene = project.default_scene_path(&dir);
                 s.status = format!("Opened project \"{}\"", project.name);
                 Self::record_recent(&mut s, &project.name, &dir);
-                s.project = Some(project);
-                s.project_dir = Some(dir);
+                self.set_project(&mut s, project, dir);
                 if let Some(scene) = default_scene {
                     s.load_path = Some(scene);
                 }
             }
             Err(e) => s.status = format!("Open project failed: {e}"),
+        }
+    }
+
+    fn set_project(&mut self, s: &mut crate::state::EditorState, project: Project, dir: PathBuf) {
+        s.camera_settings = project.camera.clone();
+        s.project_scenes = Project::list_scenes(&dir);
+        self.saved_project = Some(project.clone());
+        self.pending_project = None;
+        s.project = Some(project);
+        s.project_dir = Some(dir);
+    }
+
+    /// Writes `project.json` once project settings have stopped changing for a moment.
+    fn sync_project(&mut self) {
+        let mut s = self.state.lock().expect("editor state mutex poisoned");
+        let camera = s.camera_settings.clone();
+        let Some(project) = s.project.as_mut() else { return };
+        project.camera = camera;
+        if self.saved_project.as_ref() == Some(project) {
+            self.pending_project = None;
+            return;
+        }
+
+        let now = Instant::now();
+        match &self.pending_project {
+            Some((pending, changed_at)) if pending == project => {
+                if now.duration_since(*changed_at) < PROJECT_SAVE_DELAY {
+                    return;
+                }
+            }
+            _ => {
+                self.pending_project = Some((project.clone(), now));
+                return;
+            }
+        }
+
+        let project = project.clone();
+        let Some(dir) = s.project_dir.clone() else { return };
+        self.pending_project = None;
+        // On failure the snapshot still advances, so the write is retried on the next change rather than every tick.
+        if let Err(e) = project.save(&dir) {
+            s.status = format!("Saving project settings failed: {e:#}");
+        }
+        self.saved_project = Some(project);
+    }
+
+    fn refresh_project_scenes(s: &mut crate::state::EditorState) {
+        if let Some(dir) = &s.project_dir {
+            s.project_scenes = Project::list_scenes(dir);
         }
     }
 
@@ -215,7 +275,7 @@ impl EditorPlugin {
         if needs_dialog {
             let start_dir = self.state.lock().expect("editor state mutex poisoned")
                 .project_dir.as_ref()
-                .map(|d| crate::project::Project::scenes_dir(d));
+                .map(|d| Project::scenes_dir(d));
             let mut dialog = rfd::FileDialog::new().add_filter("GLTF / GLB", &["gltf", "glb"]);
             if let Some(dir) = start_dir {
                 dialog = dialog.set_directory(dir);
@@ -264,6 +324,7 @@ impl EditorPlugin {
             Ok(scene) => {
                 s.status = format!("Imported {}", scene.display());
                 s.load_path = Some(scene);
+                Self::refresh_project_scenes(&mut s);
             }
             Err(e) => s.status = format!("Import failed: {e:#}"),
         }
@@ -301,7 +362,7 @@ impl EditorPlugin {
             let default_dir = {
                 let s = self.state.lock().expect("editor state mutex poisoned");
                 s.project_dir.as_ref()
-                    .map(|d| crate::project::Project::scenes_dir(d))
+                    .map(|d| Project::scenes_dir(d))
                     .or_else(|| s.file_path.as_ref()
                         .and_then(|p| p.parent().map(|d| d.to_path_buf())))
             };
@@ -327,6 +388,7 @@ impl EditorPlugin {
             };
             let mut s = self.state.lock().expect("editor state mutex poisoned");
             s.export_requested = false;
+            Self::refresh_project_scenes(&mut s);
             s.status = match result {
                 Ok(()) => format!("Exported to {}", path.display()),
                 Err(e) => format!("Export failed: {e}"),

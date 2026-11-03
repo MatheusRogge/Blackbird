@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use engine_core::entity::EntityKey;
 use gltf_api::Document;
+use serde::{Deserialize, Serialize};
 use ultraviolet::Mat4;
 
 use crate::math;
@@ -155,7 +156,8 @@ impl LightData {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CameraSettings {
     /// World units per second for WASD/QE movement.
     pub move_speed: f32,
@@ -184,6 +186,8 @@ pub struct EditorState {
 
     pub project: Option<Project>,
     pub project_dir: Option<PathBuf>,
+    /// Scenes in the project's scenes dir, refreshed by the plugin when they can change.
+    pub project_scenes: Vec<String>,
 
     pub file_path: Option<PathBuf>,
     pub document: Option<Document>,
@@ -228,6 +232,7 @@ impl EditorState {
             recent_projects: RecentProjects::load(),
             project: None,
             project_dir: None,
+            project_scenes: Vec::new(),
             file_path: None,
             document: None,
             scene_nodes: Vec::new(),
@@ -288,6 +293,11 @@ impl EditorState {
             }
         }
         self.node_edits.insert(node_idx, edit);
+    }
+
+    /// The open scene as a project-relative path, if it lives inside the project.
+    pub fn scene_in_project(&self) -> Option<String> {
+        Project::relative_path(self.project_dir.as_ref()?, self.file_path.as_ref()?)
     }
 
     /// Node transform relative to its parent, with any edit applied.

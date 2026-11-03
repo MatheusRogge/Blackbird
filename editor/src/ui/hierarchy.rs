@@ -11,13 +11,23 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
             ui.heading("Scene");
             ui.separator();
 
-            // Right-click the panel background to add lights.
+            // Right-click the panel background to add lights or make this the default scene.
             let bg_response = ui.interact(
                 ui.available_rect_before_wrap(),
                 ui.scope_id().with("scene_ctx"),
                 egui::Sense::click(),
             );
             bg_response.context_menu(|ui| {
+                if let Some(scene) = state.scene_in_project()
+                    && let Some(project) = state.project.as_mut()
+                {
+                    let mut is_default = project.default_scene.as_ref() == Some(&scene);
+                    if ui.checkbox(&mut is_default, "Default Scene").changed() {
+                        project.default_scene = is_default.then_some(scene);
+                        ui.close();
+                    }
+                    ui.separator();
+                }
                 ui.menu_button("Add Light", |ui| {
                     if ui.button("☀ Sky Light").clicked() {
                         state.add_light_requested = Some(LightKind::Sky);
