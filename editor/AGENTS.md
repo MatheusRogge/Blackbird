@@ -16,7 +16,7 @@ main.rs ── EditorState::new() ──► SharedState = Arc<Mutex<EditorState>
 ```
 
 - **`EditorUiLayer`** (`ui/`): runs on the render thread. It `try_lock`s the state and skips the frame if the lock is contended. It only *writes request flags and edit values*: no I/O, no `World` mutation.
-- **`EditorPlugin`** (`plugin.rs`): runs on the game thread. Each `tick`, in order: `handle_signals` (new/open project, open recent, open scene, import, export), `poll_load`, `check_file_changes`, `handle_light_requests`, `apply_edits`, `GltfScene::load_batch(10)`, `apply_node_transforms`, then camera controllers (skipped during camera preview).
+- **`EditorPlugin`** (`plugin.rs`): runs on the game thread. Each `tick`, in order: `handle_signals` (new/open project, open recent, open scene, import, save, export), `poll_load`, `check_file_changes`, `handle_light_requests`, `apply_edits`, `GltfScene::load_batch(10)`, `apply_node_transforms`, then camera controllers (skipped during camera preview).
 - **`apply_node_transforms`**: when any `node_edits` TRS changes, or more meshes have streamed in, it recomputes `EditorState::node_world` for every node with entities (from `GltfScene::node_entities`), writes it to each `Mesh::transform`, and refreshes `state.entity_nodes` (mesh entity → node, used for picking).
 
 This request/response pattern through `EditorState` is the rule. UI sets `*_requested` or `Option<PathBuf>` fields, the plugin consumes them with `.take()`, does the work, and writes `status`. Native `rfd` dialogs are opened **on the game thread** and block it while they're open.
@@ -32,7 +32,7 @@ This request/response pattern through `EditorState` is the rule. UI sets `*_requ
 | `recent.rs` | `RecentProjects`, max 10, stored at `$HOME/.blackbird/recent_projects.json` (falls back to `USERPROFILE`). |
 | `import.rs` | `import_scene(source, project_dir)`: copies a `.gltf`/`.glb` into the project as `scenes/<name>.gltf`, writing every buffer (incl. GLB `BIN` and data URIs) to `assets/models/<name>/` and every image (external, data URI or buffer-view embedded) to `assets/textures/<name>/`, with URIs rewritten to `../assets/...`. Names are sanitised to URI-safe characters and `<name>` is suffixed `_N` if taken. The plugin opens the imported scene afterwards. |
 | `export.rs` | `write_gltf(&EditorState, path)`: clones the document JSON, writes `node_edits` (TRS, and material factors to *every* material on the node's mesh), serialises **JSON only**. Buffers/images are not copied, so URIs must still resolve relative to the export location. |
-| `ui/toolbar.rs` | File menu + status bar. |
+| `ui/toolbar.rs` | File menu + status bar. Owns the Ctrl+S shortcut (sets `save_requested`). |
 | `ui/hierarchy.rs` | Scene node tree + lights list, selection, "add light". |
 | `ui/inspector.rs` | Light editor, transform (euler ⇄ quat), material, camera params. |
 | `ui/gizmo.rs` | Viewport gizmo for the selected node: mode toolbar (Move/Rotate/Scale, keys 1/2/3), translate arrows and rotate rings on **world** axes, scale handles on the node's **own** axes plus a uniform centre square. Drag state lives in egui temp memory. Also click-to-select: ray vs. each mesh's world AABB, nearest hit selects its node; clicking empty space deselects. |
@@ -45,7 +45,7 @@ This request/response pattern through `EditorState` is the rule. UI sets `*_requ
 
 ## What edits actually affect
 
-| Edit | Live in viewport | Exported |
+| Edit | Live in viewport | Saved / exported |
 |------|------------------|----------|
 | Light properties | ✅ (`apply_edits` rewrites every light entity each tick from `LightData`) | ❌ (lights are editor-only) |
 | Camera node fov/near/far | ✅ on the editor camera | ✅ |
@@ -56,6 +56,7 @@ This request/response pattern through `EditorState` is the rule. UI sets `*_requ
 Mesh entities map back to glTF nodes through `GltfScene::node_entities` / `state.entity_nodes`. Live material editing could use the same mapping.
 
 ## Gotchas
+- **Save** (`handle_save_scene`) runs `write_gltf` onto `state.file_path` and then ignores watcher events for 500 ms, so the editor's own write doesn't hot-reload (which would drop lights and selection). `.glb` scenes can't be saved in place; use Export.
 - Loading a scene calls `reset_world`, which does `World::clear()`. That destroys lights too, and `start_load` clears `state.lights` to match. Hot reload therefore drops user-added lights.
 - `node_edits` is keyed by glTF node index, and `ensure_node_edit` looks the node up with `doc.nodes().nth(idx)`.
 - Shaders come from `../../sandbox/shaders/` through `include_str!`.

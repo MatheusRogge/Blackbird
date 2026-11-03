@@ -253,7 +253,25 @@ fn to_egui_key(key: &Key) -> Option<egui::Key> {
         Key::F10 => Some(egui::Key::F10),
         Key::F11 => Some(egui::Key::F11),
         Key::F12 => Some(egui::Key::F12),
-        Key::Scancode(_) => None,
+        Key::Scancode(code) => scancode_to_egui_key(*code),
+    }
+}
+
+/// Letter and digit keys arrive as physical scancodes (PC set 1, which evdev
+/// keycodes match for these keys).
+fn scancode_to_egui_key(code: u32) -> Option<egui::Key> {
+    use egui::Key as K;
+    const DIGITS: [K; 10] = [K::Num1, K::Num2, K::Num3, K::Num4, K::Num5, K::Num6, K::Num7, K::Num8, K::Num9, K::Num0];
+    const QWERTY_ROW: [K; 10] = [K::Q, K::W, K::E, K::R, K::T, K::Y, K::U, K::I, K::O, K::P];
+    const HOME_ROW: [K; 9] = [K::A, K::S, K::D, K::F, K::G, K::H, K::J, K::K, K::L];
+    const BOTTOM_ROW: [K; 7] = [K::Z, K::X, K::C, K::V, K::B, K::N, K::M];
+    let code = code as usize;
+    match code {
+        2..=11 => Some(DIGITS[code - 2]),
+        16..=25 => Some(QWERTY_ROW[code - 16]),
+        30..=38 => Some(HOME_ROW[code - 30]),
+        44..=50 => Some(BOTTOM_ROW[code - 44]),
+        _ => None,
     }
 }
 

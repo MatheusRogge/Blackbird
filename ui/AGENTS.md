@@ -27,7 +27,7 @@ Layers get `&World` under the render thread's **read** lock. Don't mutate game s
 
 ## Input translation notes
 - Mouse positions are divided by `pixels_per_point` (set from `InputEvent::ScaleFactorChanged`).
-- `Key::Scancode(_)` is not forwarded as an egui key. Letter keys reach egui only as `TextInput`.
+- `Key::Scancode` is mapped to egui letter and digit keys (`scancode_to_egui_key`, PC set 1 positions, so physical rather than layout-aware). Other scancodes are dropped. Text still arrives separately as `TextInput`.
 - `command` modifier = ctrl, and `mac_cmd` is always false.
 - The match over `InputEvent` is exhaustive. New variants must be handled here.
 

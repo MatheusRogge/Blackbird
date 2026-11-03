@@ -2,7 +2,14 @@ use egui::Ui;
 
 use crate::state::EditorState;
 
+const SAVE_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+
 pub fn draw(root: &mut Ui, state: &mut EditorState) {
+    let can_save = state.document.is_some();
+    if can_save && root.ctx().input_mut(|i| i.consume_shortcut(&SAVE_SHORTCUT)) {
+        state.save_requested = true;
+    }
+
     egui::Panel::top("toolbar").show(root, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
@@ -38,8 +45,12 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                     state.import_requested = true;
                     ui.close();
                 }
-                let can_export = state.document.is_some();
-                if ui.add_enabled(can_export, egui::Button::new("Export Scene…")).clicked() {
+                let save = egui::Button::new("Save Scene").shortcut_text(ui.ctx().format_shortcut(&SAVE_SHORTCUT));
+                if ui.add_enabled(can_save, save).clicked() {
+                    state.save_requested = true;
+                    ui.close();
+                }
+                if ui.add_enabled(can_save, egui::Button::new("Export Scene…")).clicked() {
                     state.export_requested = true;
                     ui.close();
                 }

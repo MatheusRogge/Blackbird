@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use engine::Engine;
 use engine::EntityKey;
@@ -30,6 +30,7 @@ pub struct EditorPlugin {
     watcher: Option<notify::RecommendedWatcher>,
     watch_rx: Option<mpsc::Receiver<notify::Result<notify::Event>>>,
     last_reload: Option<Instant>,
+    ignore_changes_until: Option<Instant>,
     applied_transforms: TransformSnapshot,
     applied_entities: usize,
 }
@@ -45,6 +46,7 @@ impl EditorPlugin {
             watcher: None,
             watch_rx: None,
             last_reload: None,
+            ignore_changes_until: None,
             applied_transforms: Vec::new(),
             applied_entities: 0,
         }
@@ -110,6 +112,7 @@ impl EditorPlugin {
         self.handle_open_recent(engine);
         self.handle_open_scene(engine);
         self.handle_import_scene();
+        self.handle_save_scene();
         self.handle_export_scene();
     }
 
@@ -263,6 +266,29 @@ impl EditorPlugin {
             }
             Err(e) => s.status = format!("Import failed: {e:#}"),
         }
+    }
+
+    fn handle_save_scene(&mut self) {
+        let mut s = self.state.lock().expect("editor state mutex poisoned");
+        if !std::mem::take(&mut s.save_requested) {
+            return;
+        }
+        let Some(path) = s.file_path.clone() else { return };
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("glb")) {
+            s.status = "Save failed: .glb scenes can't be saved in place, use Export Scene…".to_string();
+            return;
+        }
+
+        let result = crate::export::write_gltf(&s, &path);
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        s.status = match result {
+            Ok(()) => {
+                // Our own write would otherwise trigger a hot reload that drops lights and selection.
+                self.ignore_changes_until = Some(Instant::now() + Duration::from_millis(500));
+                format!("Saved {name}")
+            }
+            Err(e) => format!("Save failed: {e:#}"),
+        };
     }
 
     fn handle_export_scene(&mut self) {
@@ -608,19 +634,24 @@ impl EditorPlugin {
 
         let changed = match &self.watch_rx {
             None => return,
-            Some(rx) => rx.try_iter().any(|res| {
-                matches!(
-                    res,
-                    Ok(notify::Event { kind: EventKind::Modify(_) | EventKind::Create(_), .. })
-                )
-            }),
+            // Drain every event, so none of a save's events linger past the ignore window.
+            Some(rx) => rx
+                .try_iter()
+                .filter(|res| {
+                    matches!(
+                        res,
+                        Ok(notify::Event { kind: EventKind::Modify(_) | EventKind::Create(_), .. })
+                    )
+                })
+                .count()
+                > 0,
         };
 
-        if !changed {
+        let now = Instant::now();
+        if !changed || self.ignore_changes_until.is_some_and(|t| now < t) {
             return;
         }
 
-        let now = Instant::now();
         let debounce_elapsed = self.last_reload
             .map(|t| now.duration_since(t).as_millis() >= 300)
             .unwrap_or(true);
