@@ -11,9 +11,9 @@ use gltf_api::json::validation::Checked;
 use gltf_api::json::{Index, Root};
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
-use ultraviolet::{Mat4, Vec3, Vec4};
+use ultraviolet::{Mat4, Vec4};
 
-use crate::math::{self, Quat};
+use crate::math;
 use crate::state::{EditorState, LightData};
 
 const EXTENSION: &str = "KHR_lights_punctual";
@@ -177,21 +177,7 @@ fn light_world(data: &LightData, current: &Mat4) -> Mat4 {
         LightData::Spot { position, direction, .. } => (*position, *direction),
         LightData::Area { position, .. } => (*position, [0.0, 0.0, -1.0]),
     };
-    math::trs(position, rotation_to(direction.into()), [1.0; 3])
-}
-
-/// Rotation taking the local -Z axis onto `dir`.
-fn rotation_to(dir: Vec3) -> Quat {
-    let from = Vec3::new(0.0, 0.0, -1.0);
-    let dir = dir.normalized();
-    let dot = from.dot(dir);
-    if dot > 0.9999 {
-        [0.0, 0.0, 0.0, 1.0]
-    } else if dot < -0.9999 {
-        math::quat_from_axis_angle(Vec3::unit_y(), std::f32::consts::PI)
-    } else {
-        math::quat_from_axis_angle(from.cross(dir), dot.acos())
-    }
+    math::trs(position, math::quat_look(direction.into()), [1.0; 3])
 }
 
 fn set_local_transform(node: &mut gltf_api::json::Node, parent: Mat4, world: Mat4) {

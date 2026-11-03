@@ -37,13 +37,15 @@ This request/response pattern through `EditorState` is the rule. UI sets `*_requ
 | `ui/toolbar.rs` | File, Project (default scene) and Camera (move speed, Shift multiplier) menus + status bar. Owns the Ctrl+S shortcut (sets `save_requested`). |
 | `ui/hierarchy.rs` | Scene node tree + lights list, selection. Background context menu: "Default Scene" toggle (only for scenes inside the project) and "add light". |
 | `ui/inspector.rs` | Light editor, transform (euler ⇄ quat), material, camera params. |
-| `ui/gizmo.rs` | Viewport gizmo for the selected node: mode toolbar (Move/Rotate/Scale, keys 1/2/3), translate arrows and rotate rings on **world** axes, scale handles on the node's **own** axes plus a uniform centre square. Drag state lives in egui temp memory. Also click-to-select: ray vs. each mesh's world AABB, nearest hit selects its node; clicking empty space deselects. |
+| `ui/gizmo.rs` | Viewport gizmo for the selected node or light (`Target`): mode toolbar (Move/Rotate/Scale, keys 1/2/3), translate arrows and rotate rings on **world** axes, scale handles on the target's **own** axes plus a uniform centre square. Drag state lives in egui temp memory. Also draws light markers (dot; spot aim line; area outline; for sky lights a sun on the side the light comes from with an arrow into the origin, grey below the horizon) and does click-to-select: a light marker within reach wins, otherwise ray vs. each mesh's world AABB, nearest hit selects its node; clicking empty space deselects. |
 
 ## Gizmo
 - Drawn after the panels, clipped to the free rect left by `root_ui` (`viewport`). It projects with the editor camera's `view_proj_matrix()` onto the whole window (`ctx.content_rect()`), the same mapping the renderer uses.
 - Pointer capture: an `Order::Middle` area becomes interactable only while a handle is hovered or dragged. That makes `egui_wants_pointer_input()` true, so the camera controller doesn't start a drag on a gizmo handle but still does everywhere else.
 - Translation is converted into the parent's space (`parent_world⁻¹`), and rotation is conjugated by the parent's rotation, so nested nodes move along world axes. Scale is clamped to ≥ 0.001.
 - Hidden during camera preview.
+- The gizmo edits a `Pose` (translation/rotation/scale in the parent's frame). Nodes read/write `node_edits`. Lights convert through `light_pose`/`apply_light_pose` with an identity parent: lights aim down local −Z (`math::quat_look`), and an area light's `right`/`up` are local X/Y scaled by their half-extents.
+- `editable_axes` decides which modes and axes a target gets: point = move, spot = move + rotate, sky = rotate (drawn at the scene origin, since it has no position), area = move + rotate + scale X/Y. When the current mode doesn't apply, the gizmo switches to the first one that does, and the toolbar disables the others.
 
 ## What edits actually affect
 

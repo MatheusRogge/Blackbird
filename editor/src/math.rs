@@ -85,6 +85,20 @@ pub fn rotate(q: Quat, v: Vec3) -> Vec3 {
     v + t * q[3] + axis.cross(t)
 }
 
+/// Rotation taking the local -Z axis onto `dir`, the way glTF lights and cameras point.
+pub fn quat_look(dir: Vec3) -> Quat {
+    let from = Vec3::new(0.0, 0.0, -1.0);
+    let dir = dir.normalized();
+    let dot = from.dot(dir);
+    if dot > 0.9999 {
+        [0.0, 0.0, 0.0, 1.0]
+    } else if dot < -0.9999 {
+        quat_from_axis_angle(Vec3::unit_y(), std::f32::consts::PI)
+    } else {
+        quat_from_axis_angle(from.cross(dir), dot.acos())
+    }
+}
+
 /// `T * R * S`, the glTF node transform.
 pub fn trs(translation: [f32; 3], rotation: Quat, scale: [f32; 3]) -> Mat4 {
     let x = rotate(rotation, Vec3::unit_x()) * scale[0];
