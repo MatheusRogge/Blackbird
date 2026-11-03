@@ -97,6 +97,10 @@ fn draw_camera_settings(ui: &mut Ui, settings: &mut CameraSettings) {
             ui.label("Shift multiplier");
             ui.add(egui::DragValue::new(&mut settings.fast_multiplier).speed(0.05).range(1.0..=20.0).prefix("×"));
             ui.end_row();
+
+            ui.label("Exposure");
+            ui.add(egui::DragValue::new(&mut settings.exposure_stops).speed(0.05).range(-24.0..=24.0).suffix(" EV"));
+            ui.end_row();
         });
     ui.label(egui::RichText::new("Scroll while holding LMB to adjust speed").small().weak());
     if ui.button("Reset to defaults").clicked() {

@@ -150,6 +150,18 @@ struct ClusterParams {
     screen_h: f32,
     debug_mode: u32,
     num_sky_lights: u32,
+    inv_view: mat4x4<f32>,
+    // Pre-exposure: scales the physical radiance written to `lit`.
+    exposure: f32,
+}
+
+const PI: f32 = 3.14159265;
+
+// KHR_lights_punctual recommended falloff: inverse-square, smoothly windowed to zero at `range`.
+fn range_attenuation(dist: f32, range: f32) -> f32 {
+    let r = dist / range;
+    let window = clamp(1.0 - r * r * r * r, 0.0, 1.0);
+    return window * window / max(dist * dist, 1e-4);
 }
 
 struct GpuPointLight {
@@ -257,15 +269,17 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
     return out;
 }
 
+// Background radiance, scaled by each sky light's illuminance so it stays in proportion to the lit scene.
 fn sky_color(ray_dir: vec3<f32>) -> vec3<f32> {
     let horizon = vec3f(0.55, 0.65, 0.80);
     let zenith  = vec3f(0.10, 0.25, 0.60);
-    var col = mix(horizon, zenith, clamp(ray_dir.y, 0.0, 1.0));
+    let gradient = mix(horizon, zenith, clamp(ray_dir.y, 0.0, 1.0));
+    var col = vec3f(0.0);
     for (var i = 0u; i < cp.num_sky_lights; i++) {
         let L_ws = normalize((camera.inv_view * vec4f(-sky_lights[i].direction_vs, 0.0)).xyz);
         if L_ws.y < 0.0 { continue; }
-        col += sky_lights[i].color * sky_lights[i].intensity
-            * pow(max(dot(ray_dir, L_ws), 0.0), 128.0);
+        let illuminance = sky_lights[i].color * sky_lights[i].intensity / PI;
+        col += illuminance * (gradient + pow(max(dot(ray_dir, L_ws), 0.0), 128.0));
     }
     return col;
 }
@@ -287,7 +301,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let far_ws4  = camera.inv_view_proj * vec4f(ndc_x, ndc_y, 0.0, 1.0);
         let near_ws4 = camera.inv_view_proj * vec4f(ndc_x, ndc_y, 1.0, 1.0);
         let ray_dir  = normalize(far_ws4.xyz / far_ws4.w - near_ws4.xyz / near_ws4.w);
-        return vec4f(sky_color(ray_dir), 1.0);
+        return vec4f(sky_color(ray_dir) * cp.exposure, 1.0);
     }
 
     let albedo_raw = textureSample(t_albedo, s_linear, in.uv).rgb;
@@ -347,10 +361,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 continue;
             }
 
-            let L           = to_light / dist;
-            let diff        = max(dot(N_vs, L), 0.0);
-            let attenuation = 1.0 - dist / light.radius;
-            color += albedo * light.color * (light.intensity * diff * attenuation * attenuation);
+            let L    = to_light / dist;
+            let diff = max(dot(N_vs, L), 0.0);
+            color += albedo / PI * light.color * (light.intensity * diff * range_attenuation(dist, light.radius));
         }
 
         for (var i = 0u; i < light_counts.num_spot; i++) {
@@ -362,11 +375,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 continue;
             }
 
-            let L           = to_light / dist;
-            let cone        = smoothstep(light.outer_cos, light.inner_cos, dot(-L, normalize(light.direction_vs)));
-            let diff        = max(dot(N_vs, L), 0.0);
-            let attenuation = 1.0 - dist / light.radius;
-            color += albedo * light.color * (light.intensity * diff * cone * attenuation * attenuation);
+            let L    = to_light / dist;
+            let cd   = dot(-L, normalize(light.direction_vs));
+            let t    = clamp((cd - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
+            let diff = max(dot(N_vs, L), 0.0);
+            color += albedo / PI * light.color * (light.intensity * diff * t * t * range_attenuation(dist, light.radius));
         }
 
         // Representative-point approximation: light from the closest point on the rectangle,
@@ -395,7 +408,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let facing  = abs(dot(L, normalize(cross(r_dir, u_dir))));
             let diff    = max(dot(N_vs, L), 0.0);
             let falloff = area / (dist2 + area);
-            color += albedo * light.color * (light.intensity * diff * facing * falloff);
+            color += albedo / PI * light.color * (light.intensity * diff * facing * falloff);
         }
 
         for (var i = 0u; i < cp.num_sky_lights; i++) {
@@ -428,9 +441,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 lit = shadow_sum / 9.0;
             }
 
-            color += albedo * sky.color * (sky.intensity * diff * lit);
+            color += albedo / PI * sky.color * (sky.intensity * diff * lit);
         }
     }
 
-    return vec4<f32>(color, 1.0);
+    return vec4<f32>(color * cp.exposure, 1.0);
 }

@@ -17,7 +17,7 @@ wgpu 30 renderer (Vulkan backend forced). Contains the render graph, every rende
 | `pass` | `Pass` / `PassDesc` traits, `PassContext`, and every PBR pass (below) |
 | `pbr` | `RenderGraphPBRBuilder`, which wires the full 3D pipeline |
 | `rendering_2d` | `Sprite`, `SpriteTexture`, `Camera2D`, `SpritePass`, `SpriteRenderGraphBuilder` (shader embedded in-crate) |
-| `camera` | `Camera` entity (`eye/target/up/fovy/aspect/near/far`). **Reversed-Z** projection. Implements `Controllable`. |
+| `camera` | `Camera` entity (`eye/target/up/fovy/aspect/near/far/exposure`). **Reversed-Z** projection. `exposure` is a linear multiplier applied in `lighting.wgsl` (pre-exposure, before `present`'s ACES). Implements `Controllable`. |
 | `camera_controller` | `CameraController` (`FirstPerson` / `ThirdPerson` orbit + scroll zoom; respects `ui_wants_pointer`) |
 | `light` | Entities `PointLight`, `SpotLight`, `AreaLight`, `SkyLight` + `Gpu*` structs, `LightCounts`, `MAX_*_LIGHTS` (256/64/32/4) |
 | `mesh` | `Vertex` (pos, normal, color, uv, tangent), `Mesh` entity (+ optional albedo/normal `Arc<TextureAsset>`, `transform: Mat4` local→world), `MeshBatch` |
@@ -87,6 +87,9 @@ The pass constructor convention is `XPass::new(&mut graph, upstream_outputs…, 
 | `present` | fullscreen | `lit` + overlay | surface |
 
 Coordinate conventions: right-handed, Y-up, camera looks down -Z. Light data is in **view space** on the GPU. Camera/GBuffer depth is reversed-Z (`GreaterEqual`, clear to 0). Shadow maps use standard Z (`LessEqual`).
+
+## Light units
+Lighting follows `KHR_lights_punctual`, so glTF intensities map 1:1. `SkyLight::intensity` is illuminance in lux, `PointLight`/`SpotLight::intensity` is luminous intensity in candela, and `AreaLight::intensity` is the emitter's luminance in nits. Diffuse is Lambertian (`albedo / π`) for every light, and in `probe_trace.wgsl` too. Point/spot falloff is `window(d / radius)² / d²` (`range_attenuation`), so `radius` is the glTF `range`. The spot cone uses the spec's squared linear blend between `outer_cos` and `inner_cos`. The sky background (and the probes' sky term) scales with each sky light's illuminance. The camera's `exposure` (carried in `ClusterParams`) brings physical values into display range: 1.0 suits a few-lux scene, and daylight (~100 000 lx) wants roughly 2⁻¹⁵.
 
 ## Gotchas
 - **Mesh geometry is keyed by `EntityKey`** in `GeometryArena`, and gbuffer material textures by `Arc` pointer. Changing a `Mesh`'s vertices in place is never re-uploaded, but replacing the entity (new key) works. `Mesh::transform` *is* picked up every frame. Removed meshes are freed on the next frame. Material textures are still never freed.

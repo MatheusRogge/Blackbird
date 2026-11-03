@@ -70,6 +70,7 @@ impl EditorPlugin {
             fovy: 45.0_f32.to_radians(),
             near: 0.01,
             far: 10000.0,
+            exposure: 1.0,
         });
         self.camera_controller = Some(EditorCameraController::new(camera_key));
 
@@ -730,6 +731,8 @@ fn node_snapshot(node: &gltf_api::Node) -> SceneNode {
             NodeKind::Mesh(mesh.name().unwrap_or("").to_string())
         } else if node.camera().is_some() {
             NodeKind::Camera
+        } else if node.light().is_some() {
+            NodeKind::Light
         } else {
             NodeKind::Empty
         },

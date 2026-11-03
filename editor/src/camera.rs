@@ -146,6 +146,7 @@ impl EditorCameraController {
         }
 
         let Some(camera) = world.get_entity_mut::<Camera>(self.camera_key) else { return };
+        camera.exposure = settings.exposure();
         self.apply(camera, settings, cursor_delta, scroll, delta);
     }
 

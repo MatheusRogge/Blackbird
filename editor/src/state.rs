@@ -25,6 +25,8 @@ pub struct SceneNode {
 pub enum NodeKind {
     Mesh(String),
     Camera,
+    /// Carries a `KHR_lights_punctual` light, which is edited as a `SceneLight`.
+    Light,
     Empty,
 }
 
@@ -115,6 +117,15 @@ pub enum LightData {
 }
 
 impl LightData {
+    pub fn icon(&self) -> &'static str {
+        match self {
+            LightData::Sky { .. }   => "☀",
+            LightData::Point { .. } => "●",
+            LightData::Spot { .. }  => "◎",
+            LightData::Area { .. }  => "▪",
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             LightData::Sky { .. }   => "☀ Sky Light",
@@ -128,20 +139,20 @@ impl LightData {
         match kind {
             LightKind::Sky => LightData::Sky {
                 color: [0.8, 0.9, 1.0],
-                intensity: 1.5,
+                intensity: 5.0,
                 direction: [-0.3, -1.0, 0.2],
             },
             LightKind::Point => LightData::Point {
                 position: [0.0, 2.0, 0.0],
                 color: [1.0, 1.0, 1.0],
-                intensity: 10.0,
+                intensity: 80.0,
                 radius: 10.0,
             },
             LightKind::Spot => LightData::Spot {
                 position: [0.0, 3.0, 0.0],
                 direction: [0.0, -1.0, 0.0],
                 color: [1.0, 1.0, 1.0],
-                intensity: 10.0,
+                intensity: 80.0,
                 radius: 10.0,
                 inner_angle: 15.0_f32.to_radians(),
                 outer_angle: 30.0_f32.to_radians(),
@@ -151,7 +162,7 @@ impl LightData {
                 right: [1.0, 0.0, 0.0],
                 up: [0.0, 0.0, -1.0],
                 color: [1.0, 1.0, 1.0],
-                intensity: 5.0,
+                intensity: 15.0,
             },
         }
     }
@@ -164,16 +175,22 @@ pub struct CameraSettings {
     pub move_speed: f32,
     /// Speed multiplier while Shift is held.
     pub fast_multiplier: f32,
+    /// Exposure compensation in stops; the camera exposure is `2^exposure_stops`.
+    pub exposure_stops: f32,
 }
 
 impl CameraSettings {
     pub const MIN_SPEED: f32 = 0.01;
     pub const MAX_SPEED: f32 = 1000.0;
+
+    pub fn exposure(&self) -> f32 {
+        self.exposure_stops.exp2()
+    }
 }
 
 impl Default for CameraSettings {
     fn default() -> Self {
-        Self { move_speed: 10.0, fast_multiplier: 4.0 }
+        Self { move_speed: 10.0, fast_multiplier: 4.0, exposure_stops: 0.0 }
     }
 }
 

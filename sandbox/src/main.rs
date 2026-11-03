@@ -54,6 +54,7 @@ impl Plugin for MyGame {
             fovy: 45.0_f32.to_radians(),
             near: 0.01,
             far: 100.0,
+            exposure: 1.0,
         });
 
         self.player_controller.attach(camera_key);
@@ -64,7 +65,7 @@ impl Plugin for MyGame {
         world.add_entity(SkyLight {
             direction: (-0.3, -1.0, 0.2).into(),
             color: (0.8, 0.9, 1.0).into(),
-            intensity: 1.5,
+            intensity: 5.0,
         });
 
         Ok(())

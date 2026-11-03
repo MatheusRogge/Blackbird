@@ -78,7 +78,7 @@ fn draw_light(ui: &mut egui::Ui, data: &mut LightData) {
                 ui.end_row();
 
                 ui.label("Intensity");
-                ui.add(egui::DragValue::new(intensity).speed(0.05).range(0.0..=20.0));
+                ui.add(egui::DragValue::new(intensity).speed(0.05).range(0.0..=200_000.0).suffix(" lx"));
                 ui.end_row();
 
                 ui.label("Direction");
@@ -106,7 +106,7 @@ fn draw_light(ui: &mut egui::Ui, data: &mut LightData) {
                 ui.end_row();
 
                 ui.label("Intensity");
-                ui.add(egui::DragValue::new(intensity).speed(0.1).range(0.0..=10000.0));
+                ui.add(egui::DragValue::new(intensity).speed(0.1).range(0.0..=1_000_000.0).suffix(" cd"));
                 ui.end_row();
 
                 ui.label("Radius");
@@ -138,7 +138,7 @@ fn draw_light(ui: &mut egui::Ui, data: &mut LightData) {
                 ui.end_row();
 
                 ui.label("Intensity");
-                ui.add(egui::DragValue::new(intensity).speed(0.1).range(0.0..=10000.0));
+                ui.add(egui::DragValue::new(intensity).speed(0.1).range(0.0..=1_000_000.0).suffix(" cd"));
                 ui.end_row();
 
                 ui.label("Radius");
@@ -193,7 +193,7 @@ fn draw_light(ui: &mut egui::Ui, data: &mut LightData) {
                 ui.end_row();
 
                 ui.label("Intensity");
-                ui.add(egui::DragValue::new(intensity).speed(0.1).range(0.0..=10000.0));
+                ui.add(egui::DragValue::new(intensity).speed(0.1).range(0.0..=1_000_000.0).suffix(" nt"));
                 ui.end_row();
             });
         }

@@ -280,6 +280,7 @@ fn load_cameras(document: &gltf::Document, world: &mut World) {
                 fovy: perspective.yfov(),
                 near: perspective.znear(),
                 far: perspective.zfar().unwrap_or(1000.0),
+                exposure: 1.0,
                 aspect: perspective.aspect_ratio().unwrap_or((4 / 3) as f32),
                 up: (0.0, 1.0, 0.0).into(),
                 eye: (0.0, 40.0, 150.0).into(),

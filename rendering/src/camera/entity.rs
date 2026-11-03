@@ -9,6 +9,9 @@ pub struct Camera {
     pub aspect: f32,
     pub near: f32,
     pub far: f32,
+    /// Linear multiplier from physical radiance to display values. Light intensities are in
+    /// glTF units (candela, lux, nits), so a bright daylight scene wants a small exposure.
+    pub exposure: f32,
 }
 
 impl Camera {

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use egui::Ui;
 
 use crate::state::{EditorState, LightKind, NodeKind, SceneNode, Selection};
@@ -96,6 +98,10 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
 
             let nodes = state.scene_nodes.clone();
             let mut new_selection = state.selected.clone();
+            let node_lights: HashMap<usize, (usize, &'static str)> = state.lights.iter()
+                .enumerate()
+                .filter_map(|(idx, light)| Some((light.node?, (idx, light.data.icon()))))
+                .collect();
 
             if !nodes.is_empty() {
                 egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -106,7 +112,7 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                 .show_header(ui, |ui| { ui.label("Nodes"); })
                 .body(|ui| {
                     for node in &nodes {
-                        draw_node(ui, node, &mut new_selection);
+                        draw_node(ui, node, &node_lights, &mut new_selection);
                     }
                 });
             }
@@ -120,19 +126,32 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
         });
 }
 
-fn draw_node(ui: &mut egui::Ui, node: &SceneNode, selection: &mut Option<Selection>) {
-    let label = match &node.kind {
-        NodeKind::Mesh(mesh) if !mesh.is_empty() && *mesh != node.name =>
+/// `node_lights` maps a light-carrying node to its `state.lights` index, so clicking the node
+/// selects the light rather than a node whose transform the light would overwrite on save.
+fn draw_node(
+    ui: &mut egui::Ui,
+    node: &SceneNode,
+    node_lights: &HashMap<usize, (usize, &'static str)>,
+    selection: &mut Option<Selection>,
+) {
+    let light = node_lights.get(&node.index).filter(|_| matches!(node.kind, NodeKind::Light));
+    let label = match (&node.kind, light) {
+        (NodeKind::Light, Some((_, icon))) => format!("{icon} {}", node.name),
+        (NodeKind::Mesh(mesh), _) if !mesh.is_empty() && *mesh != node.name =>
             format!("▲ {} [{mesh}]", node.name),
-        NodeKind::Mesh(_) => format!("▲ {}", node.name),
-        NodeKind::Camera  => format!("📷 {}", node.name),
-        NodeKind::Empty   => format!("○ {}", node.name),
+        (NodeKind::Mesh(_), _) => format!("▲ {}", node.name),
+        (NodeKind::Camera, _)  => format!("📷 {}", node.name),
+        (NodeKind::Light | NodeKind::Empty, _) => format!("○ {}", node.name),
     };
-    let selected = *selection == Some(Selection::GltfNode(node.index));
+    let target = match light {
+        Some(&(idx, _)) => Selection::Light(idx),
+        None => Selection::GltfNode(node.index),
+    };
+    let selected = selection.as_ref() == Some(&target);
 
     if node.children.is_empty() {
         if ui.selectable_label(selected, &label).clicked() {
-            *selection = Some(Selection::GltfNode(node.index));
+            *selection = Some(target);
         }
     } else {
         egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -142,13 +161,13 @@ fn draw_node(ui: &mut egui::Ui, node: &SceneNode, selection: &mut Option<Selecti
         )
         .show_header(ui, |ui| {
             if ui.selectable_label(selected, &label).clicked() {
-                *selection = Some(Selection::GltfNode(node.index));
+                *selection = Some(target.clone());
             }
         })
         .body(|ui| {
             ui.indent(node.index, |ui| {
                 for child in &node.children {
-                    draw_node(ui, child, selection);
+                    draw_node(ui, child, node_lights, selection);
                 }
             });
         });

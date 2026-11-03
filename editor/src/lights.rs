@@ -18,7 +18,9 @@ use crate::state::{EditorState, LightData};
 
 const EXTENSION: &str = "KHR_lights_punctual";
 const EXTRAS_KEY: &str = "blackbird_lights";
-const DEFAULT_RANGE: f32 = 10.0;
+/// Illuminance (lux) at which a light with no `range` is cut off. The renderer needs a finite
+/// radius to cluster point lights, while glTF treats a missing range as infinite.
+const CUTOFF_ILLUMINANCE: f32 = 0.01;
 
 /// Lights stored in `doc`, each with the node it is attached to (`None` for `extras` lights).
 pub fn read_lights(doc: &Document) -> Result<Vec<(Option<usize>, LightData)>> {
@@ -48,7 +50,7 @@ fn read_punctual(doc: &Document) -> Vec<(Option<usize>, LightData)> {
         let direction = (world * Vec4::new(0.0, 0.0, -1.0, 0.0)).xyz().normalized().into();
         let color = light.color();
         let intensity = light.intensity();
-        let radius = light.range().unwrap_or(DEFAULT_RANGE);
+        let radius = light.range().unwrap_or_else(|| (intensity / CUTOFF_ILLUMINANCE).sqrt().max(1.0));
         let data = match light.kind() {
             gltf_api::khr_lights_punctual::Kind::Directional => LightData::Sky { color, intensity, direction },
             gltf_api::khr_lights_punctual::Kind::Point => LightData::Point { position, color, intensity, radius },

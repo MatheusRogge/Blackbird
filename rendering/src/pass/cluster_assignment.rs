@@ -39,6 +39,8 @@ pub struct ClusterParams {
     // Inverse camera view matrix for world-position reconstruction in lighting.
     // mat4x4<f32> needs 16-byte alignment; offset 48 is already 16-byte aligned.
     pub inv_view: [[f32; 4]; 4],
+    pub exposure: f32,
+    pub _pad: [f32; 3],
 }
 
 pub struct ClusterOutputs {
@@ -178,6 +180,8 @@ impl Pass for ClusterAssignmentPass {
             debug_mode: 0,
             num_sky_lights,
             inv_view: inv_view_arr,
+            exposure: camera.exposure,
+            _pad: [0.0; 3],
         };
 
         let Some(&params_buf) = ctx.buffers.get(&self.cluster_params_id) else {
