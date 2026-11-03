@@ -155,6 +155,25 @@ impl LightData {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct CameraSettings {
+    /// World units per second for WASD/QE movement.
+    pub move_speed: f32,
+    /// Speed multiplier while Shift is held.
+    pub fast_multiplier: f32,
+}
+
+impl CameraSettings {
+    pub const MIN_SPEED: f32 = 0.01;
+    pub const MAX_SPEED: f32 = 1000.0;
+}
+
+impl Default for CameraSettings {
+    fn default() -> Self {
+        Self { move_speed: 10.0, fast_multiplier: 4.0 }
+    }
+}
+
 pub struct SceneLight {
     pub key: EntityKey,
     pub data: LightData,
@@ -180,6 +199,7 @@ pub struct EditorState {
     pub gizmo_mode: GizmoMode,
 
     pub editor_camera_key: Option<EntityKey>,
+    pub camera_settings: CameraSettings,
 
     pub lights: Vec<SceneLight>,
     pub add_light_requested: Option<LightKind>,
@@ -218,6 +238,7 @@ impl EditorState {
             gizmo_mode: GizmoMode::default(),
             camera_preview_node: None,
             editor_camera_key: None,
+            camera_settings: CameraSettings::default(),
             lights: Vec::new(),
             add_light_requested: None,
             new_project_requested: false,

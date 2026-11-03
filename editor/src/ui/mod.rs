@@ -52,9 +52,13 @@ fn draw_camera_hints(ctx: &egui::Context) {
                     let font = egui::TextStyle::Small.resolve(ui.style());
 
                     for (key, action) in [
-                        ("WASD",     "Move"),
-                        ("LMB drag", "Orbit"),
+                        ("WASD / QE", "Move / Down, Up"),
+                        ("Shift",    "Move faster"),
+                        ("LMB drag", "Look"),
+                        ("RMB drag", "Orbit"),
+                        ("MMB drag", "Pan"),
                         ("Scroll",   "Zoom"),
+                        ("LMB + Scroll", "Move speed"),
                         ("Click",    "Select"),
                         ("1 / 2 / 3", "Move / Rotate / Scale"),
                     ] {

@@ -1,6 +1,6 @@
 use egui::Ui;
 
-use crate::state::EditorState;
+use crate::state::{CameraSettings, EditorState};
 
 const SAVE_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
 
@@ -55,10 +55,36 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                     ui.close();
                 }
             });
+
+            ui.menu_button("Camera", |ui| draw_camera_settings(ui, &mut state.camera_settings));
         });
     });
 
     egui::Panel::bottom("statusbar").show(root, |ui| {
         ui.label(&state.status);
     });
+}
+
+fn draw_camera_settings(ui: &mut Ui, settings: &mut CameraSettings) {
+    egui::Grid::new("camera_settings_grid")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Move speed");
+            ui.add(
+                egui::DragValue::new(&mut settings.move_speed)
+                    .speed(0.1)
+                    .range(CameraSettings::MIN_SPEED..=CameraSettings::MAX_SPEED)
+                    .suffix(" u/s"),
+            );
+            ui.end_row();
+
+            ui.label("Shift multiplier");
+            ui.add(egui::DragValue::new(&mut settings.fast_multiplier).speed(0.05).range(1.0..=20.0).prefix("×"));
+            ui.end_row();
+        });
+    ui.label(egui::RichText::new("Scroll while holding LMB to adjust speed").small().weak());
+    if ui.button("Reset to defaults").clicked() {
+        *settings = CameraSettings::default();
+    }
 }

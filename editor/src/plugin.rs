@@ -10,11 +10,10 @@ use engine::assets::AssetLoadHandle;
 use engine::gltf::{GLTFAsset, GltfScene};
 use engine::plugin::{EnginePluginError, Plugin};
 use engine::rendering::camera::Camera;
-use engine::player_controller::PlayerController;
-use engine::rendering::camera_controller::{CameraController, CameraMode};
 use engine::rendering::light::{AreaLight, PointLight, SkyLight, SpotLight};
 use engine::rendering::mesh::Mesh;
 
+use crate::camera::EditorCameraController;
 use crate::math;
 use crate::state::{LightData, NodeKind, SceneLight, SceneNode, Selection, SharedState};
 
@@ -23,8 +22,7 @@ type TransformSnapshot = Vec<(usize, [f32; 10])>;
 
 pub struct EditorPlugin {
     state: SharedState,
-    camera_controller: Option<CameraController>,
-    player_controller: PlayerController,
+    camera_controller: Option<EditorCameraController>,
     scene: Option<GltfScene>,
     pending_gltf: Option<AssetLoadHandle<GLTFAsset>>,
     watcher: Option<notify::RecommendedWatcher>,
@@ -40,7 +38,6 @@ impl EditorPlugin {
         Self {
             state,
             camera_controller: None,
-            player_controller: PlayerController::new(20.0),
             scene: None,
             pending_gltf: None,
             watcher: None,
@@ -64,8 +61,7 @@ impl EditorPlugin {
             near: 0.01,
             far: 10000.0,
         });
-        self.camera_controller = Some(CameraController::new(camera_key, CameraMode::ThirdPerson));
-        self.player_controller.attach(camera_key);
+        self.camera_controller = Some(EditorCameraController::new(camera_key));
 
         camera_key
     }
@@ -91,15 +87,20 @@ impl Plugin for EditorPlugin {
         }
         self.apply_node_transforms(engine);
 
-        let in_camera_preview = self.state.lock().expect("editor state mutex poisoned").camera_preview_node.is_some();
-
-        if !in_camera_preview {
-            self.player_controller.tick::<Camera>(engine, delta);
-
+        let (in_camera_preview, mut settings) = {
+            let s = self.state.lock().expect("editor state mutex poisoned");
+            (s.camera_preview_node.is_some(), s.camera_settings.clone())
+        };
+        if !in_camera_preview && let Some(ctrl) = &mut self.camera_controller {
             let ui_wants_pointer = engine.ui_wants_pointer();
-            if let Some(ctrl) = &mut self.camera_controller {
+            let ui_wants_keyboard = engine.ui_wants_keyboard();
+            let speed = settings.move_speed;
+            {
                 let (input, mut world) = engine.input_and_world();
-                ctrl.tick(input, &mut world, delta, ui_wants_pointer);
+                ctrl.tick(input, &mut world, &mut settings, delta, ui_wants_pointer, ui_wants_keyboard);
+            }
+            if settings.move_speed != speed {
+                self.state.lock().expect("editor state mutex poisoned").camera_settings.move_speed = settings.move_speed;
             }
         }
     }
