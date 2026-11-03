@@ -1,6 +1,6 @@
 # editor
 
-Scene editor binary built on `engine` (`full, debug`) + egui. Opens projects, loads glTF scenes with hot reload, edits lights and camera live, and exports edited glTF. Extra deps: `gltf` 1.4 (renamed `gltf-api` to avoid clashing with the workspace `gltf` crate), `rfd` (native dialogs), `serde`/`serde_json`, `notify`.
+Scene editor binary built on `engine` (`full, debug`) + egui. Opens projects, loads glTF scenes with hot reload, edits lights and camera live, and exports edited glTF. Extra deps: `gltf` 1.4 with `KHR_lights_punctual` (renamed `gltf-api` to avoid clashing with the workspace `gltf` crate), `rfd` (native dialogs), `serde`/`serde_json`, `notify`.
 
 Run with `cargo run -p editor`.
 
@@ -32,7 +32,8 @@ This request/response pattern through `EditorState` is the rule. UI sets `*_requ
 | `project.rs` | `Project { name, version, default_scene, camera }` ⇄ `project.json` (`camera` is `#[serde(default)]`, so older manifests still load). `default_scene` is project-relative with `/` separators and is opened by `load_project`. `list_scenes` lists `scenes/*.gltf|glb` into `EditorState::project_scenes`, refreshed on project open/create, import and export. `create` scaffolds `scenes/`, `assets/textures/`, `assets/models/`. |
 | `recent.rs` | `RecentProjects`, max 10, stored at `$HOME/.blackbird/recent_projects.json` (falls back to `USERPROFILE`). |
 | `import.rs` | `import_scene(source, project_dir)`: copies a `.gltf`/`.glb` into the project as `scenes/<name>.gltf`, writing every buffer (incl. GLB `BIN` and data URIs) to `assets/models/<name>/` and every image (external, data URI or buffer-view embedded) to `assets/textures/<name>/`, with URIs rewritten to `../assets/...`. Names are sanitised to URI-safe characters and `<name>` is suffixed `_N` if taken. The plugin opens the imported scene afterwards. |
-| `export.rs` | `write_gltf(&EditorState, path)`: clones the document JSON, writes `node_edits` (TRS, and material factors to *every* material on the node's mesh), serialises **JSON only**. Buffers/images are not copied, so URIs must still resolve relative to the export location. |
+| `export.rs` | `write_gltf(&EditorState, path)`: clones the document JSON, writes `node_edits` (TRS, and material factors to *every* material on the node's mesh), calls `lights::write_lights`, serialises **JSON only**. Buffers/images are not copied, so URIs must still resolve relative to the export location. |
+| `lights.rs` | Scene lights in glTF. Sky/point/spot ⇄ `KHR_lights_punctual` (sky = `directional`, `radius` = `range`, light aims down the node's −Z, intensity copied 1:1 with no unit conversion). Area lights ⇄ root `extras.blackbird_lights` (tagged `LightData`; other `extras` keys are kept). `read_lights` walks every scene and takes position/direction from the node's world transform. `write_lights` removes all existing punctual lights, then writes each light back onto `SceneLight::node` (setting its local TRS through `parent_world⁻¹`) or onto a new root node in the default scene. `poll_load` respawns whatever `read_lights` returns. |
 | `ui/toolbar.rs` | File, Project (default scene) and Camera (move speed, Shift multiplier) menus + status bar. Owns the Ctrl+S shortcut (sets `save_requested`). |
 | `ui/hierarchy.rs` | Scene node tree + lights list, selection. Background context menu: "Default Scene" toggle (only for scenes inside the project) and "add light". |
 | `ui/inspector.rs` | Light editor, transform (euler ⇄ quat), material, camera params. |
@@ -48,7 +49,7 @@ This request/response pattern through `EditorState` is the rule. UI sets `*_requ
 
 | Edit | Live in viewport | Saved / exported |
 |------|------------------|----------|
-| Light properties | ✅ (`apply_edits` rewrites every light entity each tick from `LightData`) | ❌ (lights are editor-only) |
+| Lights (add + properties) | ✅ (`apply_edits` rewrites every light entity each tick from `LightData`) | ✅ (`KHR_lights_punctual`, area lights in `extras`) |
 | Camera node fov/near/far | ✅ on the editor camera | ✅ |
 | Camera preview (`camera_preview_node`) | ✅ editor camera snaps to the node's TRS | — |
 | Node transform (inspector or gizmo) | ✅ (children follow their parent) | ✅ |
@@ -59,6 +60,8 @@ Mesh entities map back to glTF nodes through `GltfScene::node_entities` / `state
 ## Gotchas
 - **Project settings** are edited in place on `state.project` (and `state.camera_settings`, copied into it). `sync_project` writes `project.json` 500 ms after the last change, so a DragValue drag doesn't write every frame.
 - **Save** (`handle_save_scene`) runs `write_gltf` onto `state.file_path` and then ignores watcher events for 500 ms, so the editor's own write doesn't hot-reload (which would drop lights and selection). `.glb` scenes can't be saved in place; use Export.
-- Loading a scene calls `reset_world`, which does `World::clear()`. That destroys lights too, and `start_load` clears `state.lights` to match. Hot reload therefore drops user-added lights.
+- Loading a scene calls `reset_world`, which does `World::clear()`. That destroys lights too, and `start_load` clears `state.lights` to match; `poll_load` respawns the ones saved in the file. Hot reload therefore drops lights added since the last save.
+- A light loaded from `KHR_lights_punctual` still shows up as an empty node in the hierarchy. Moving that node with the gizmo doesn't move the light, and on save the light's own position/direction overwrite the node's TRS.
+- Without the gltf `extensions` feature, `Root`/`Node` extensions other than `KHR_lights_punctual` are dropped on save.
 - `node_edits` is keyed by glTF node index, and `ensure_node_edit` looks the node up with `doc.nodes().nth(idx)`.
 - Shaders come from `../../sandbox/shaders/` through `include_str!`.

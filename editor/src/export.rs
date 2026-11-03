@@ -50,6 +50,8 @@ pub fn write_gltf(state: &EditorState, path: &Path) -> Result<()> {
         }
     }
 
+    crate::lights::write_lights(&mut root, state)?;
+
     let json = serde_json::to_string_pretty(&root).context("JSON serialization failed")?;
     std::fs::write(path, json).context("writing file")?;
     Ok(())

@@ -17,7 +17,7 @@ engine      = { path = "../engine/",    features = ["full", "debug"] }
 engine_core = { path = "../core/" }
 rendering   = { path = "../rendering/" }
 
-gltf-api   = { package = "gltf", version = "1.4.1", features = ["names", "extras"] }
+gltf-api   = { package = "gltf", version = "1.4.1", features = ["names", "extras", "KHR_lights_punctual"] }
 egui       = { version = "0.37" }
 rfd        = "0.17"
 serde      = { version = "1", features = ["derive"] }

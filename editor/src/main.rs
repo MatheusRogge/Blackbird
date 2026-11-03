@@ -1,6 +1,7 @@
 mod camera;
 mod export;
 mod import;
+mod lights;
 mod math;
 mod plugin;
 mod project;

@@ -421,7 +421,7 @@ impl EditorPlugin {
         s.status = "Loading…".to_string();
     }
 
-    fn poll_load(&mut self, _engine: &mut Engine) {
+    fn poll_load(&mut self, engine: &mut Engine) {
         let result = match &self.pending_gltf {
             Some(h) => h.try_get(),
             None => return,
@@ -433,6 +433,14 @@ impl EditorPlugin {
             Ok(asset) => {
                 let doc = asset.document.clone();
                 let nodes = build_scene_nodes(&doc);
+                let (lights, lights_error) = match crate::lights::read_lights(&doc) {
+                    Ok(lights) => (lights, None),
+                    Err(e) => (Vec::new(), Some(e)),
+                };
+                let lights: Vec<SceneLight> = lights
+                    .into_iter()
+                    .map(|(node, data)| SceneLight { key: spawn_light(engine, &data), data, node })
+                    .collect();
                 self.scene = Some(GltfScene::new(Arc::clone(&asset)));
                 let scene_path = {
                     let mut s = self.state.lock().expect("editor state mutex poisoned");
@@ -445,7 +453,11 @@ impl EditorPlugin {
                         .nodes()
                         .flat_map(|parent| parent.children().map(move |child| (child.index(), parent.index())))
                         .collect();
-                    s.status = format!("Loaded: {path_display}");
+                    s.lights = lights;
+                    s.status = match lights_error {
+                        Some(e) => format!("Loaded: {path_display} (lights skipped: {e:#})"),
+                        None => format!("Loaded: {path_display}"),
+                    };
                     s.file_path.clone()
                 };
                 if let Some(path) = scene_path {
@@ -464,38 +476,8 @@ impl EditorPlugin {
         let Some(kind) = request else { return };
 
         let data = LightData::default_for(kind);
-        let key = match &data {
-            LightData::Sky { color, intensity, direction } => engine.world().add_entity(SkyLight {
-                direction: (*direction).into(),
-                color: (*color).into(),
-                intensity: *intensity,
-            }),
-            LightData::Point { position, color, intensity, radius } => engine.world().add_entity(PointLight {
-                position: (*position).into(),
-                color: (*color).into(),
-                intensity: *intensity,
-                radius: *radius,
-            }),
-            LightData::Spot { position, direction, color, intensity, radius, inner_angle, outer_angle } => {
-                engine.world().add_entity(SpotLight {
-                    position: (*position).into(),
-                    direction: (*direction).into(),
-                    color: (*color).into(),
-                    intensity: *intensity,
-                    radius: *radius,
-                    inner_angle: *inner_angle,
-                    outer_angle: *outer_angle,
-                })
-            }
-            LightData::Area { position, right, up, color, intensity } => engine.world().add_entity(AreaLight {
-                position: (*position).into(),
-                right: (*right).into(),
-                up: (*up).into(),
-                color: (*color).into(),
-                intensity: *intensity,
-            }),
-        };
-        self.state.lock().expect("editor state mutex poisoned").lights.push(SceneLight { key, data });
+        let key = spawn_light(engine, &data);
+        self.state.lock().expect("editor state mutex poisoned").lights.push(SceneLight { key, data, node: None });
     }
 
     fn apply_edits(&self, engine: &mut Engine) {
@@ -752,5 +734,39 @@ fn node_snapshot(node: &gltf_api::Node) -> SceneNode {
             NodeKind::Empty
         },
         children: node.children().map(|c| node_snapshot(&c)).collect(),
+    }
+}
+
+fn spawn_light(engine: &mut Engine, data: &LightData) -> EntityKey {
+    match data {
+        LightData::Sky { color, intensity, direction } => engine.world().add_entity(SkyLight {
+            direction: (*direction).into(),
+            color: (*color).into(),
+            intensity: *intensity,
+        }),
+        LightData::Point { position, color, intensity, radius } => engine.world().add_entity(PointLight {
+            position: (*position).into(),
+            color: (*color).into(),
+            intensity: *intensity,
+            radius: *radius,
+        }),
+        LightData::Spot { position, direction, color, intensity, radius, inner_angle, outer_angle } => {
+            engine.world().add_entity(SpotLight {
+                position: (*position).into(),
+                direction: (*direction).into(),
+                color: (*color).into(),
+                intensity: *intensity,
+                radius: *radius,
+                inner_angle: *inner_angle,
+                outer_angle: *outer_angle,
+            })
+        }
+        LightData::Area { position, right, up, color, intensity } => engine.world().add_entity(AreaLight {
+            position: (*position).into(),
+            right: (*right).into(),
+            up: (*up).into(),
+            color: (*color).into(),
+            intensity: *intensity,
+        }),
     }
 }

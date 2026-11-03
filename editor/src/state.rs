@@ -82,7 +82,8 @@ pub enum LightKind {
     Area,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum LightData {
     Sky {
         color: [f32; 3],
@@ -179,6 +180,8 @@ impl Default for CameraSettings {
 pub struct SceneLight {
     pub key: EntityKey,
     pub data: LightData,
+    /// glTF node carrying the light's `KHR_lights_punctual` entry, if it was loaded from one.
+    pub node: Option<usize>,
 }
 
 pub struct EditorState {
