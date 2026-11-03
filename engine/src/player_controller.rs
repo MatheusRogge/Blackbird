@@ -39,10 +39,18 @@ impl PlayerController {
     pub fn tick<E: Controllable>(&mut self, engine: &mut Engine, delta: f32) {
         let events: Vec<InputEvent> = std::iter::from_fn(|| engine.input().pop()).collect();
 
+        let ui_wants_keyboard = engine.ui_wants_keyboard();
         let mut unhandled: Vec<InputEvent> = Vec::new();
 
         for event in events {
             match event {
+                // Typing into the UI and chorded shortcuts like Ctrl+S are not movement.
+                // Releases still go through so a held key never sticks.
+                InputEvent::KeyPressed { modifiers, .. }
+                    if ui_wants_keyboard || modifiers.ctrl || modifiers.alt || modifiers.super_ =>
+                {
+                    unhandled.push(event)
+                }
                 InputEvent::KeyPressed { key: Key::Scancode(17), .. } => self.moving_forward = true,
                 InputEvent::KeyPressed { key: Key::Scancode(31), .. } => self.moving_back = true,
                 InputEvent::KeyPressed { key: Key::Scancode(30), .. } => self.moving_left = true,
