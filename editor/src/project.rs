@@ -18,9 +18,9 @@ impl Project {
     pub fn create(dir: &Path, name: &str) -> Result<Self> {
         std::fs::create_dir_all(dir.join(SCENES_DIR))
             .context("creating scenes dir")?;
-        std::fs::create_dir_all(dir.join(ASSETS_DIR).join("textures"))
+        std::fs::create_dir_all(Self::textures_dir(dir))
             .context("creating assets/textures dir")?;
-        std::fs::create_dir_all(dir.join(ASSETS_DIR).join("models"))
+        std::fs::create_dir_all(Self::models_dir(dir))
             .context("creating assets/models dir")?;
 
         let project = Self {
@@ -45,6 +45,14 @@ impl Project {
 
     pub fn scenes_dir(dir: &Path) -> PathBuf {
         dir.join(SCENES_DIR)
+    }
+
+    pub fn models_dir(dir: &Path) -> PathBuf {
+        dir.join(ASSETS_DIR).join("models")
+    }
+
+    pub fn textures_dir(dir: &Path) -> PathBuf {
+        dir.join(ASSETS_DIR).join("textures")
     }
 
     pub fn default_scene_path(&self, project_dir: &Path) -> Option<PathBuf> {

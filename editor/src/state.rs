@@ -191,10 +191,12 @@ pub struct EditorState {
     pub open_recent_path: Option<PathBuf>,
     pub open_requested: bool,
     pub export_requested: bool,
+    pub import_requested: bool,
     pub new_project_path: Option<(PathBuf, String)>,
     pub open_project_path: Option<PathBuf>,
     pub load_path: Option<PathBuf>,
     pub export_path: Option<PathBuf>,
+    pub import_path: Option<PathBuf>,
 
     pub status: String,
 }
@@ -222,10 +224,12 @@ impl EditorState {
             open_recent_path: None,
             open_requested: false,
             export_requested: false,
+            import_requested: false,
             new_project_path: None,
             open_project_path: None,
             load_path: None,
             export_path: None,
+            import_path: None,
             status: "No project loaded.".to_string(),
         }))
     }

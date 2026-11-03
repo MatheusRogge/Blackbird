@@ -34,6 +34,10 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                     state.open_requested = true;
                     ui.close();
                 }
+                if ui.add_enabled(has_project, egui::Button::new("Import Scene…")).clicked() {
+                    state.import_requested = true;
+                    ui.close();
+                }
                 let can_export = state.document.is_some();
                 if ui.add_enabled(can_export, egui::Button::new("Export Scene…")).clicked() {
                     state.export_requested = true;

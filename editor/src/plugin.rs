@@ -109,6 +109,7 @@ impl EditorPlugin {
         self.handle_open_project();
         self.handle_open_recent(engine);
         self.handle_open_scene(engine);
+        self.handle_import_scene();
         self.handle_export_scene();
     }
 
@@ -226,6 +227,41 @@ impl EditorPlugin {
         let load_path = self.state.lock().expect("editor state mutex poisoned").load_path.take();
         if let Some(path) = load_path {
             self.start_load(engine, path);
+        }
+    }
+
+    fn handle_import_scene(&mut self) {
+        let needs_dialog = {
+            let s = self.state.lock().expect("editor state mutex poisoned");
+            s.import_requested && s.import_path.is_none() && s.project_dir.is_some()
+        };
+        if needs_dialog {
+            let picked = rfd::FileDialog::new()
+                .add_filter("GLTF / GLB", &["gltf", "glb"])
+                .pick_file();
+            let mut s = self.state.lock().expect("editor state mutex poisoned");
+            match picked {
+                Some(path) => s.import_path = Some(path),
+                None => s.import_requested = false,
+            }
+        }
+
+        let (source, project_dir) = {
+            let mut s = self.state.lock().expect("editor state mutex poisoned");
+            match (s.import_path.take(), s.project_dir.clone()) {
+                (Some(source), Some(dir)) => (source, dir),
+                _ => return,
+            }
+        };
+        let result = crate::import::import_scene(&source, &project_dir);
+        let mut s = self.state.lock().expect("editor state mutex poisoned");
+        s.import_requested = false;
+        match result {
+            Ok(scene) => {
+                s.status = format!("Imported {}", scene.display());
+                s.load_path = Some(scene);
+            }
+            Err(e) => s.status = format!("Import failed: {e:#}"),
         }
     }
 

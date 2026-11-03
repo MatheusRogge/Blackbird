@@ -16,7 +16,7 @@ main.rs ── EditorState::new() ──► SharedState = Arc<Mutex<EditorState>
 ```
 
 - **`EditorUiLayer`** (`ui/`): runs on the render thread. It `try_lock`s the state and skips the frame if the lock is contended. It only *writes request flags and edit values*: no I/O, no `World` mutation.
-- **`EditorPlugin`** (`plugin.rs`): runs on the game thread. Each `tick`, in order: `handle_signals` (new/open project, open recent, open scene, export), `poll_load`, `check_file_changes`, `handle_light_requests`, `apply_edits`, `GltfScene::load_batch(10)`, `apply_node_transforms`, then camera controllers (skipped during camera preview).
+- **`EditorPlugin`** (`plugin.rs`): runs on the game thread. Each `tick`, in order: `handle_signals` (new/open project, open recent, open scene, import, export), `poll_load`, `check_file_changes`, `handle_light_requests`, `apply_edits`, `GltfScene::load_batch(10)`, `apply_node_transforms`, then camera controllers (skipped during camera preview).
 - **`apply_node_transforms`**: when any `node_edits` TRS changes, or more meshes have streamed in, it recomputes `EditorState::node_world` for every node with entities (from `GltfScene::node_entities`), writes it to each `Mesh::transform`, and refreshes `state.entity_nodes` (mesh entity → node, used for picking).
 
 This request/response pattern through `EditorState` is the rule. UI sets `*_requested` or `Option<PathBuf>` fields, the plugin consumes them with `.take()`, does the work, and writes `status`. Native `rfd` dialogs are opened **on the game thread** and block it while they're open.
@@ -30,6 +30,7 @@ This request/response pattern through `EditorState` is the rule. UI sets `*_requ
 | `plugin.rs` | `EditorPlugin`: project/scene lifecycle, `notify` watcher on the scene file + external buffer/image URIs (300 ms debounce, full reload), light spawning, applying edits to entities. |
 | `project.rs` | `Project { name, version, default_scene }` ⇄ `project.json`. `create` scaffolds `scenes/`, `assets/textures/`, `assets/models/`. |
 | `recent.rs` | `RecentProjects`, max 10, stored at `$HOME/.blackbird/recent_projects.json` (falls back to `USERPROFILE`). |
+| `import.rs` | `import_scene(source, project_dir)`: copies a `.gltf`/`.glb` into the project as `scenes/<name>.gltf`, writing every buffer (incl. GLB `BIN` and data URIs) to `assets/models/<name>/` and every image (external, data URI or buffer-view embedded) to `assets/textures/<name>/`, with URIs rewritten to `../assets/...`. Names are sanitised to URI-safe characters and `<name>` is suffixed `_N` if taken. The plugin opens the imported scene afterwards. |
 | `export.rs` | `write_gltf(&EditorState, path)`: clones the document JSON, writes `node_edits` (TRS, and material factors to *every* material on the node's mesh), serialises **JSON only**. Buffers/images are not copied, so URIs must still resolve relative to the export location. |
 | `ui/toolbar.rs` | File menu + status bar. |
 | `ui/hierarchy.rs` | Scene node tree + lights list, selection, "add light". |
