@@ -333,7 +333,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if debug.disable_indirect != 0u {
         color = vec3f(0.0);
     } else {
-        color = albedo * max(indirect, vec3f(0.03));
+        color = albedo * indirect;
     }
 
     if debug.disable_direct == 0u {

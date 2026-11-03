@@ -202,8 +202,7 @@ fn sample_sky(ray_dir: vec3<f32>) -> vec3<f32> {
         let sky_base   = sky_lights[0].color * sky_lights[0].intensity;
         return sky_base * (0.3 + 0.7 * max(0.0, ray_dir.y) + pow(sun_factor, 32.0));
     }
-    let t = max(0.0, ray_dir.y) * 0.5 + 0.5;
-    return mix(vec3f(0.8, 0.9, 1.0), vec3f(0.2, 0.4, 0.8), t) * 1.5;
+    return vec3f(0.0);
 }
 
 // ── Main compute entry ────────────────────────────────────────────────────────
