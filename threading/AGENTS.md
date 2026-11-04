@@ -22,6 +22,6 @@ pub struct DefaultExecutor; // ::new(), Default, Drop calls shutdown()
 - All state sits behind one `Mutex`. Calling `spawn` from inside a task is fine because the lock is released before tasks run.
 
 ## Usage in the engine
-`engine::Engine` holds an `Arc<dyn Executor>` (default `DefaultExecutor`, or inject one with `HeadlessApplication::with_executor`). `engine`'s `AssetsPlugin` hands it to `AssetManager::init_executor`, and `AssetManager::load_async` uses `spawn`.
+`engine::Engine` holds an `Arc<dyn Executor>` (default `DefaultExecutor`, or inject one with `HeadlessApplication::with_executor`). `Engine::new` hands it to `AssetManager::init_executor` (with the `assets` feature), and `AssetManager::load_async` uses `spawn`.
 
 If you need parallel loading, implement a pool-backed `Executor` rather than changing call sites.

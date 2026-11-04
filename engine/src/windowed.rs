@@ -66,19 +66,8 @@ pub struct WindowedApplication<B: RenderGraphBuilder> {
 
 impl<B: RenderGraphBuilder> WindowedApplication<B> {
     pub fn new(render_graph: B) -> Self {
-        use crate::plugins::assets::AssetsPlugin;
-        #[cfg(feature = "gltf")]
-        use crate::plugins::gltf::GltfPlugin;
-
-        let mut inner = HeadlessApplication::new().add_plugin(AssetsPlugin);
-
-        #[cfg(feature = "gltf")]
-        {
-            inner = inner.add_plugin(GltfPlugin);
-        }
-
         Self {
-            inner,
+            inner: HeadlessApplication::new(),
             graph_builder: Some(render_graph),
             pending_inputs: Vec::new(),
             current_modifiers: Modifiers::default(),

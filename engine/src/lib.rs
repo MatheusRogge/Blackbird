@@ -11,9 +11,6 @@ pub mod application;
 #[cfg(feature = "window")]
 pub mod windowed;
 
-#[cfg(feature = "assets")]
-mod plugins;
-
 // Re-export core primitives so users only need to import `engine`.
 pub use engine_core::{entity, input, world};
 pub use engine_core::entity::{Controllable, Entity, EntityKey};
@@ -32,6 +29,19 @@ pub use rendering;
 
 #[cfg(feature = "ui")]
 pub use ui;
+
+/// Registers every resolver the enabled features provide. Builds call this too, so their
+/// dependency walk follows exactly what the game can load.
+#[cfg(feature = "assets")]
+pub fn register_asset_resolvers(assets: &mut assets::AssetManager) {
+    #[cfg(feature = "gltf")]
+    {
+        assets.add_resolver("gltf", gltf::GLTFAssetResolver);
+        assets.add_resolver("glb", gltf::GLTFAssetResolver);
+    }
+    #[cfg(not(feature = "gltf"))]
+    let _ = assets;
+}
 
 pub struct Engine {
     world:    Arc<RwLock<World>>,
@@ -53,15 +63,21 @@ impl Engine {
         Self {
             world: Arc::new(RwLock::new(World::default())),
             input: InputBuffer::default(),
-            executor,
             ui_wants_pointer:  Arc::new(AtomicBool::new(false)),
             ui_wants_keyboard: Arc::new(AtomicBool::new(false)),
 
             #[cfg(feature = "assets")]
-            assets: assets::AssetManager::default(),
+            assets: {
+                let mut assets = assets::AssetManager::default();
+                assets.init_executor(Arc::clone(&executor));
+                register_asset_resolvers(&mut assets);
+                assets
+            },
 
             #[cfg(feature = "window")]
             frame_stats: Arc::new(RwLock::new(rendering::FrameStats::default())),
+
+            executor,
         }
     }
 
@@ -96,7 +112,8 @@ impl Engine {
         (&mut self.input, world)
     }
 
-    pub(crate) fn executor(&self) -> Arc<dyn Executor> {
+    /// Background executor shared with asset loading, for game work off the game thread.
+    pub fn executor(&self) -> Arc<dyn Executor> {
         Arc::clone(&self.executor)
     }
 

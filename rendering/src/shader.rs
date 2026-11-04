@@ -1,11 +1,6 @@
-use std::{
-    borrow::Cow,
-    fs::File,
-    io::{self, BufReader, Read},
-    path::Path,
-};
+use std::{borrow::Cow, io};
 
-use assets::{Asset, AssetError, AssetResolver};
+use assets::{Asset, AssetError, AssetResolver, LoadContext};
 use wgpu::{Device, ShaderModule, ShaderModuleDescriptor, ShaderSource};
 
 pub use wgpu::{BindGroupLayoutEntry, BindingType, BufferBindingType, ShaderStages};
@@ -46,17 +41,9 @@ impl AssetResolver for ShaderAssetResolver {
     type Asset = ShaderAsset;
     type Error = AssetError;
 
-    fn resolve(&self, _base_path: &Path, file: File) -> Result<Self::Asset, Self::Error> {
-        let mut reader = BufReader::new(file);
-
-        let mut content = String::new();
-        reader.read_to_string(&mut content)?;
-
-        let asset = ShaderAsset {
-            content,
-            bindings: Vec::new(),
-        };
-
-        Ok(asset)
+    fn resolve(&self, ctx: &mut LoadContext<'_>) -> Result<Self::Asset, Self::Error> {
+        let content = String::from_utf8(ctx.take_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(ShaderAsset::from_raw(content))
     }
 }

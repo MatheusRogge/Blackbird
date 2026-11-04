@@ -1,15 +1,14 @@
-use assets::{Asset, AssetError, AssetResolver};
+use assets::{Asset, AssetError, AssetResolver, LoadContext};
 use engine_core::{entity::EntityKey, world::World};
-use gltf::{Gltf, image::Format, import_buffers, import_images, mesh::util::ReadIndices};
+use gltf::{Gltf, buffer, image, image::Format, mesh::util::ReadIndices};
 use rendering::{
     TextureAsset,
     camera::Camera,
     mesh::{Mat4, Mesh, Vertex},
 };
 use std::{
+    borrow::Cow,
     collections::HashMap,
-    fs::File,
-    io::{self},
     path::Path,
     sync::Arc,
 };
@@ -18,15 +17,21 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum GLTFAssetError {
     #[error(transparent)]
-    IOError(#[from] io::Error),
+    Asset(#[from] AssetError),
 
     #[error(transparent)]
     DocumentError(#[from] gltf::Error),
+
+    #[error("image {uri}: {source}")]
+    Image { uri: String, source: ::image::ImageError },
 }
 
 impl From<GLTFAssetError> for AssetError {
     fn from(value: GLTFAssetError) -> Self {
-        AssetError::Other(format!("GLTF document error: {}", value))
+        match value {
+            GLTFAssetError::Asset(e) => e,
+            other => AssetError::Other(format!("GLTF document error: {other}")),
+        }
     }
 }
 
@@ -38,26 +43,83 @@ pub struct GLTFAsset {
 
 impl Asset for GLTFAsset {}
 
+/// Loads `.gltf`/`.glb`. External buffers and images are read through the `LoadContext`, so
+/// scenes load the same from loose files and from packs.
 pub struct GLTFAssetResolver;
+
+/// A relative URI naming a file next to the document, percent-decoded. `None` for data URIs.
+fn external_uri(uri: &str) -> Option<Cow<'_, str>> {
+    if uri.starts_with("data:") {
+        return None;
+    }
+    Some(urlencoding::decode(uri).unwrap_or(Cow::Borrowed(uri)))
+}
+
+fn decode_image(bytes: &[u8], uri: &str) -> Result<image::Data, GLTFAssetError> {
+    let rgba = ::image::load_from_memory(bytes)
+        .map_err(|source| GLTFAssetError::Image { uri: uri.to_string(), source })?
+        .into_rgba8();
+    Ok(image::Data {
+        width: rgba.width(),
+        height: rgba.height(),
+        format: Format::R8G8B8A8,
+        pixels: rgba.into_raw(),
+    })
+}
 
 impl AssetResolver for GLTFAssetResolver {
     type Asset = GLTFAsset;
     type Error = GLTFAssetError;
 
-    fn resolve(&self, base_path: &Path, file: File) -> Result<Self::Asset, Self::Error> {
-        let base = Some(base_path);
+    fn resolve(&self, ctx: &mut LoadContext<'_>) -> Result<Self::Asset, Self::Error> {
+        let Gltf { document, mut blob } = Gltf::from_slice(ctx.bytes())?;
 
-        let reader = io::BufReader::new(file);
-        let Gltf { document, blob } = Gltf::from_reader(reader)?;
+        let mut buffers = Vec::new();
+        for buffer in document.buffers() {
+            let data = match buffer.source() {
+                buffer::Source::Uri(uri) if let Some(file) = external_uri(uri) => {
+                    let mut data = ctx.read_relative(&file)?;
+                    data.resize(data.len().next_multiple_of(4), 0);
+                    buffer::Data(data)
+                }
+                source => buffer::Data::from_source_and_blob(source, None, &mut blob)?,
+            };
+            if data.len() < buffer.length() {
+                return Err(gltf::Error::BufferLength {
+                    buffer: buffer.index(),
+                    expected: buffer.length(),
+                    actual: data.len(),
+                }
+                .into());
+            }
+            buffers.push(data);
+        }
 
-        let buffer_data = import_buffers(&document, base, blob)?;
-        let image_data = import_images(&document, base, &buffer_data)?;
+        let mut images = Vec::new();
+        for img in document.images() {
+            let data = match img.source() {
+                image::Source::Uri { uri, .. } if let Some(file) = external_uri(uri) => {
+                    decode_image(&ctx.read_relative(&file)?, uri)?
+                }
+                source => image::Data::from_source(source, Some(Path::new("")), &buffers)?,
+            };
+            images.push(data);
+        }
 
-        Ok(GLTFAsset {
-            document,
-            images: image_data,
-            buffers: buffer_data,
-        })
+        Ok(GLTFAsset { document, buffers, images })
+    }
+
+    fn dependencies(&self, ctx: &LoadContext<'_>) -> Result<Vec<String>, Self::Error> {
+        let document = Gltf::from_slice_without_validation(ctx.bytes())?.document;
+        let buffers = document.buffers().filter_map(|b| match b.source() {
+            buffer::Source::Uri(uri) => external_uri(uri),
+            buffer::Source::Bin => None,
+        });
+        let images = document.images().filter_map(|i| match i.source() {
+            image::Source::Uri { uri, .. } => external_uri(uri),
+            image::Source::View { .. } => None,
+        });
+        Ok(buffers.chain(images).map(Cow::into_owned).collect())
     }
 }
 

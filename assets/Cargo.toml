@@ -7,8 +7,13 @@ rust-version = "1.99"
 [lints]
 workspace = true
 
+[features]
+default = ["pack"]
+pack = ["dep:zstd"]
+
 [dependencies]
 downcast-rs = "2.0.2"
+zstd = { version = "0.13.3", optional = true }
 
 thiserror = { workspace = true }
 tracing = { workspace = true }
