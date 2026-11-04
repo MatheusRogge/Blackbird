@@ -11,6 +11,9 @@ pub mod application;
 #[cfg(feature = "window")]
 pub mod windowed;
 
+#[cfg(feature = "logging")]
+pub mod logging;
+
 // Re-export core primitives so users only need to import `engine`.
 pub use engine_core::{entity, input, world};
 pub use engine_core::entity::{Controllable, Entity, EntityKey};
@@ -101,6 +104,7 @@ impl Engine {
         self.ui_wants_keyboard.load(Ordering::Relaxed)
     }
 
+    #[cfg(feature = "ui")]
     pub(crate) fn ui_flag_arcs(&self) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
         (Arc::clone(&self.ui_wants_pointer), Arc::clone(&self.ui_wants_keyboard))
     }

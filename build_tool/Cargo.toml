@@ -1,0 +1,20 @@
+[package]
+name = "build_tool"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "blackbird"
+path = "src/main.rs"
+
+[dependencies]
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }
+serde_json = "1"
+
+engine  = { path = "../engine/", features = ["gltf"] }
+project = { path = "../project/" }

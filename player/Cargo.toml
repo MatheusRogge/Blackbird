@@ -1,0 +1,26 @@
+[package]
+name = "player"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[lints]
+workspace = true
+
+[features]
+default    = ["dev"]
+# Development builds: perf overlay, dev tools window, free camera, log file.
+dev        = ["engine/debug"]
+# Production builds: compiles out info/debug logging.
+production = ["log/release_max_level_warn"]
+
+[dependencies]
+anyhow      = { workspace = true }
+log         = { workspace = true }
+ultraviolet = { workspace = true }
+
+engine  = { path = "../engine/", features = ["gltf", "window", "logging"] }
+project = { path = "../project/" }
+
+[build-dependencies]
+assets = { path = "../assets/", default-features = false }

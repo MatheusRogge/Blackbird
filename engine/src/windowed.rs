@@ -57,6 +57,7 @@ pub struct WindowedApplication<B: RenderGraphBuilder> {
     game_tx: Option<mpsc::SyncSender<GameMsg>>,
     resize_tx: Option<mpsc::SyncSender<ResizeMsg>>,
     window: Option<Arc<Window>>,
+    window_title: Option<String>,
     game_thread: Option<thread::JoinHandle<()>>,
     render_thread: Option<thread::JoinHandle<()>>,
 
@@ -74,6 +75,7 @@ impl<B: RenderGraphBuilder> WindowedApplication<B> {
             game_tx: None,
             resize_tx: None,
             window: None,
+            window_title: None,
             game_thread: None,
             render_thread: None,
             #[cfg(feature = "ui")]
@@ -83,6 +85,11 @@ impl<B: RenderGraphBuilder> WindowedApplication<B> {
 
     pub fn add_plugin(mut self, plugin: impl Plugin) -> Self {
         self.inner = self.inner.add_plugin(plugin);
+        self
+    }
+
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.window_title = Some(title.into());
         self
     }
 
@@ -153,11 +160,11 @@ impl<B: RenderGraphBuilder> ApplicationHandler for WindowedApplication<B> {
             return;
         }
 
-        let window = Arc::new(
-            event_loop
-                .create_window(WindowAttributes::default())
-                .unwrap(),
-        );
+        let mut attributes = WindowAttributes::default();
+        if let Some(title) = self.window_title.take() {
+            attributes = attributes.with_title(title);
+        }
+        let window = Arc::new(event_loop.create_window(attributes).unwrap());
 
         let builder = self.graph_builder.take().unwrap();
         let renderer = pollster::block_on(Renderer::new(window.clone(), builder)).unwrap();
@@ -216,6 +223,8 @@ impl<B: RenderGraphBuilder> ApplicationHandler for WindowedApplication<B> {
                             if let Some(overlay) = &mut egui_overlay {
                                 overlay.0.on_events(&events);
                             }
+                            #[cfg(not(feature = "ui"))]
+                            drop(events);
 
                             let world = world_arc.read().expect("world RwLock poisoned");
 

@@ -253,6 +253,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "build_tool"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "engine",
+ "project",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -631,7 +642,9 @@ version = "1.0.0"
 dependencies = [
  "assets",
  "engine_core",
+ "env_logger",
  "gltf 0.1.0",
+ "log",
  "pollster 1.0.1",
  "rendering",
  "thiserror 2.0.21",
@@ -1986,6 +1999,18 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+
+[[package]]
+name = "player"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assets",
+ "engine",
+ "log",
+ "project",
+ "ultraviolet",
+]
 
 [[package]]
 name = "png"

@@ -3,9 +3,11 @@ resolver = "2"
 members = [
   "core",
   "assets",
+  "build_tool",
   "editor",
   "engine",
   "gltf",
+  "player",
   "project",
   "rendering",
   "sandbox",
@@ -34,3 +36,12 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# Standalone game builds made by `build_tool`.
+[profile.development]
+inherits = "dev"
+opt-level = 1
+
+[profile.production]
+inherits = "release"
+panic = "abort"

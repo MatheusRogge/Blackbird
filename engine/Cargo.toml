@@ -23,6 +23,9 @@ winit     = { workspace = true,        optional = true }
 pollster  = { version = "1.0.1",       optional = true }
 ultraviolet = { workspace = true }
 
+log        = { workspace = true,        optional = true }
+env_logger = { version = "0.11.10",     optional = true }
+
 [features]
 default  = []
 assets   = ["dep:assets"]
@@ -31,3 +34,4 @@ window   = ["dep:rendering", "dep:winit", "dep:pollster", "assets"]
 ui       = ["dep:ui", "window"]
 full     = ["assets", "gltf", "window", "ui"]
 debug    = ["window", "ui", "rendering/debug"]
+logging  = ["dep:log", "dep:env_logger"]
