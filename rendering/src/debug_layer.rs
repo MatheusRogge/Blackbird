@@ -87,7 +87,7 @@ impl UiLayer for DebugLayer {
                     ui.end_row();
                     ui.label("screen textures");
                     ui.label(format!(
-                        "{} logical → {} physical",
+                        "{} logical ➡ {} physical",
                         mem.screen_textures.logical(),
                         mem.screen_textures.physical()
                     ));
@@ -173,7 +173,7 @@ fn aliasing_timeline(ui: &mut egui::Ui, report: &AliasingReport) {
     let logical = report.logical_bytes();
     let physical = report.physical_bytes();
     ui.label(format!(
-        "{} logical → {} physical    {:.1} MiB → {:.1} MiB (saved {:.1} MiB)",
+        "{} logical ➡ {} physical    {:.1} MiB ➡ {:.1} MiB (saved {:.1} MiB)",
         report.logical(),
         report.physical(),
         mib(logical),
@@ -265,7 +265,7 @@ fn aliasing_timeline(ui: &mut egui::Ui, report: &AliasingReport) {
                 ui.label(format!("resource #{} written by {}", texture.id, texture.writer));
                 ui.label(format!("{:?}, {:.2} MiB", texture.format, mib(texture.bytes)));
                 ui.label(format!(
-                    "live: {} → {}",
+                    "live: {} ➡ {}",
                     report.passes[texture.first], report.passes[texture.last]
                 ));
                 ui.label(format!("physical texture {}", texture.slot));

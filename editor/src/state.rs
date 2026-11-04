@@ -99,7 +99,7 @@ impl LightDataExt for LightData {
     fn icon(&self) -> &'static str {
         match self {
             LightData::Sky { .. }   => "☀",
-            LightData::Point { .. } => "●",
+            LightData::Point { .. } => "💡",
             LightData::Spot { .. }  => "◎",
             LightData::Area { .. }  => "▪",
         }
@@ -108,7 +108,7 @@ impl LightDataExt for LightData {
     fn label(&self) -> &'static str {
         match self {
             LightData::Sky { .. }   => "☀ Sky Light",
-            LightData::Point { .. } => "● Point Light",
+            LightData::Point { .. } => "💡 Point Light",
             LightData::Spot { .. }  => "◎ Spot Light",
             LightData::Area { .. }  => "▪ Area Light",
         }

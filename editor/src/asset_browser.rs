@@ -55,7 +55,7 @@ impl AssetKind {
             AssetKind::Scene => "🎬",
             AssetKind::Model => "📦",
             AssetKind::Texture => "🖼",
-            AssetKind::Buffer => "▤",
+            AssetKind::Buffer => "💾",
             AssetKind::Shader => "✨",
             AssetKind::Data => "📄",
             AssetKind::Other => "❔",

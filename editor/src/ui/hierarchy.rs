@@ -35,7 +35,7 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                         state.add_light_requested = Some(LightKind::Sky);
                         ui.close();
                     }
-                    if ui.button("● Point Light").clicked() {
+                    if ui.button("💡 Point Light").clicked() {
                         state.add_light_requested = Some(LightKind::Point);
                         ui.close();
                     }
@@ -89,7 +89,7 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                 .body(|ui| {
                     for (idx, name) in &mesh_entries {
                         let selected = state.selected == Some(Selection::Mesh(*idx));
-                        if ui.selectable_label(selected, format!("▲ {name}")).clicked() {
+                        if ui.selectable_label(selected, format!("⏶ {name}")).clicked() {
                             state.selected = Some(Selection::Mesh(*idx));
                         }
                     }
@@ -138,8 +138,8 @@ fn draw_node(
     let label = match (&node.kind, light) {
         (NodeKind::Light, Some((_, icon))) => format!("{icon} {}", node.name),
         (NodeKind::Mesh(mesh), _) if !mesh.is_empty() && *mesh != node.name =>
-            format!("▲ {} [{mesh}]", node.name),
-        (NodeKind::Mesh(_), _) => format!("▲ {}", node.name),
+            format!("⏶ {} [{mesh}]", node.name),
+        (NodeKind::Mesh(_), _) => format!("⏶ {}", node.name),
         (NodeKind::Camera, _)  => format!("📷 {}", node.name),
         (NodeKind::Light | NodeKind::Empty, _) => format!("○ {}", node.name),
     };

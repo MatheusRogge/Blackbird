@@ -359,7 +359,7 @@ fn row(ui: &mut Ui, label: &str, value: &str) {
 
 fn build_label(in_build: Option<bool>) -> &'static str {
     match in_build {
-        Some(true) => "● ships in builds",
+        Some(true) => "✔ ships in builds",
         Some(false) => "not referenced, left out of builds",
         None => "unknown",
     }

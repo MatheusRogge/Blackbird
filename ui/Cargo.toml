@@ -8,7 +8,7 @@ rust-version = "1.99"
 workspace = true
 
 [dependencies]
-egui     = { version = "0.37", features = ["default_fonts"] }
+egui     = { version = "0.37", features = ["default_fonts", "monochrome_emoji_fonts"] }
 egui-wgpu = "0.37"
 wgpu     = { version = "30", features = ["wgsl"] }
 

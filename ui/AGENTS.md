@@ -34,4 +34,6 @@ Layers get `&World` under the render thread's **read** lock. Don't mutate game s
 ## egui 0.37 gotchas
 - Panels (`egui::Panel`, `CentralPanel`) only show inside a `Ui`. From a `UiLayer`, wrap them in `ctx.root_ui(|ui| …)`. Windows and `Area`s still take `&Context`.
 - `egui` no longer enables `default_fonts` by default. It is turned on in this crate's `Cargo.toml`. Without it, no text renders.
+- Emoji/icon glyphs (☀ 📦 🖼 🗀 ⟳ …) come from `NotoEmoji-Regular` and `emoji-icon-font`, which egui only bundles with the `monochrome_emoji_fonts` feature. That is also on here. Without it they render as empty boxes.
+- Proportional text (all normal labels) uses `Ubuntu-Light` + `egui-icons` + the emoji fonts, **not** `Hack`. Many geometric symbols (● ▲ ▤ △ ◆ ▦ → ✓) exist only in Hack, or nowhere, and show as boxes. Check a new icon against those fonts' glyph outlines before using it. Mapped-but-empty glyphs happen too.
 - `TexturesDelta` debug-asserts on drop if it still holds deltas, so `execute` drains it (`set` before painting, `free` after).
