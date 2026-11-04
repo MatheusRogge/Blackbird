@@ -58,6 +58,7 @@ fn main() -> anyhow::Result<()> {
     ).with_debug_flags(debug_flags);
 
     WindowedApplication::new(render_graph)
+        .with_title("Blackbird Editor")
         .add_plugin(EditorPlugin::new(shared_state.clone()))
         .add_ui_layer(EditorUiLayer::new(shared_state))
         .run()?;
