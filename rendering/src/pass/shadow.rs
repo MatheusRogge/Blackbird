@@ -1,5 +1,6 @@
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use engine_core::{
@@ -14,9 +15,10 @@ use crate::{
     graph::{NodeId, RenderGraph},
     light::SkyLight,
     mesh::Mesh,
-    pass::{Pass, PassContext, PassDesc},
+    pass::{Pass, PassContext, PassDesc, gbuffer::GBufferPass},
     resource::{ResourceDescriptor, ResourceId},
     shader::ShaderAsset,
+    texture::TextureAsset,
 };
 
 pub const NUM_CASCADES: usize = 4;
@@ -45,6 +47,12 @@ pub struct ShadowPass {
     node_id: Option<NodeId>,
     shader: ShaderAsset,
     pipeline: Option<wgpu::RenderPipeline>,
+    /// Unculled pipeline that discards cut-out texels, for `Mesh::is_masked` meshes.
+    masked_pipeline: Option<wgpu::RenderPipeline>,
+    masked_texture_layout: Option<wgpu::BindGroupLayout>,
+    masked_sampler: Option<wgpu::Sampler>,
+    /// Albedo textures of masked meshes, keyed by `TextureAsset` pointer; key 0 is opaque white.
+    masked_textures: HashMap<usize, (wgpu::Texture, wgpu::BindGroup)>,
     bgl: Option<wgpu::BindGroupLayout>,
     instance_layout: Option<wgpu::BindGroupLayout>,
     instance_bind_group: Option<(u64, wgpu::BindGroup)>,
@@ -90,7 +98,43 @@ impl Aabb {
     }
 }
 
+/// Key of a mesh's albedo texture in `ShadowPass::masked_textures`.
+fn albedo_key(mesh: &Mesh) -> usize {
+    mesh.albedo_texture.as_ref().map_or(0, |t| Arc::as_ptr(t) as usize)
+}
+
 impl ShadowPass {
+    /// Uploads the albedo texture of every masked mesh not seen before (plus the white
+    /// fallback), so the cascades can alpha-test against it.
+    fn upload_masked_textures(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, meshes: &[EntityHandle<'_, Mesh>]) {
+        let (Some(layout), Some(sampler)) = (&self.masked_texture_layout, &self.masked_sampler) else {
+            return;
+        };
+        let white = Arc::new(TextureAsset::new(1, 1, vec![255; 4]));
+        let fallback = (!self.masked_textures.contains_key(&0)).then_some((0, &white));
+        let needed = meshes
+            .iter()
+            .filter(|h| h.entity.is_masked())
+            .filter_map(|h| h.entity.albedo_texture.as_ref().map(|t| (albedo_key(h.entity), t)))
+            .chain(fallback);
+
+        for (key, asset) in needed {
+            if self.masked_textures.contains_key(&key) {
+                continue;
+            }
+            let (texture, view) = GBufferPass::upload_texture(device, queue, asset, wgpu::TextureFormat::Rgba8Unorm);
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shadow_masked_texture"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                ],
+            });
+            self.masked_textures.insert(key, (texture, bind_group));
+        }
+    }
+
     pub fn new(graph: &mut RenderGraph, shader: ShaderAsset) -> (Self, ShadowOutputs) {
         let shadow_map_id = graph.alloc_resource_id(ResourceDescriptor::FixedTexture {
             size: wgpu::Extent3d {
@@ -119,6 +163,10 @@ impl ShadowPass {
                 node_id: None,
                 shader,
                 pipeline: None,
+                masked_pipeline: None,
+                masked_texture_layout: None,
+                masked_sampler: None,
+                masked_textures: HashMap::new(),
                 bgl: None,
                 instance_layout: None,
                 instance_bind_group: None,
@@ -371,6 +419,76 @@ impl Pass for ShadowPass {
                 cache: None,
             });
 
+            let masked_texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shadow_masked_texture_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+            let masked_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("shadow_masked_pipeline_layout"),
+                bind_group_layouts: &[Some(&bgl), Some(&instance_layout), Some(&masked_texture_layout)],
+                immediate_size: 0,
+            });
+
+            let masked_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shadow_masked_pipeline"),
+                layout: Some(&masked_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_masked"),
+                    buffers: &[Some(crate::mesh::Vertex::buffer_descriptor())],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_masked"),
+                    targets: &[],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+            self.masked_sampler = Some(device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("shadow_masked_sampler"),
+                address_mode_u: wgpu::AddressMode::Repeat,
+                address_mode_v: wgpu::AddressMode::Repeat,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }));
+            self.masked_texture_layout = Some(masked_texture_layout);
+            self.masked_pipeline = Some(masked_pipeline);
+
             self.cascade_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("shadow_cascade_bg"),
                 layout: &bgl,
@@ -421,11 +539,17 @@ impl Pass for ShadowPass {
             });
             self.instance_bind_group = Some((generation, bind_group));
         }
+        self.upload_masked_textures(device, queue, &meshes);
+
         let Some((_, instance_bg)) = self.instance_bind_group.as_ref() else {
             return;
         };
 
-        let pipeline = self.pipeline.as_ref().unwrap();
+        let (Some(pipeline), Some(masked_pipeline)) = (&self.pipeline, &self.masked_pipeline) else {
+            return;
+        };
+        let mut masked: Vec<_> = meshes.iter().filter(|h| h.entity.is_masked()).collect();
+        masked.sort_unstable_by_key(|h| albedo_key(h.entity));
         let inv_cam_view = camera.view_matrix().inversed();
 
         let mut view_to_shadow_raw = [[[0f32; 4]; 4]; NUM_CASCADES];
@@ -469,7 +593,28 @@ impl Pass for ShadowPass {
             pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
             pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
 
-            for draw in meshes.iter().filter_map(|h| ctx.geometry.get(h.id)) {
+            let opaque = meshes.iter().filter(|h| !h.entity.is_masked());
+            for draw in opaque.filter_map(|h| ctx.geometry.get(h.id)) {
+                pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
+            }
+
+            if masked.is_empty() {
+                continue;
+            }
+            pass.set_pipeline(masked_pipeline);
+            pass.set_bind_group(0, bg, &[vp_offset as u32]);
+            pass.set_bind_group(1, instance_bg, &[]);
+            let mut current_texture = None;
+            for handle in &masked {
+                let Some(draw) = ctx.geometry.get(handle.id) else { continue };
+                let key = albedo_key(handle.entity);
+                if current_texture != Some(key) {
+                    let Some((_, texture_bg)) = self.masked_textures.get(&key).or(self.masked_textures.get(&0)) else {
+                        continue;
+                    };
+                    pass.set_bind_group(2, texture_bg, &[]);
+                    current_texture = Some(key);
+                }
                 pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
             }
         }

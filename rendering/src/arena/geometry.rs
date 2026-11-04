@@ -22,6 +22,8 @@ pub struct GpuModel {
     pub model: [[f32; 4]; 4],
     /// Inverse-transpose of `model`, for normals.
     pub normal: [[f32; 4]; 4],
+    /// x: alpha cutoff (0 = never discard), y: 1 if double-sided, zw: unused.
+    pub material: [f32; 4],
 }
 
 /// Where a mesh lives inside the shared geometry buffers. `instance` indexes
@@ -193,10 +195,17 @@ impl GeometryArena {
         let mut models = vec![GpuModel::zeroed(); self.next_instance as usize];
         for handle in meshes {
             if let Some(alloc) = self.meshes.get(&handle.id) {
-                let transform = handle.entity.transform;
+                let mesh = handle.entity;
+                let transform = mesh.transform;
                 models[alloc.draw.instance as usize] = GpuModel {
                     model: transform.into(),
                     normal: transform.inversed().transposed().into(),
+                    material: [
+                        mesh.alpha_cutoff.unwrap_or(0.0),
+                        if mesh.double_sided { 1.0 } else { 0.0 },
+                        0.0,
+                        0.0,
+                    ],
                 };
             }
         }

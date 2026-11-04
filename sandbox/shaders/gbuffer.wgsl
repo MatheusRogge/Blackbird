@@ -16,6 +16,8 @@ var tex_sampler: sampler;
 struct Model {
     model: mat4x4<f32>,
     normal: mat4x4<f32>,
+    // x: alpha cutoff (0 = never discard), y: 1 if double-sided.
+    material: vec4<f32>,
 };
 
 @group(2) @binding(0)
@@ -35,6 +37,7 @@ struct VertexOutput {
     @location(1) color: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) world_tangent: vec4<f32>,
+    @location(4) @interpolate(flat) material: vec2<f32>,
 };
 
 struct GBufferOutput {
@@ -53,23 +56,33 @@ fn vs_main(in: VertexInput, @builtin(instance_index) instance: u32) -> VertexOut
     out.color = in.color;
     out.uv = in.uv;
     out.world_tangent = vec4<f32>(normalize((m.model * vec4<f32>(in.tangent.xyz, 0.0)).xyz), in.tangent.w);
+    out.material = m.material.xy;
 
     return out;
 }
 
 @fragment
-fn fs_main(in: VertexOutput) -> GBufferOutput {
+fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> GBufferOutput {
     var out: GBufferOutput;
 
-    let N = normalize(in.world_normal);
+    // Sample before discarding: implicit-derivative sampling must stay in uniform control flow.
+    let albedo = textureSample(albedo_tex, tex_sampler, in.uv);
+    let normal_sample = textureSample(normal_tex, tex_sampler, in.uv).rgb;
+    if albedo.a < in.material.x {
+        discard;
+    }
+
+    var N = normalize(in.world_normal);
+    if !front_facing && in.material.y > 0.5 {
+        N = -N;
+    }
     let T = normalize(in.world_tangent.xyz);
     let B = cross(N, T) * in.world_tangent.w;
 
-    let normal_sample = textureSample(normal_tex, tex_sampler, in.uv).rgb;
     let tangent_normal = normalize(normal_sample * 2.0 - 1.0);
     let world_normal = normalize(T * tangent_normal.x + B * tangent_normal.y + N * tangent_normal.z);
 
-    out.albedo = textureSample(albedo_tex, tex_sampler, in.uv);
+    out.albedo = albedo;
     out.normal = vec4<f32>(world_normal * 0.5 + 0.5, 1.0);
     out.material = vec4<f32>(0.5, 0.0, 1.0, 1.0);
 

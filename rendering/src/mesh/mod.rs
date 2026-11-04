@@ -35,6 +35,11 @@ pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub albedo_texture: Option<Arc<TextureAsset>>,
     pub normal_texture: Option<Arc<TextureAsset>>,
+    /// Alpha-tested ("cutout") material: fragments with albedo alpha below this are discarded,
+    /// in the G-buffer and in shadow maps. `None` is opaque.
+    pub alpha_cutoff: Option<f32>,
+    /// Rendered without back-face culling, with normals flipped on back faces.
+    pub double_sided: bool,
     /// Local-to-world transform, read every frame. Vertices stay in local space.
     pub transform: Mat4,
 }
@@ -46,6 +51,8 @@ impl Default for Mesh {
             vertices: Vec::new(),
             albedo_texture: None,
             normal_texture: None,
+            alpha_cutoff: None,
+            double_sided: false,
             transform: Mat4::identity(),
         }
     }
@@ -63,8 +70,25 @@ impl Mesh {
             vertices,
             albedo_texture,
             normal_texture,
+            alpha_cutoff: None,
+            double_sided: false,
             transform: Mat4::identity(),
         }
+    }
+
+    pub fn with_alpha_cutoff(mut self, cutoff: Option<f32>) -> Self {
+        self.alpha_cutoff = cutoff;
+        self
+    }
+
+    pub fn with_double_sided(mut self, double_sided: bool) -> Self {
+        self.double_sided = double_sided;
+        self
+    }
+
+    /// Needs the alpha-tested / double-sided path rather than the plain opaque one.
+    pub fn is_masked(&self) -> bool {
+        self.alpha_cutoff.is_some() || self.double_sided
     }
 
     pub fn with_transform(mut self, transform: Mat4) -> Self {

@@ -24,6 +24,8 @@ pub struct GBufferPass {
 
     shader: ShaderAsset,
     pipeline: Option<wgpu::RenderPipeline>,
+    /// Same as `pipeline` without back-face culling, for `Mesh::double_sided`.
+    double_sided_pipeline: Option<wgpu::RenderPipeline>,
     camera_bind_group_layout: Option<wgpu::BindGroupLayout>,
     texture_bind_group_layout: Option<wgpu::BindGroupLayout>,
     instance_layout: Option<wgpu::BindGroupLayout>,
@@ -84,6 +86,7 @@ impl GBufferPass {
                 node_id: None,
                 shader,
                 pipeline: None,
+                double_sided_pipeline: None,
                 camera_bind_group_layout: None,
                 texture_bind_group_layout: None,
                 instance_layout: None,
@@ -105,7 +108,7 @@ impl GBufferPass {
         )
     }
 
-    fn upload_texture(
+    pub(crate) fn upload_texture(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         asset: &TextureAsset,
@@ -412,57 +415,61 @@ impl Pass for GBufferPass {
                 immediate_size: 0,
             });
 
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("gbuffer_pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader_module,
-                    entry_point: Some("vs_main"),
-                    buffers: &[Some(Vertex::buffer_descriptor())],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader_module,
-                    entry_point: Some("fs_main"),
-                    targets: &[
-                        Some(wgpu::ColorTargetState {
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                        Some(wgpu::ColorTargetState {
-                            format: wgpu::TextureFormat::Rgba16Float,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                        Some(wgpu::ColorTargetState {
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                    ],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
-                    unclipped_depth: false,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    conservative: false,
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
+            let create_pipeline = |label: &str, cull_mode: Option<wgpu::Face>| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader_module,
+                        entry_point: Some("vs_main"),
+                        buffers: &[Some(Vertex::buffer_descriptor())],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader_module,
+                        entry_point: Some("fs_main"),
+                        targets: &[
+                            Some(wgpu::ColorTargetState {
+                                format: wgpu::TextureFormat::Rgba8Unorm,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                            Some(wgpu::ColorTargetState {
+                                format: wgpu::TextureFormat::Rgba16Float,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                            Some(wgpu::ColorTargetState {
+                                format: wgpu::TextureFormat::Rgba8Unorm,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                        ],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode,
+                        unclipped_depth: false,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        conservative: false,
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(true),
+                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+            let pipeline = create_pipeline("gbuffer_pipeline", Some(wgpu::Face::Back));
+            let double_sided_pipeline = create_pipeline("gbuffer_double_sided_pipeline", None);
 
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("gbuffer_texture_sampler"),
@@ -500,6 +507,7 @@ impl Pass for GBufferPass {
             );
 
             self.pipeline = Some(pipeline);
+            self.double_sided_pipeline = Some(double_sided_pipeline);
             self.camera_bind_group_layout = Some(camera_layout);
             self.texture_bind_group_layout = Some(texture_layout);
             self.instance_layout = Some(instance_layout);
@@ -509,7 +517,9 @@ impl Pass for GBufferPass {
             self.fallback_bind_group = Some(fallback_bg);
         }
 
-        let pipeline = self.pipeline.as_ref().unwrap();
+        let (Some(pipeline), Some(double_sided_pipeline)) = (&self.pipeline, &self.double_sided_pipeline) else {
+            return;
+        };
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("gbuffer"),
@@ -627,17 +637,18 @@ impl Pass for GBufferPass {
             }
         }
 
-        // Sort draw order by bind group key so consecutive meshes that share a
-        // material don't trigger a GPU bind group switch.
+        // Group draws by pipeline, then by bind group key, so consecutive meshes
+        // that share a material don't trigger a GPU state switch.
         let mut draw_order: Vec<usize> = (0..meshes.len()).collect();
         draw_order.sort_unstable_by_key(|&i| {
             let m = meshes[i].entity;
             let ak = m.albedo_texture.as_ref().map(|t| Arc::as_ptr(t) as usize).unwrap_or(0);
             let nk = m.normal_texture.as_ref().map(|t| Arc::as_ptr(t) as usize).unwrap_or(0);
-            (ak, nk)
+            (m.double_sided, ak, nk)
         });
 
         pass.set_pipeline(pipeline);
+        let mut double_sided = false;
         if let Some((_, instance_bg)) = self.instance_bind_group.as_ref() {
             pass.set_bind_group(2, instance_bg, &[]);
         }
@@ -659,6 +670,11 @@ impl Pass for GBufferPass {
             let albedo_key = mesh.albedo_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
             let normal_key = mesh.normal_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
             let bg_key = (albedo_key.unwrap_or(0), normal_key.unwrap_or(0));
+
+            if mesh.double_sided != double_sided {
+                double_sided = mesh.double_sided;
+                pass.set_pipeline(if double_sided { double_sided_pipeline } else { pipeline });
+            }
 
             if current_bg_key != Some(bg_key) {
                 let texture_bg = self

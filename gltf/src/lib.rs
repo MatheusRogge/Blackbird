@@ -239,7 +239,15 @@ fn build_mesh_primitives(
             .normal_texture()
             .and_then(|info| textures.get(images, info.texture()));
 
-        out.push(Mesh::new(vertices, indices, albedo_texture, normal_texture));
+        let alpha_cutoff = match material.alpha_mode() {
+            gltf::material::AlphaMode::Mask => Some(material.alpha_cutoff().unwrap_or(0.5)),
+            gltf::material::AlphaMode::Opaque | gltf::material::AlphaMode::Blend => None,
+        };
+        out.push(
+            Mesh::new(vertices, indices, albedo_texture, normal_texture)
+                .with_alpha_cutoff(alpha_cutoff)
+                .with_double_sided(material.double_sided()),
+        );
     }
 
     out
