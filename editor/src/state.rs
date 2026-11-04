@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use engine_core::entity::EntityKey;
 use gltf_api::Document;
-use serde::{Deserialize, Serialize};
 use ultraviolet::Mat4;
 
+pub use engine::gltf::lights::LightData;
 pub use project::CameraSettings;
 
 use crate::math;
@@ -86,40 +86,15 @@ pub enum LightKind {
     Area,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum LightData {
-    Sky {
-        color: [f32; 3],
-        intensity: f32,
-        direction: [f32; 3],
-    },
-    Point {
-        position: [f32; 3],
-        color: [f32; 3],
-        intensity: f32,
-        radius: f32,
-    },
-    Spot {
-        position: [f32; 3],
-        direction: [f32; 3],
-        color: [f32; 3],
-        intensity: f32,
-        radius: f32,
-        inner_angle: f32,
-        outer_angle: f32,
-    },
-    Area {
-        position: [f32; 3],
-        right: [f32; 3],
-        up: [f32; 3],
-        color: [f32; 3],
-        intensity: f32,
-    },
+/// Editor-only presentation of a light.
+pub trait LightDataExt {
+    fn icon(&self) -> &'static str;
+    fn label(&self) -> &'static str;
+    fn default_for(kind: LightKind) -> Self;
 }
 
-impl LightData {
-    pub fn icon(&self) -> &'static str {
+impl LightDataExt for LightData {
+    fn icon(&self) -> &'static str {
         match self {
             LightData::Sky { .. }   => "☀",
             LightData::Point { .. } => "●",
@@ -128,7 +103,7 @@ impl LightData {
         }
     }
 
-    pub fn label(&self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
             LightData::Sky { .. }   => "☀ Sky Light",
             LightData::Point { .. } => "● Point Light",
@@ -137,7 +112,7 @@ impl LightData {
         }
     }
 
-    pub fn default_for(kind: LightKind) -> Self {
+    fn default_for(kind: LightKind) -> Self {
         match kind {
             LightKind::Sky => LightData::Sky {
                 color: [0.8, 0.9, 1.0],

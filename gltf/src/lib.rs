@@ -1,3 +1,5 @@
+pub mod lights;
+
 use assets::{Asset, AssetError, AssetResolver, LoadContext};
 use engine_core::{entity::EntityKey, world::World};
 use gltf::{Gltf, buffer, image, image::Format, mesh::util::ReadIndices};
@@ -8,11 +10,12 @@ use rendering::{
 };
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
     sync::Arc,
 };
 use thiserror::Error;
+use ultraviolet::Vec4;
 
 #[derive(Error, Debug)]
 pub enum GLTFAssetError {
@@ -247,23 +250,21 @@ pub fn local_matrix(node: &gltf::Node<'_>) -> Mat4 {
     node.transform().matrix().into()
 }
 
-/// Every node of the default scene (or of all root nodes if there is none)
-/// that has a mesh, paired with its world matrix, in depth-first order.
-fn mesh_nodes(document: &gltf::Document) -> Vec<(usize, Mat4)> {
-    fn visit(node: gltf::Node<'_>, parent: Mat4, out: &mut Vec<(usize, Mat4)>) {
+/// Calls `f` with every node of the default scene (or of all root nodes if there is none)
+/// and its world matrix, in depth-first order.
+fn visit_scene<'a>(document: &'a gltf::Document, mut f: impl FnMut(gltf::Node<'a>, Mat4)) {
+    fn visit<'a>(node: gltf::Node<'a>, parent: Mat4, f: &mut impl FnMut(gltf::Node<'a>, Mat4)) {
         let world = parent * local_matrix(&node);
-        if node.mesh().is_some() {
-            out.push((node.index(), world));
-        }
+        f(node.clone(), world);
         for child in node.children() {
-            visit(child, world, out);
+            visit(child, world, f);
         }
     }
 
     let roots: Vec<gltf::Node<'_>> = match document.default_scene().or_else(|| document.scenes().next()) {
         Some(scene) => scene.nodes().collect(),
         None => {
-            let children: std::collections::HashSet<usize> = document
+            let children: HashSet<usize> = document
                 .nodes()
                 .flat_map(|n| n.children().map(|c| c.index()))
                 .collect();
@@ -271,10 +272,18 @@ fn mesh_nodes(document: &gltf::Document) -> Vec<(usize, Mat4)> {
         }
     };
 
-    let mut out = Vec::new();
     for root in roots {
-        visit(root, Mat4::identity(), &mut out);
+        visit(root, Mat4::identity(), &mut f);
     }
+}
+
+fn mesh_nodes(document: &gltf::Document) -> Vec<(usize, Mat4)> {
+    let mut out = Vec::new();
+    visit_scene(document, |node, world| {
+        if node.mesh().is_some() {
+            out.push((node.index(), world));
+        }
+    });
     out
 }
 
@@ -335,19 +344,23 @@ impl GltfScene {
     }
 }
 
+/// Each perspective camera node becomes a `Camera` looking down the node's −Z.
 fn load_cameras(document: &gltf::Document, world: &mut World) {
-    for camera in document.cameras() {
-        if let gltf::camera::Projection::Perspective(perspective) = camera.projection() {
-            world.add_entity(Camera {
-                fovy: perspective.yfov(),
-                near: perspective.znear(),
-                far: perspective.zfar().unwrap_or(1000.0),
-                exposure: 1.0,
-                aspect: perspective.aspect_ratio().unwrap_or((4 / 3) as f32),
-                up: (0.0, 1.0, 0.0).into(),
-                eye: (0.0, 40.0, 150.0).into(),
-                target: (0.0, 40.0, 0.0).into(),
-            });
-        }
-    }
+    visit_scene(document, |node, transform| {
+        let Some(camera) = node.camera() else { return };
+        let gltf::camera::Projection::Perspective(perspective) = camera.projection() else { return };
+        let eye = transform.cols[3].xyz();
+        let forward = (transform * Vec4::new(0.0, 0.0, -1.0, 0.0)).xyz().normalized();
+        let up = (transform * Vec4::new(0.0, 1.0, 0.0, 0.0)).xyz().normalized();
+        world.add_entity(Camera {
+            fovy: perspective.yfov(),
+            near: perspective.znear(),
+            far: perspective.zfar().unwrap_or(1000.0),
+            exposure: 1.0,
+            aspect: perspective.aspect_ratio().unwrap_or(4.0 / 3.0),
+            up,
+            eye,
+            target: eye + forward,
+        });
+    });
 }

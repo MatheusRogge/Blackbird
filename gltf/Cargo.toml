@@ -14,13 +14,17 @@ gltf = { version = "1.4.1", features = [
   "import",
   "utils",
   "guess_mime_type",
+  "KHR_lights_punctual",
 ] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 urlencoding = "2.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 thiserror = { workspace = true }
 tracing = { workspace = true }
 log = { workspace = true }
+ultraviolet = { workspace = true }
 
 assets = { path = "../assets/" }
 engine_core = { path = "../core/" }

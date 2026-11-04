@@ -1,82 +1,18 @@
-//! Scene lights in glTF: point, spot and sky lights as `KHR_lights_punctual` on nodes, area
-//! lights (which the extension can't express) in the root `extras`.
+//! Writes scene lights back into glTF. Reading them, and the format itself, lives in
+//! `engine::gltf::lights`.
 
-use std::collections::HashSet;
-
-use anyhow::{Context, Result};
-use gltf_api::Document;
+use anyhow::Result;
+use engine::gltf::lights::{EXTENSION, EXTRAS_KEY};
 use gltf_api::json::extensions::scene::khr_lights_punctual::{self as khr, Type};
 use gltf_api::json::scene::UnitQuaternion;
 use gltf_api::json::validation::Checked;
 use gltf_api::json::{Index, Root};
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
-use ultraviolet::{Mat4, Vec4};
+use ultraviolet::Mat4;
 
 use crate::math;
 use crate::state::{EditorState, LightData};
-
-const EXTENSION: &str = "KHR_lights_punctual";
-const EXTRAS_KEY: &str = "blackbird_lights";
-/// Illuminance (lux) at which a light with no `range` is cut off. The renderer needs a finite
-/// radius to cluster point lights, while glTF treats a missing range as infinite.
-const CUTOFF_ILLUMINANCE: f32 = 0.01;
-
-/// Lights stored in `doc`, each with the node it is attached to (`None` for `extras` lights).
-pub fn read_lights(doc: &Document) -> Result<Vec<(Option<usize>, LightData)>> {
-    let mut lights = read_punctual(doc);
-    lights.extend(read_extras(doc)?.into_iter().map(|data| (None, data)));
-    Ok(lights)
-}
-
-fn read_punctual(doc: &Document) -> Vec<(Option<usize>, LightData)> {
-    let mut lights = Vec::new();
-    let mut visited = HashSet::new();
-    let mut stack: Vec<_> = doc
-        .scenes()
-        .flat_map(|scene| scene.nodes())
-        .map(|node| (node, Mat4::identity()))
-        .collect();
-
-    while let Some((node, parent)) = stack.pop() {
-        if !visited.insert(node.index()) {
-            continue;
-        }
-        let world = parent * Mat4::from(node.transform().matrix());
-        stack.extend(node.children().map(|child| (child, world)));
-
-        let Some(light) = node.light() else { continue };
-        let position = world.cols[3].xyz().into();
-        let direction = (world * Vec4::new(0.0, 0.0, -1.0, 0.0)).xyz().normalized().into();
-        let color = light.color();
-        let intensity = light.intensity();
-        let radius = light.range().unwrap_or_else(|| (intensity / CUTOFF_ILLUMINANCE).sqrt().max(1.0));
-        let data = match light.kind() {
-            gltf_api::khr_lights_punctual::Kind::Directional => LightData::Sky { color, intensity, direction },
-            gltf_api::khr_lights_punctual::Kind::Point => LightData::Point { position, color, intensity, radius },
-            gltf_api::khr_lights_punctual::Kind::Spot { inner_cone_angle, outer_cone_angle } => LightData::Spot {
-                position,
-                direction,
-                color,
-                intensity,
-                radius,
-                inner_angle: inner_cone_angle,
-                outer_angle: outer_cone_angle,
-            },
-        };
-        lights.push((Some(node.index()), data));
-    }
-    lights
-}
-
-fn read_extras(doc: &Document) -> Result<Vec<LightData>> {
-    let Some(raw) = &doc.as_json().extras else { return Ok(Vec::new()) };
-    let Ok(Value::Object(mut extras)) = serde_json::from_str::<Value>(raw.get()) else { return Ok(Vec::new()) };
-    match extras.remove(EXTRAS_KEY) {
-        Some(lights) => serde_json::from_value(lights).context("invalid scene lights"),
-        None => Ok(Vec::new()),
-    }
-}
 
 /// Replaces every light in `root` with the editor's lights.
 pub fn write_lights(root: &mut Root, state: &EditorState) -> Result<()> {

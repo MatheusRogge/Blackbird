@@ -1,6 +1,6 @@
 use egui::Ui;
 
-use crate::state::{EditorState, LightData, NodeEdit, NodeKind, Selection};
+use crate::state::{EditorState, LightData, LightDataExt, NodeEdit, NodeKind, Selection};
 
 pub fn draw(root: &mut Ui, state: &mut EditorState) {
     egui::Panel::right("inspector")

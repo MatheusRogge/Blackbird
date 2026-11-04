@@ -831,6 +831,7 @@ fn ray_aabb((origin, dir): (Vec3, Vec3), lo: Vec3, hi: Vec3) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::LightDataExt;
 
     #[test]
     fn axis_param_finds_closest_point() {

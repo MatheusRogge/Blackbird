@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use egui::Ui;
 
-use crate::state::{EditorState, LightKind, NodeKind, SceneNode, Selection};
+use crate::state::{EditorState, LightDataExt, LightKind, NodeKind, SceneNode, Selection};
 
 pub fn draw(root: &mut Ui, state: &mut EditorState) {
     let ctx = &root.ctx().clone();
