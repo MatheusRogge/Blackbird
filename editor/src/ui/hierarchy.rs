@@ -1,11 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use egui::Ui;
 
 use crate::state::{EditorState, LightDataExt, LightKind, NodeKind, SceneNode, Selection};
 
 pub fn draw(root: &mut Ui, state: &mut EditorState) {
-    let ctx = &root.ctx().clone();
     egui::Panel::left("hierarchy")
         .min_size(180.0)
         .default_size(220.0)
@@ -50,50 +49,10 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                 });
             });
 
-            if !state.lights.is_empty() {
-                egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ctx,
-                    ui.make_persistent_id("lights_section"),
-                    true,
-                )
-                .show_header(ui, |ui| { ui.label("Lights"); })
-                .body(|ui| {
-                    for (idx, light) in state.lights.iter().enumerate() {
-                        let selected = state.selected == Some(Selection::Light(idx));
-                        if ui.selectable_label(selected, light.data.label()).clicked() {
-                            state.selected = Some(Selection::Light(idx));
-                        }
-                    }
-                });
-            }
-
-            if state.scene_nodes.is_empty() && state.document.is_none() {
+            if state.document.is_none() && state.lights.is_empty() {
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("Open a GLTF file to begin.").weak());
                 return;
-            }
-
-            let mesh_entries: Vec<(usize, String)> = state.document.as_ref()
-                .map(|doc| doc.meshes()
-                    .map(|m| (m.index(), m.name().unwrap_or("(unnamed)").to_string()))
-                    .collect())
-                .unwrap_or_default();
-
-            if !mesh_entries.is_empty() {
-                egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ctx,
-                    ui.make_persistent_id("meshes_section"),
-                    true,
-                )
-                .show_header(ui, |ui| { ui.label("Meshes"); })
-                .body(|ui| {
-                    for (idx, name) in &mesh_entries {
-                        let selected = state.selected == Some(Selection::Mesh(*idx));
-                        if ui.selectable_label(selected, format!("⏶ {name}")).clicked() {
-                            state.selected = Some(Selection::Mesh(*idx));
-                        }
-                    }
-                });
             }
 
             let nodes = state.scene_nodes.clone();
@@ -103,19 +62,26 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                 .filter_map(|(idx, light)| Some((light.node?, (idx, light.data.icon()))))
                 .collect();
 
-            if !nodes.is_empty() {
-                egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ctx,
-                    ui.make_persistent_id("nodes_section"),
-                    true,
-                )
-                .show_header(ui, |ui| { ui.label("Nodes"); })
-                .body(|ui| {
-                    for node in &nodes {
-                        draw_node(ui, node, &node_lights, &mut new_selection);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                for node in &nodes {
+                    draw_node(ui, node, &node_lights, &mut new_selection);
+                }
+                // Lights that have no row of their own in the tree: added in the editor, area
+                // lights from `extras`, or carried by a mesh/camera node or a node outside the
+                // default scene.
+                let mut light_rows = HashSet::new();
+                for node in &nodes {
+                    collect_light_nodes(node, &mut light_rows);
+                }
+                let unlisted = state.lights.iter().enumerate()
+                    .filter(|(_, l)| l.node.is_none_or(|n| !light_rows.contains(&n)));
+                for (idx, light) in unlisted {
+                    let target = Selection::Light(idx);
+                    if ui.selectable_label(new_selection.as_ref() == Some(&target), light.data.label()).clicked() {
+                        new_selection = Some(target);
                     }
-                });
-            }
+                }
+            });
 
             if new_selection != state.selected {
                 if let Some(Selection::GltfNode(idx)) = &new_selection {
@@ -124,6 +90,15 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                 state.selected = new_selection;
             }
         });
+}
+
+fn collect_light_nodes(node: &SceneNode, out: &mut HashSet<usize>) {
+    if matches!(node.kind, NodeKind::Light) {
+        out.insert(node.index);
+    }
+    for child in &node.children {
+        collect_light_nodes(child, out);
+    }
 }
 
 /// `node_lights` maps a light-carrying node to its `state.lights` index, so clicking the node

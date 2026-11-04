@@ -29,6 +29,17 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                         .map(|n| n.kind.clone());
 
                     ui.label(egui::RichText::new(&node_name).strong());
+                    if let Some(mesh) = state.document.as_ref()
+                        .and_then(|doc| doc.nodes().nth(idx))
+                        .and_then(|node| node.mesh())
+                    {
+                        let primitives = mesh.primitives().count();
+                        ui.label(egui::RichText::new(format!(
+                            "Mesh {} · {primitives} primitive{}",
+                            mesh.name().unwrap_or("(unnamed)"),
+                            if primitives == 1 { "" } else { "s" },
+                        )).weak());
+                    }
                     ui.separator();
 
                     if let Some(edit) = state.node_edits.get_mut(&idx) {
@@ -50,16 +61,6 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                         if ui.button(label).clicked() {
                             state.camera_preview_node = if previewing { None } else { Some(idx) };
                         }
-                    }
-                }
-                Some(Selection::Mesh(idx)) => {
-                    if let Some(doc) = &state.document
-                        && let Some(mesh) = doc.meshes().find(|m| m.index() == idx)
-                    {
-                        ui.label(egui::RichText::new(mesh.name().unwrap_or("(unnamed)")).strong());
-                        ui.separator();
-                        let prim_count = mesh.primitives().count();
-                        ui.label(format!("Primitives: {prim_count}"));
                     }
                 }
             }

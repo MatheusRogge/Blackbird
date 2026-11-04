@@ -77,7 +77,6 @@ pub enum GizmoMode {
 pub enum Selection {
     GltfNode(usize),
     Light(usize),
-    Mesh(usize),
 }
 
 #[derive(Clone, Debug, PartialEq)]
