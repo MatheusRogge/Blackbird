@@ -7,8 +7,10 @@ use gltf_api::Document;
 use serde::{Deserialize, Serialize};
 use ultraviolet::Mat4;
 
+pub use project::CameraSettings;
+
 use crate::math;
-use crate::project::Project;
+use project::Project;
 use crate::recent::RecentProjects;
 
 pub type SharedState = Arc<Mutex<EditorState>>;
@@ -165,32 +167,6 @@ impl LightData {
                 intensity: 15.0,
             },
         }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CameraSettings {
-    /// World units per second for WASD/QE movement.
-    pub move_speed: f32,
-    /// Speed multiplier while Shift is held.
-    pub fast_multiplier: f32,
-    /// Exposure compensation in stops; the camera exposure is `2^exposure_stops`.
-    pub exposure_stops: f32,
-}
-
-impl CameraSettings {
-    pub const MIN_SPEED: f32 = 0.01;
-    pub const MAX_SPEED: f32 = 1000.0;
-
-    pub fn exposure(&self) -> f32 {
-        self.exposure_stops.exp2()
-    }
-}
-
-impl Default for CameraSettings {
-    fn default() -> Self {
-        Self { move_speed: 10.0, fast_multiplier: 4.0, exposure_stops: 0.0 }
     }
 }
 

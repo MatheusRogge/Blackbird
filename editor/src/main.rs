@@ -4,7 +4,6 @@ mod import;
 mod lights;
 mod math;
 mod plugin;
-mod project;
 mod recent;
 mod state;
 mod ui;

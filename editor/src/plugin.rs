@@ -13,9 +13,10 @@ use engine::rendering::camera::Camera;
 use engine::rendering::light::{AreaLight, PointLight, SkyLight, SpotLight};
 use engine::rendering::mesh::Mesh;
 
+use project::Project;
+
 use crate::camera::EditorCameraController;
 use crate::math;
-use crate::project::Project;
 use crate::state::{LightData, NodeKind, SceneLight, SceneNode, Selection, SharedState};
 
 /// TRS of every edited node, used to detect when transforms must be reapplied.

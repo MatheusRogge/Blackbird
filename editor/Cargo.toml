@@ -16,6 +16,7 @@ ultraviolet = { workspace = true }
 engine      = { path = "../engine/",    features = ["full", "debug"] }
 engine_core = { path = "../core/" }
 rendering   = { path = "../rendering/" }
+project     = { path = "../project/" }
 
 gltf-api   = { package = "gltf", version = "1.4.1", features = ["names", "extras", "extensions", "KHR_lights_punctual"] }
 egui       = { version = "0.37" }

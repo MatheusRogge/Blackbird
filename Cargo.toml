@@ -6,6 +6,7 @@ members = [
   "editor",
   "engine",
   "gltf",
+  "project",
   "rendering",
   "sandbox",
   "threading",

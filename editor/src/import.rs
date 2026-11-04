@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use gltf_api::buffer::{Data, Source};
 
-use crate::project::Project;
+use project::Project;
 
 /// Copies a glTF/GLB scene and everything it references into the project.
 ///
