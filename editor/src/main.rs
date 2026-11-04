@@ -1,3 +1,4 @@
+mod asset_browser;
 mod camera;
 mod export;
 mod import;

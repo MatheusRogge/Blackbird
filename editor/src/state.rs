@@ -9,7 +9,9 @@ use ultraviolet::Mat4;
 pub use engine::gltf::lights::LightData;
 pub use project::CameraSettings;
 
+use crate::asset_browser::AssetBrowserState;
 use crate::math;
+use build_tool::BuildKind;
 use project::Project;
 use crate::recent::RecentProjects;
 
@@ -152,6 +154,16 @@ pub struct SceneLight {
     pub node: Option<usize>,
 }
 
+#[derive(Default)]
+pub struct BuildState {
+    pub requested: Option<BuildKind>,
+    pub running: Option<BuildKind>,
+    pub log: Vec<String>,
+    pub show_log: bool,
+    /// Executable produced by the last successful build.
+    pub last_output: Option<PathBuf>,
+}
+
 pub struct EditorState {
     pub recent_projects: RecentProjects,
 
@@ -194,6 +206,9 @@ pub struct EditorState {
     pub export_path: Option<PathBuf>,
     pub import_path: Option<PathBuf>,
 
+    pub build: BuildState,
+    pub assets: AssetBrowserState,
+
     pub status: String,
 }
 
@@ -229,6 +244,8 @@ impl EditorState {
             load_path: None,
             export_path: None,
             import_path: None,
+            build: BuildState::default(),
+            assets: AssetBrowserState::default(),
             status: "No project loaded.".to_string(),
         }))
     }

@@ -12,17 +12,26 @@ use engine::plugin::{EnginePluginError, Plugin};
 use engine::rendering::camera::Camera;
 use engine::rendering::mesh::Mesh;
 
+use build_tool::{BuildKind, BuildOptions, BuildOutput};
 use project::Project;
 
+use crate::asset_browser::AssetWorker;
 use crate::camera::EditorCameraController;
 use crate::math;
-use crate::state::{LightData, LightDataExt, NodeKind, SceneLight, SceneNode, Selection, SharedState};
+use crate::state::{EditorState, LightData, LightDataExt, NodeKind, SceneLight, SceneNode, Selection, SharedState};
 
 /// TRS of every edited node, used to detect when transforms must be reapplied.
 type TransformSnapshot = Vec<(usize, [f32; 10])>;
 
 /// Quiet period after the last project change before `project.json` is written.
 const PROJECT_SAVE_DELAY: Duration = Duration::from_millis(500);
+/// Lines of build output kept for the build log window.
+const BUILD_LOG_LINES: usize = 4000;
+
+enum BuildEvent {
+    Line(String),
+    Finished(Result<BuildOutput, String>),
+}
 
 pub struct EditorPlugin {
     state: SharedState,
@@ -39,6 +48,8 @@ pub struct EditorPlugin {
     saved_project: Option<Project>,
     /// Unsaved project contents and when they were last changed.
     pending_project: Option<(Project, Instant)>,
+    asset_worker: AssetWorker,
+    build_events: Option<mpsc::Receiver<BuildEvent>>,
 }
 
 impl EditorPlugin {
@@ -56,6 +67,8 @@ impl EditorPlugin {
             applied_entities: 0,
             saved_project: None,
             pending_project: None,
+            asset_worker: AssetWorker::spawn(),
+            build_events: None,
         }
     }
 
@@ -93,6 +106,8 @@ impl Plugin for EditorPlugin {
         self.handle_light_requests(engine);
         self.apply_edits(engine);
         self.sync_project();
+        self.handle_build();
+        self.sync_assets();
 
         if let Some(scene) = &mut self.scene {
             scene.load_batch(&mut engine.world(), 10);
@@ -212,9 +227,12 @@ impl EditorPlugin {
         }
     }
 
-    fn set_project(&mut self, s: &mut crate::state::EditorState, project: Project, dir: PathBuf) {
+    fn set_project(&mut self, s: &mut EditorState, project: Project, dir: PathBuf) {
         s.camera_settings = project.camera.clone();
         s.project_scenes = Project::list_scenes(&dir);
+        s.assets.folder.clear();
+        s.assets.selected = None;
+        self.asset_worker.rescan(&mut s.assets, &dir);
         self.saved_project = Some(project.clone());
         self.pending_project = None;
         s.project = Some(project);
@@ -252,16 +270,20 @@ impl EditorPlugin {
         if let Err(e) = project.save(&dir) {
             s.status = format!("Saving project settings failed: {e:#}");
         }
+        // The default scene and build settings decide what a build ships.
+        self.asset_worker.rescan(&mut s.assets, &dir);
         self.saved_project = Some(project);
     }
 
-    fn refresh_project_scenes(s: &mut crate::state::EditorState) {
-        if let Some(dir) = &s.project_dir {
-            s.project_scenes = Project::list_scenes(dir);
+    /// Re-reads the project's files after something on disk changed.
+    fn refresh_project_files(&self, s: &mut EditorState) {
+        if let Some(dir) = s.project_dir.clone() {
+            s.project_scenes = Project::list_scenes(&dir);
+            self.asset_worker.rescan(&mut s.assets, &dir);
         }
     }
 
-    fn record_recent(s: &mut crate::state::EditorState, name: &str, dir: &Path) {
+    fn record_recent(s: &mut EditorState, name: &str, dir: &Path) {
         s.recent_projects.push(name, dir);
         if let Err(e) = s.recent_projects.save() {
             log::warn!("could not save recent projects: {e}");
@@ -325,7 +347,7 @@ impl EditorPlugin {
             Ok(scene) => {
                 s.status = format!("Imported {}", scene.display());
                 s.load_path = Some(scene);
-                Self::refresh_project_scenes(&mut s);
+                self.refresh_project_files(&mut s);
             }
             Err(e) => s.status = format!("Import failed: {e:#}"),
         }
@@ -348,6 +370,7 @@ impl EditorPlugin {
             Ok(()) => {
                 // Our own write would otherwise trigger a hot reload that drops lights and selection.
                 self.ignore_changes_until = Some(Instant::now() + Duration::from_millis(500));
+                self.refresh_project_files(&mut s);
                 format!("Saved {name}")
             }
             Err(e) => format!("Save failed: {e:#}"),
@@ -389,7 +412,7 @@ impl EditorPlugin {
             };
             let mut s = self.state.lock().expect("editor state mutex poisoned");
             s.export_requested = false;
-            Self::refresh_project_scenes(&mut s);
+            self.refresh_project_files(&mut s);
             s.status = match result {
                 Ok(()) => format!("Exported to {}", path.display()),
                 Err(e) => format!("Export failed: {e}"),
@@ -597,6 +620,92 @@ impl EditorPlugin {
 
         self.applied_transforms = snapshot;
         self.applied_entities = loaded;
+    }
+
+    fn sync_assets(&mut self) {
+        let mut s = self.state.lock().expect("editor state mutex poisoned");
+        if std::mem::take(&mut s.assets.refresh_requested) {
+            self.refresh_project_files(&mut s);
+        }
+        let dir = s.project_dir.clone();
+        self.asset_worker.sync(&mut s.assets, dir.as_deref());
+    }
+
+    /// Runs builds on a background thread, streaming their output into the build log.
+    fn handle_build(&mut self) {
+        let state = Arc::clone(&self.state);
+        let mut s = state.lock().expect("editor state mutex poisoned");
+
+        if let Some(rx) = &self.build_events {
+            let mut finished = None;
+            for event in rx.try_iter() {
+                match event {
+                    BuildEvent::Line(line) => s.build.log.push(line),
+                    BuildEvent::Finished(result) => finished = Some(result),
+                }
+            }
+            let overflow = s.build.log.len().saturating_sub(BUILD_LOG_LINES);
+            s.build.log.drain(..overflow);
+
+            if let Some(result) = finished {
+                let kind = s.build.running.take().unwrap_or(BuildKind::Development);
+                self.build_events = None;
+                match result {
+                    Ok(output) => {
+                        s.status = format!(
+                            "{kind} build finished: {} ({} assets, {})",
+                            output.executable.display(),
+                            output.assets,
+                            build_tool::format_bytes(output.stored_bytes)
+                        );
+                        let line = s.status.clone();
+                        s.build.log.push(line);
+                        s.build.last_output = Some(output.executable);
+                    }
+                    Err(e) => {
+                        s.status = format!("{kind} build failed: {e}");
+                        let line = s.status.clone();
+                        s.build.log.push(line);
+                        s.build.show_log = true;
+                    }
+                }
+                self.refresh_project_files(&mut s);
+            }
+        }
+
+        let Some(kind) = s.build.requested.take() else { return };
+        if s.build.running.is_some() {
+            return;
+        }
+        let Some(dir) = s.project_dir.clone() else { return };
+        if let Some((project, _)) = self.pending_project.take() {
+            if let Err(e) = project.save(&dir) {
+                s.status = format!("Saving project settings failed: {e}");
+                return;
+            }
+            self.saved_project = Some(project);
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let options = BuildOptions::new(dir, kind);
+        let spawned = std::thread::Builder::new().name("build".into()).spawn(move || {
+            let lines = tx.clone();
+            let result = build_tool::build(&options, &mut |line| {
+                let _ = lines.send(BuildEvent::Line(line));
+            });
+            let _ = tx.send(BuildEvent::Finished(result.map_err(|e| e.to_string())));
+        });
+        if let Err(e) = spawned {
+            s.status = format!("Starting build failed: {e}");
+            return;
+        }
+
+        self.build_events = Some(rx);
+        s.build.running = Some(kind);
+        s.build.log.clear();
+        s.build.last_output = None;
+        s.build.show_log = true;
+        s.status = format!("Building {kind}… (uses the saved scene files)");
     }
 
     fn setup_watcher(&mut self, scene_path: &Path, doc: &gltf_api::Document) {

@@ -51,7 +51,7 @@ impl Asset for GLTFAsset {}
 pub struct GLTFAssetResolver;
 
 /// A relative URI naming a file next to the document, percent-decoded. `None` for data URIs.
-fn external_uri(uri: &str) -> Option<Cow<'_, str>> {
+pub fn external_uri(uri: &str) -> Option<Cow<'_, str>> {
     if uri.starts_with("data:") {
         return None;
     }

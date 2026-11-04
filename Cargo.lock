@@ -569,11 +569,13 @@ name = "editor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "build_tool",
  "egui",
  "engine",
  "engine_core",
  "env_logger",
  "gltf 1.4.1",
+ "image",
  "log",
  "notify",
  "project",

@@ -59,12 +59,20 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
             ui.add_enabled_ui(state.project.is_some(), |ui| {
                 ui.menu_button("Project", |ui| draw_project_menu(ui, state));
             });
+            ui.add_enabled_ui(state.project.is_some(), |ui| {
+                ui.menu_button("Build", |ui| super::build::draw_menu(ui, state));
+            });
             ui.menu_button("Camera", |ui| draw_camera_settings(ui, &mut state.camera_settings));
         });
     });
 
     egui::Panel::bottom("statusbar").show(root, |ui| {
-        ui.label(&state.status);
+        ui.horizontal(|ui| {
+            if state.build.running.is_some() {
+                ui.spinner();
+            }
+            ui.label(&state.status);
+        });
     });
 }
 

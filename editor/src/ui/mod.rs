@@ -1,3 +1,5 @@
+mod assets;
+mod build;
 mod gizmo;
 mod hierarchy;
 mod inspector;
@@ -10,11 +12,12 @@ use crate::state::SharedState;
 
 pub struct EditorUiLayer {
     state: SharedState,
+    assets: assets::AssetPanel,
 }
 
 impl EditorUiLayer {
     pub fn new(state: SharedState) -> Self {
-        Self { state }
+        Self { state, assets: assets::AssetPanel::default() }
     }
 }
 
@@ -25,9 +28,11 @@ impl UiLayer for EditorUiLayer {
             toolbar::draw(root, &mut state);
             hierarchy::draw(root, &mut state);
             inspector::draw(root, &mut state);
+            self.assets.draw(root, &mut state);
             root.available_rect_before_wrap()
         });
         gizmo::draw(ctx, &mut state, world, viewport);
+        build::draw_log_window(ctx, &mut state);
         draw_camera_hints(ctx);
     }
 }
