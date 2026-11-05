@@ -79,6 +79,7 @@ impl LightData {
                 up: up.into(),
                 color: color.into(),
                 intensity,
+                two_sided: true,
             }),
         }
     }

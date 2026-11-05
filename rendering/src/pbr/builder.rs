@@ -88,13 +88,13 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         let (camera_pass, camera_buffer_id) = CameraPass::new(&mut graph);
         let camera_node_id = graph.add_pass(device, camera_pass);
 
-        let (light_upload_pass, light_buffers) = LightUploadPass::new(&mut graph);
+        let debug_flags = graph.debug_flags_arc();
+
+        let (light_upload_pass, light_buffers) = LightUploadPass::new(&mut graph, Arc::clone(&debug_flags));
         graph.add_pass(device, light_upload_pass);
 
         let (bvh_pass, bvh_outputs) = BvhUploadPass::new(&mut graph);
         graph.add_pass(device, bvh_pass);
-
-        let debug_flags = graph.debug_flags_arc();
 
         let (probe_atlas_pass, probe_atlas_outputs) =
             ProbeAtlasPass::new(&mut graph, ProbeGridConfig::default(), std::sync::Arc::clone(&debug_flags));

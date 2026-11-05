@@ -264,16 +264,22 @@ struct GpuSpotLight {
     _pad2: f32,
 }
 
-// right_vs / up_vs are half-extent vectors of the rectangle.
+// right_vs / up_vs are half-extent vectors of the rectangle. One-sided lights emit toward right × up.
 struct GpuAreaLight {
     position_vs: vec3<f32>,
     intensity: f32,
     right_vs: vec3<f32>,
-    _pad0: f32,
+    two_sided: f32,
     up_vs: vec3<f32>,
     _pad1: f32,
     color: vec3<f32>,
     _pad2: f32,
+}
+
+// Cosine at an area light for light leaving along `dir`. One-sided lights are dark behind.
+fn area_facing(light: GpuAreaLight, dir: vec3<f32>, normal: vec3<f32>) -> f32 {
+    let c = dot(dir, normal);
+    return select(max(c, 0.0), abs(c), light.two_sided > 0.5);
 }
 
 struct LightCounts {
@@ -521,7 +527,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
             let area     = 4.0 * half_r * half_u;
             let normal   = normalize(cross(r_dir, u_dir));
             let radiance = light.color * light.intensity;
-            let facing   = abs(dot(L, normal));
+            let facing   = area_facing(light, -L, normal);
             color += diffuse_brdf(surf_vs, L) * radiance * (facing * area / (dist2 + area));
 
             // A ray parallel to or facing away from the plane falls back to the closest point.
@@ -541,7 +547,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
             // Karis' sphere-light widening, using the radius of a disc with the rectangle's area.
             let source_r    = sqrt(area / PI);
             let spec_alpha  = clamp(alpha + source_r / (2.0 * sqrt(spec_dist2)), 0.0, 1.0);
-            let spec_facing = abs(dot(L_spec, normal));
+            let spec_facing = area_facing(light, -L_spec, normal);
             color += specular_brdf(surf_vs, L_spec, spec_alpha) * radiance
                 * (spec_facing * area / (spec_dist2 + area));
         }

@@ -22,12 +22,14 @@ pub struct SpotLight {
 
 impl Entity for SpotLight {}
 
+/// `right` / `up` are half-extent vectors. A one-sided light emits only toward `right × up`.
 pub struct AreaLight {
     pub position: Vec3,
     pub right: Vec3,
     pub up: Vec3,
     pub color: Vec3,
     pub intensity: f32,
+    pub two_sided: bool,
 }
 
 impl Entity for AreaLight {}

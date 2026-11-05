@@ -1,3 +1,4 @@
+pub mod emissive;
 mod entity;
 mod gpu;
 

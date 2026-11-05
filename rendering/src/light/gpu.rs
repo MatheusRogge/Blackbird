@@ -26,7 +26,8 @@ pub struct GpuAreaLight {
     pub position_vs: [f32; 3],
     pub intensity: f32,
     pub right_vs: [f32; 3],
-    pub _pad0: f32,
+    /// 1 = emits from both faces, 0 = only toward `right × up`.
+    pub two_sided: f32,
     pub up_vs: [f32; 3],
     pub _pad1: f32,
     pub color: [f32; 3],

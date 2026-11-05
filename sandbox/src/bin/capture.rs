@@ -7,7 +7,7 @@
 //!   --eye x,y,z          camera position (default: the scene's main camera)
 //!   --target x,y,z       point the camera looks at
 //!   --exposure E         linear exposure override
-//!   --no-specular --no-reflections --no-ssr --no-indirect --no-direct --no-shadows
+//!   --no-specular --no-reflections --no-ssr --no-emissive-lights --no-indirect --no-direct --no-shadows
 //!   --view lit|albedo|normal|material|emissive
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
 //! ```
@@ -84,6 +84,7 @@ fn parse_args() -> Result<Options> {
             "--no-specular" => flags.specular = false,
             "--no-reflections" => flags.reflections = false,
             "--no-ssr" => flags.ssr = false,
+            "--no-emissive-lights" => flags.emissive_lights = false,
             "--no-indirect" => flags.indirect = false,
             "--no-direct" => flags.direct = false,
             "--no-shadows" => flags.shadows = false,

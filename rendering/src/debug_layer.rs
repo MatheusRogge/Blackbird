@@ -101,6 +101,7 @@ impl UiLayer for DebugLayer {
                     ui.checkbox(&mut flags.indirect, "Indirect (GI)");
                     ui.checkbox(&mut flags.direct, "Direct lights");
                     ui.checkbox(&mut flags.shadows, "Shadows");
+                    ui.checkbox(&mut flags.emissive_lights, "Emissive lights");
                     ui.checkbox(&mut flags.specular, "Specular");
                     ui.checkbox(&mut flags.reflections, "Reflections");
                     ui.add_enabled_ui(flags.reflections, |ui| {

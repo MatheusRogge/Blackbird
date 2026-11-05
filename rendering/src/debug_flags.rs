@@ -46,6 +46,8 @@ pub struct RenderDebugFlags {
     pub direct:   bool,
     pub shadows:  bool,
     pub specular: bool,
+    /// Area lights generated from flat emissive meshes (`light_upload`).
+    pub emissive_lights: bool,
     /// SSR and the probe fallback. Direct highlights stay.
     pub reflections: bool,
     /// Screen-space reflections only: with this off, reflections come from the probe fallback alone.
@@ -73,6 +75,7 @@ impl Default for RenderDebugFlags {
             direct:   true,
             shadows:  true,
             specular: true,
+            emissive_lights: true,
             reflections: true,
             ssr: true,
             view:     GBufferView::Lit,
