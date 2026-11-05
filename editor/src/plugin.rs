@@ -125,8 +125,16 @@ impl Plugin for EditorPlugin {
         self.handle_build();
         self.sync_assets();
 
-        if let Some(scene) = &mut self.scene {
-            scene.load_batch(&mut engine.world(), 10);
+        if let Some(scene) = &mut self.scene
+            && !scene.is_complete()
+        {
+            let mut world = engine.world();
+            scene.load_batch(&mut world, 10);
+            // The renderer draws from the first camera, which after `World::clear` can be a scene
+            // camera rather than the editor's. Camera nodes are edited through `node_edits` instead.
+            for &key in scene.node_cameras().values() {
+                world.remove_entity(key);
+            }
         }
         self.apply_node_transforms(engine);
 

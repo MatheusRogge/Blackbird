@@ -70,6 +70,7 @@ Mesh entities map back to glTF nodes through `GltfScene::node_entities` / `state
 - A node carrying a `KHR_lights_punctual` light is `NodeKind::Light`. Clicking it in the hierarchy selects its `SceneLight` (`Selection::Light`), never the node, because on save the light's position/direction overwrite the node's TRS. A node that also has a mesh or camera stays selectable as a node, so moving it won't move the light.
 - Unknown glTF extensions survive save/export only because of the gltf `extensions` feature (they land in each struct's `others` map). Don't drop that feature.
 - Light intensities are physical (lux for sky, candela for point/spot, nits for area). Exposure lives in `CameraSettings::exposure_stops` (Camera menu, `project.json`) and `EditorCameraController` copies `2^stops` into `Camera::exposure` each tick.
+- The editor removes the camera entities `GltfScene` spawns, so the editor camera is the only `Camera` and the renderer draws from it (otherwise slot reuse after `World::clear` makes a scene camera win). Camera nodes are edited via `node_edits` and seen through Assume Camera View.
 - `node_edits` is keyed by glTF node index, and `ensure_node_edit` looks the node up with `doc.nodes().nth(idx)`.
 - Shaders come from `../../sandbox/shaders/` through `include_str!`.
 - Builds read the **saved** scene files, not the editor's in-memory edits. Save first.

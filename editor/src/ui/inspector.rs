@@ -367,6 +367,7 @@ fn draw_camera(ui: &mut egui::Ui, camera: &mut CameraEdit, is_main: &mut bool, p
                         ui.end_row();
                     });
                 ui.label(egui::RichText::new(format!("EV₁₀₀ {:.1}", p.ev100())).weak());
+                ui.label(egui::RichText::new("Visible through Assume Camera View and in the player.").small().weak());
             }
             None => {
                 ui.label(egui::RichText::new(format!("Uses the project exposure ({project_stops:+.1} EV, Camera menu)")).weak());
