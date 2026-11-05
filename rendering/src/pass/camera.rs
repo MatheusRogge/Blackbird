@@ -12,6 +12,8 @@ struct CameraUniform {
     pub view_proj: [[f32; 4]; 4],
     pub inv_view_proj: [[f32; 4]; 4],
     pub inv_view: [[f32; 4]; 4],
+    /// near, far, 0, 0. For linearizing reversed-Z depth.
+    pub depth_params: [f32; 4],
 }
 
 impl CameraUniform {
@@ -21,6 +23,7 @@ impl CameraUniform {
             view_proj: view_proj.into(),
             inv_view_proj: view_proj.inversed().into(),
             inv_view: camera.view_matrix().inversed().into(),
+            depth_params: [camera.near, camera.far, 0.0, 0.0],
         }
     }
 }

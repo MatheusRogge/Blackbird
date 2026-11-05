@@ -18,8 +18,19 @@ use crate::{
 };
 
 pub struct LightingOutputs {
+    /// Diffuse + direct specular. Indirect specular is left to `composite`.
     pub lit_id: ResourceId,
+    /// Rgba8Unorm. RGB: split-sum env BRDF weight for reflections, 0 where nothing should reflect
+    /// (sky, debug views, specular or GI disabled). A: roughness.
+    pub specular_weight_id: ResourceId,
+    /// Rgba16Float. Probe irradiance around the reflection vector × weight, exposed: the
+    /// reflection where SSR has nothing.
+    pub specular_fallback_id: ResourceId,
+    /// Uniform `DebugFlagsGpu`, uploaded by this pass every frame.
+    pub debug_flags_id: ResourceId,
 }
+
+pub const SPECULAR_WEIGHT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 pub struct LightingPass {
     node_id: Option<NodeId>,
@@ -47,6 +58,8 @@ pub struct LightingPass {
     shadow_params_id: ResourceId,
 
     lit_id: ResourceId,
+    specular_weight_id: ResourceId,
+    specular_fallback_id: ResourceId,
     surface_format: wgpu::TextureFormat,
 
     // cluster_bg only binds buffers — cached indefinitely.
@@ -95,12 +108,21 @@ impl LightingPass {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         });
 
+        let specular_weight_id = graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
+            format: SPECULAR_WEIGHT_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        });
+        let specular_fallback_id = graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        });
+
         let debug_flags_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: std::mem::size_of::<DebugFlagsGpu>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let outputs = LightingOutputs { lit_id };
+        let outputs = LightingOutputs { lit_id, specular_weight_id, specular_fallback_id, debug_flags_id };
 
         (
             Self {
@@ -125,6 +147,8 @@ impl LightingPass {
                 shadow_map_id: shadow.shadow_map_id,
                 shadow_params_id: shadow.shadow_params_id,
                 lit_id,
+                specular_weight_id,
+                specular_fallback_id,
                 surface_format: wgpu::TextureFormat::Rgba16Float,
                 cluster_bg: None,
                 gbuffer_bg: None,
@@ -184,7 +208,7 @@ impl PassDesc for LightingPass {
     }
 
     fn writes(&self) -> Vec<ResourceId> {
-        vec![self.lit_id, self.debug_flags_id]
+        vec![self.lit_id, self.specular_weight_id, self.specular_fallback_id, self.debug_flags_id]
     }
 }
 
@@ -207,6 +231,12 @@ impl Pass for LightingPass {
         _world: &World,
     ) {
         let Some(&lit_view) = ctx.views.get(&self.lit_id) else {
+            return;
+        };
+
+        let (Some(&specular_weight_view), Some(&specular_fallback_view)) =
+            (ctx.views.get(&self.specular_weight_id), ctx.views.get(&self.specular_fallback_id))
+        else {
             return;
         };
 
@@ -560,11 +590,23 @@ impl Pass for LightingPass {
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
                     entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: self.surface_format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
+                    targets: &[
+                        Some(wgpu::ColorTargetState {
+                            format: self.surface_format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: SPECULAR_WEIGHT_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                    ],
                     compilation_options: Default::default(),
                 }),
                 primitive: wgpu::PrimitiveState::default(),
@@ -766,15 +808,17 @@ impl Pass for LightingPass {
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("lighting"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: lit_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    store: wgpu::StoreOp::Store,
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                },
-            })],
+            color_attachments: &[lit_view, specular_weight_view, specular_fallback_view].map(|view| {
+                Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        store: wgpu::StoreOp::Store,
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    },
+                })
+            }),
             depth_stencil_attachment: None,
             ..Default::default()
         });

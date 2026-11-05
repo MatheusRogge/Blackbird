@@ -9,7 +9,8 @@ pub struct DebugFlagsGpu {
     pub disable_shadows:  u32,
     pub view:             u32,
     pub disable_specular: u32,
-    pub _pad:             [u32; 2],
+    pub disable_reflections: u32,
+    pub disable_ssr:      u32,
 }
 
 /// What the `lighting` pass outputs: the lit image, or one G-buffer target as-is.
@@ -42,6 +43,10 @@ pub struct RenderDebugFlags {
     pub direct:   bool,
     pub shadows:  bool,
     pub specular: bool,
+    /// SSR and the probe fallback. Direct highlights stay.
+    pub reflections: bool,
+    /// Screen-space reflections only: with this off, reflections come from the probe fallback alone.
+    pub ssr: bool,
     pub view:     GBufferView,
 
     pub show_bvh:        bool,
@@ -65,6 +70,8 @@ impl Default for RenderDebugFlags {
             direct:   true,
             shadows:  true,
             specular: true,
+            reflections: true,
+            ssr: true,
             view:     GBufferView::Lit,
 
             show_bvh:        false,
@@ -91,7 +98,8 @@ impl RenderDebugFlags {
             disable_shadows:  !self.shadows as u32,
             view:             self.view as u32,
             disable_specular: !self.specular as u32,
-            _pad:             [0; 2],
+            disable_reflections: !self.reflections as u32,
+            disable_ssr:      !self.ssr as u32,
         }
     }
 }

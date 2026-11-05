@@ -108,6 +108,13 @@ fn draw_view_menu(ui: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<Ren
         state.show_gizmos = !state.show_gizmos;
     }
     ui.separator();
+    if ui.add(egui::Button::selectable(flags.reflections, "Reflections")).clicked() {
+        flags.reflections = !flags.reflections;
+    }
+    let ssr = egui::Button::selectable(flags.ssr, "Screen-space reflections");
+    if ui.add_enabled(flags.reflections, ssr).clicked() {
+        flags.ssr = !flags.ssr;
+    }
     ui.menu_button("G-buffer view", |ui| {
         for view in GBufferView::ALL {
             ui.radio_value(&mut flags.view, view, view.label());

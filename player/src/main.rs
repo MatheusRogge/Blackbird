@@ -105,6 +105,8 @@ fn main() -> Result<()> {
         ShaderAsset::from_raw(include_str!("../../sandbox/shaders/probe_trace.wgsl")),
         ShaderAsset::from_raw(include_str!("../../sandbox/shaders/probe_update.wgsl")),
         ShaderAsset::from_raw(include_str!("../../sandbox/shaders/debug_overlay.wgsl")),
+        ShaderAsset::from_raw(include_str!("../../sandbox/shaders/ssr.wgsl")),
+        ShaderAsset::from_raw(include_str!("../../sandbox/shaders/composite.wgsl")),
     );
 
     #[cfg(feature = "dev")]

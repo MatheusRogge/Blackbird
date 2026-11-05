@@ -44,6 +44,8 @@ struct DebugFlags {
     // 0 lit, 1 albedo, 2 normal, 3 material (rendering::debug_flags::GBufferView).
     view:             u32,
     disable_specular: u32,
+    disable_reflections: u32,
+    disable_ssr:      u32,
 }
 
 @group(4) @binding(0) var<uniform> debug: DebugFlags;
@@ -352,8 +354,21 @@ fn sky_color(ray_dir: vec3<f32>) -> vec3<f32> {
     return col;
 }
 
+struct LightingOutput {
+    // Diffuse + direct specular.
+    @location(0) lit: vec4<f32>,
+    // rgb: env BRDF weight for reflections (0 = no reflection), a: roughness.
+    @location(1) specular_weight: vec4<f32>,
+    // Probe-based reflection × weight, exposed. The composite pass uses it where SSR misses.
+    @location(2) specular_fallback: vec4<f32>,
+}
+
+fn unreflective(color: vec3<f32>) -> LightingOutput {
+    return LightingOutput(vec4f(color, 1.0), vec4f(0.0), vec4f(0.0));
+}
+
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOutput) -> LightingOutput {
     let frag_xy = vec2<i32>(i32(in.pos.x), i32(in.pos.y));
 
     let ndc_x = in.pos.x / cp.screen_w * 2.0 - 1.0;
@@ -364,18 +379,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Reversed-Z: depth_v == 0 means "at far plane / sky" — no geometry.
     if depth_v == 0.0 {
         if cp.num_sky_lights == 0u {
-            return vec4f(0.0, 0.0, 0.0, 1.0);
+            return unreflective(vec3f(0.0));
         }
         let far_ws4  = camera.inv_view_proj * vec4f(ndc_x, ndc_y, 0.0, 1.0);
         let near_ws4 = camera.inv_view_proj * vec4f(ndc_x, ndc_y, 1.0, 1.0);
         let ray_dir  = normalize(far_ws4.xyz / far_ws4.w - near_ws4.xyz / near_ws4.w);
-        return vec4f(sky_color(ray_dir) * cp.exposure, 1.0);
+        return unreflective(sky_color(ray_dir) * cp.exposure);
     }
 
     switch debug.view {
-        case 1u: { return vec4f(textureSample(t_albedo, s_linear, in.uv).rgb, 1.0); }
-        case 2u: { return vec4f(textureSample(t_normal, s_linear, in.uv).rgb, 1.0); }
-        case 3u: { return vec4f(textureSample(t_material, s_linear, in.uv).rgb, 1.0); }
+        case 1u: { return unreflective(textureSample(t_albedo, s_linear, in.uv).rgb); }
+        case 2u: { return unreflective(textureSample(t_normal, s_linear, in.uv).rgb); }
+        case 3u: { return unreflective(textureSample(t_material, s_linear, in.uv).rgb); }
         default: {}
     }
 
@@ -415,7 +430,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Debug: visualise light density per cluster.
     if cp.debug_mode == 1u {
         let heat = f32(light_count) / f32(MAX_LIGHTS_PER_CLUSTER);
-        return vec4<f32>(heat, 0.3, 1.0 - heat, 1.0);
+        return unreflective(vec3f(heat, 0.3, 1.0 - heat));
     }
 
     let cam_pos  = camera.inv_view[3].xyz;
@@ -429,16 +444,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let surf_ws = Surface(N, view_dir, diffuse_color, f0, alpha);
 
     var color = vec3f(0.0);
+    var out: LightingOutput;
     if debug.disable_indirect == 0u {
         color = diffuse_color * sample_probe_irradiance(pos_ws, N, N, view_dir);
 
-        // Stand-in for reflections: probe irradiance around the reflection vector, leaning toward
-        // N as roughness grows (Filament's dominant direction).
-        if debug.disable_specular == 0u {
+        // Reflections are added by the composite pass: SSR where it hits, else probe irradiance
+        // around the reflection vector, leaning toward N as roughness grows (Filament's dominant
+        // direction).
+        if debug.disable_specular == 0u && debug.disable_reflections == 0u {
             let n_dot_v = max(dot(N, view_dir), 1e-4);
             let R = normalize(mix(reflect(-view_dir, N), N, alpha));
+            let weight = env_brdf_approx(f0, roughness, n_dot_v);
             let env = sample_probe_irradiance(pos_ws, N, R, view_dir);
-            color += env * env_brdf_approx(f0, roughness, n_dot_v);
+            out.specular_weight = vec4f(weight, roughness);
+            out.specular_fallback = vec4f(env * weight * cp.exposure, 1.0);
         }
     }
 
@@ -556,5 +575,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    return vec4<f32>(color * cp.exposure, 1.0);
+    out.lit = vec4<f32>(color * cp.exposure, 1.0);
+    return out;
 }

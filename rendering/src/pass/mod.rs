@@ -1,6 +1,7 @@
 pub mod bvh_upload;
 pub mod camera;
 pub mod debug_overlay;
+pub mod fullscreen;
 pub mod cluster_assignment;
 pub mod gbuffer;
 pub mod light_upload;

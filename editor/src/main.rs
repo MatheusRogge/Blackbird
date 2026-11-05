@@ -40,6 +40,8 @@ fn main() -> anyhow::Result<()> {
     let probe_trace      = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/probe_trace.wgsl"));
     let probe_update     = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/probe_update.wgsl"));
     let debug_overlay    = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/debug_overlay.wgsl"));
+    let ssr              = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/ssr.wgsl"));
+    let composite        = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/composite.wgsl"));
 
     let debug_flags = Arc::new(RwLock::new(RenderDebugFlags {
         show_grid: true,
@@ -55,6 +57,8 @@ fn main() -> anyhow::Result<()> {
         probe_trace,
         probe_update,
         debug_overlay,
+        ssr,
+        composite,
     ).with_debug_flags(debug_flags.clone());
 
     WindowedApplication::new(render_graph)

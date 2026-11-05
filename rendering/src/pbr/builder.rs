@@ -8,6 +8,7 @@ use crate::{
         camera::CameraPass,
         cluster_assignment::ClusterAssignmentPass,
         debug_overlay::DebugOverlayPass,
+        fullscreen::{FullscreenInput, FullscreenPass},
         gbuffer::GBufferPass,
         light_upload::LightUploadPass,
         lighting::LightingPass,
@@ -31,6 +32,8 @@ pub struct RenderGraphPBRBuilder {
     probe_trace_shader:    ShaderAsset,
     probe_update_shader:   ShaderAsset,
     debug_overlay_shader:  ShaderAsset,
+    ssr_shader:            ShaderAsset,
+    composite_shader:      ShaderAsset,
     debug_flags:           Option<Arc<RwLock<RenderDebugFlags>>>,
 }
 
@@ -45,6 +48,8 @@ impl RenderGraphPBRBuilder {
         probe_trace_shader:   ShaderAsset,
         probe_update_shader:  ShaderAsset,
         debug_overlay_shader: ShaderAsset,
+        ssr_shader:           ShaderAsset,
+        composite_shader:     ShaderAsset,
     ) -> Self {
         Self {
             gbuffer_shader,
@@ -55,6 +60,8 @@ impl RenderGraphPBRBuilder {
             probe_trace_shader,
             probe_update_shader,
             debug_overlay_shader,
+            ssr_shader,
+            composite_shader,
             debug_flags: None,
         }
     }
@@ -140,6 +147,36 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         );
         graph.add_pass(device, lighting_pass);
 
+        let (ssr_pass, ssr_id) = FullscreenPass::new(
+            &mut graph,
+            "ssr",
+            vec![
+                FullscreenInput::Depth(gbuffer_outputs.depth_id),
+                FullscreenInput::Color(gbuffer_outputs.normal_id),
+                FullscreenInput::Color(lighting_outputs.lit_id),
+                FullscreenInput::Color(lighting_outputs.specular_weight_id),
+            ],
+            vec![camera_buffer_id, lighting_outputs.debug_flags_id],
+            wgpu::TextureFormat::Rgba16Float,
+            self.ssr_shader,
+        );
+        graph.add_pass(device, ssr_pass);
+
+        let (composite_pass, composite_id) = FullscreenPass::new(
+            &mut graph,
+            "composite",
+            vec![
+                FullscreenInput::Color(lighting_outputs.lit_id),
+                FullscreenInput::Color(lighting_outputs.specular_weight_id),
+                FullscreenInput::Color(lighting_outputs.specular_fallback_id),
+                FullscreenInput::Color(ssr_id),
+            ],
+            vec![],
+            wgpu::TextureFormat::Rgba16Float,
+            self.composite_shader,
+        );
+        graph.add_pass(device, composite_pass);
+
         let (debug_overlay_pass, debug_overlay_outputs) = DebugOverlayPass::new(
             &mut graph,
             bvh_outputs.nodes_id,
@@ -153,7 +190,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         graph.add_pass(device, debug_overlay_pass);
 
         let present_pass = PresentPass::new(
-            lighting_outputs.lit_id,
+            composite_id,
             debug_overlay_outputs.debug_overlay_id,
             surface_view_id,
             surface_config.format,

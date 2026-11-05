@@ -12,9 +12,9 @@ Demo binaries and the **canonical location of the PBR WGSL shaders**. Depends on
 Run with `cargo run -p sandbox` or `cargo run -p sandbox --bin sprites`.
 
 ## Shaders (`shaders/`)
-Embedded at compile time with `include_str!` and passed to `RenderGraphPBRBuilder::new` in this order: `gbuffer`, `cluster_assignment`, `lighting`, `present`, `shadow`, `probe_trace`, `probe_update`, `debug_overlay`.
+Embedded at compile time with `include_str!` and passed to `RenderGraphPBRBuilder::new` in this order: `gbuffer`, `cluster_assignment`, `lighting`, `present`, `shadow`, `probe_trace`, `probe_update`, `debug_overlay`, `ssr`, `composite`.
 
-`editor` also `include_str!`s these same files through `../../sandbox/shaders/…`, so renaming or moving a shader breaks both binaries.
+`editor` and `player` also `include_str!` these same files through `../../sandbox/shaders/…`, so renaming or moving a shader breaks all of them.
 
 - There is **no include/preprocessor system**. Shared code (octahedral encoding, `ProbeGridParams`, `CameraUniform`, …) is copy-pasted into every shader that needs it. `probe_helpers.wgsl` is not referenced by anything.
 - `sdf_voxelize.wgsl` belongs to the unused `SdfVoxelizePass` (see `rendering/AGENTS.md`).

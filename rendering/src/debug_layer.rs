@@ -102,6 +102,12 @@ impl UiLayer for DebugLayer {
                     ui.checkbox(&mut flags.direct, "Direct lights");
                     ui.checkbox(&mut flags.shadows, "Shadows");
                     ui.checkbox(&mut flags.specular, "Specular");
+                    ui.checkbox(&mut flags.reflections, "Reflections");
+                    ui.add_enabled_ui(flags.reflections, |ui| {
+                        ui.indent("reflections_indent", |ui| {
+                            ui.checkbox(&mut flags.ssr, "Screen-space");
+                        });
+                    });
                     egui::ComboBox::from_label("View")
                         .selected_text(flags.view.label())
                         .show_ui(ui, |ui| {

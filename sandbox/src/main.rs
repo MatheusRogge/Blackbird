@@ -117,6 +117,8 @@ fn main() -> anyhow::Result<()> {
     let probe_trace_shader    = ShaderAsset::from_raw(include_str!("../shaders/probe_trace.wgsl"));
     let probe_update_shader   = ShaderAsset::from_raw(include_str!("../shaders/probe_update.wgsl"));
     let debug_overlay_shader  = ShaderAsset::from_raw(include_str!("../shaders/debug_overlay.wgsl"));
+    let ssr_shader            = ShaderAsset::from_raw(include_str!("../shaders/ssr.wgsl"));
+    let composite_shader      = ShaderAsset::from_raw(include_str!("../shaders/composite.wgsl"));
 
     let render_graph = RenderGraphPBRBuilder::new(
         gbuffer_shader,
@@ -127,6 +129,8 @@ fn main() -> anyhow::Result<()> {
         probe_trace_shader,
         probe_update_shader,
         debug_overlay_shader,
+        ssr_shader,
+        composite_shader,
     );
 
     WindowedApplication::new(render_graph)
