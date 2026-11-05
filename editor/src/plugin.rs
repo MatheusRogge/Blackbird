@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use engine::Engine;
 use engine::EntityKey;
 use engine::assets::AssetLoadHandle;
+use engine::gltf::camera::INFINITE_FAR;
 use engine::gltf::{GLTFAsset, GltfScene};
 use engine::plugin::{EnginePluginError, Plugin};
 use engine::rendering::camera::Camera;
@@ -17,8 +18,7 @@ use project::Project;
 
 use crate::asset_browser::AssetWorker;
 use crate::camera::EditorCameraController;
-use crate::math;
-use crate::state::{EditorState, LightData, LightDataExt, NodeKind, SceneLight, SceneNode, Selection, SharedState};
+use crate::state::{EditorState, LightData, LightDataExt, NodeKind, SceneLight, SceneNode, SharedState};
 
 /// TRS of every edited node, used to detect when transforms must be reapplied.
 type TransformSnapshot = Vec<(usize, [f32; 10])>;
@@ -27,6 +27,10 @@ type TransformSnapshot = Vec<(usize, [f32; 10])>;
 const PROJECT_SAVE_DELAY: Duration = Duration::from_millis(500);
 /// Lines of build output kept for the build log window.
 const BUILD_LOG_LINES: usize = 4000;
+/// Lens of the editor's viewport camera, restored after Assume Camera View.
+const EDITOR_FOV_Y_DEG: f32 = 45.0;
+const EDITOR_NEAR: f32 = 0.01;
+const EDITOR_FAR: f32 = 10000.0;
 
 enum BuildEvent {
     Line(String),
@@ -79,10 +83,10 @@ impl EditorPlugin {
             up: (0.0, 1.0, 0.0).into(),
             eye: (0.0, 5.0, 15.0).into(),
             target: (0.0, 0.0, 0.0).into(),
-            aspect: 16.0 / 9.0,
-            fovy: 45.0_f32.to_radians(),
-            near: 0.01,
-            far: 10000.0,
+            aspect: None,
+            fovy: EDITOR_FOV_Y_DEG.to_radians(),
+            near: EDITOR_NEAR,
+            far: EDITOR_FAR,
             exposure: 1.0,
         });
         self.camera_controller = Some(EditorCameraController::new(camera_key));
@@ -441,6 +445,7 @@ impl EditorPlugin {
         s.node_edits.clear();
         s.selected = None;
         s.camera_preview_node = None;
+        s.main_camera = None;
         s.open_requested = false;
         s.status = "Loading…".to_string();
     }
@@ -472,6 +477,10 @@ impl EditorPlugin {
                         .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
                         .unwrap_or_default();
                     s.document = Some(doc.clone());
+                    s.main_camera = doc
+                        .default_scene()
+                        .or_else(|| doc.scenes().next())
+                        .and_then(|scene| engine::gltf::camera::main_camera(&scene));
                     s.scene_nodes = nodes;
                     s.node_parents = doc
                         .nodes()
@@ -521,53 +530,33 @@ impl EditorPlugin {
         }
 
         let s = self.state.lock().expect("editor state mutex poisoned");
+        let Some(cam_key) = s.editor_camera_key else { return };
+        let preview = s.camera_preview_node.and_then(|idx| {
+            let camera = s.node_edits.get(&idx)?.camera.clone()?;
+            Some((s.node_world(idx), camera))
+        });
+        let project_exposure = s.camera_settings.exposure();
+        drop(s);
 
-        if let (Some(cam_key), Some(idx)) = (s.editor_camera_key, s.camera_preview_node) {
-            if let Some(edit) = s.node_edits.get(&idx) {
-                let [tx, ty, tz] = edit.translation;
-                let [qx, qy, qz, qw] = edit.rotation;
-                let fov = edit.fov_y_deg;
-                let near = edit.near_plane;
-                let far = edit.far_plane;
-                drop(s);
-
-                let eye = ultraviolet::Vec3::new(tx, ty, tz);
-                let rotation = [qx, qy, qz, qw];
-                let forward = math::rotate(rotation, ultraviolet::Vec3::new(0.0, 0.0, -1.0));
-                let up = math::rotate(rotation, ultraviolet::Vec3::new(0.0, 1.0, 0.0));
-
-                let mut world = engine.world();
-                if let Some(cam) = world.get_entity_mut::<Camera>(cam_key) {
-                    cam.eye = eye;
-                    cam.target = eye + forward;
-                    cam.up = up;
-                    if let Some(fov_deg) = fov { cam.fovy = fov_deg.to_radians(); }
-                    if let Some(n) = near { cam.near = n; }
-                    if let Some(f) = far { cam.far = f; }
-                }
-            } else {
-                drop(s);
+        let mut world = engine.world();
+        let Some(cam) = world.get_entity_mut::<Camera>(cam_key) else { return };
+        match preview {
+            Some((node_world, edit)) => {
+                cam.eye = node_world.extract_translation();
+                cam.target = cam.eye + node_world.transform_vec3(-ultraviolet::Vec3::unit_z()).normalized();
+                cam.up = node_world.transform_vec3(ultraviolet::Vec3::unit_y()).normalized();
+                cam.fovy = edit.fov_y_deg.to_radians();
+                cam.near = edit.near;
+                cam.far = edit.far.unwrap_or(INFINITE_FAR);
+                cam.aspect = edit.aspect;
+                cam.exposure = edit.physical.map_or(project_exposure, |p| p.exposure());
             }
-            return;
-        }
-
-        if let (Some(cam_key), Some(Selection::GltfNode(idx))) =
-            (s.editor_camera_key, s.selected.clone())
-        {
-            let edit = s.node_edits.get(&idx).cloned();
-            drop(s);
-            if let Some(edit) = edit {
-                let mut world = engine.world();
-                if let Some(cam) = world.get_entity_mut::<Camera>(cam_key) {
-                    if let Some(fov_deg) = edit.fov_y_deg {
-                        cam.fovy = fov_deg.to_radians();
-                    }
-                    if let Some(near) = edit.near_plane { cam.near = near; }
-                    if let Some(far) = edit.far_plane { cam.far = far; }
-                }
+            None => {
+                cam.fovy = EDITOR_FOV_Y_DEG.to_radians();
+                cam.near = EDITOR_NEAR;
+                cam.far = EDITOR_FAR;
+                cam.aspect = None;
             }
-        } else {
-            drop(s);
         }
     }
 

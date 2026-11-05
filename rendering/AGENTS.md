@@ -17,7 +17,7 @@ wgpu 30 renderer (Vulkan backend forced). Contains the render graph, every rende
 | `pass` | `Pass` / `PassDesc` traits, `PassContext`, and every PBR pass (below) |
 | `pbr` | `RenderGraphPBRBuilder`, which wires the full 3D pipeline |
 | `rendering_2d` | `Sprite`, `SpriteTexture`, `Camera2D`, `SpritePass`, `SpriteRenderGraphBuilder` (shader embedded in-crate) |
-| `camera` | `Camera` entity (`eye/target/up/fovy/aspect/near/far/exposure`). **Reversed-Z** projection. `exposure` is a linear multiplier applied in `lighting.wgsl` (pre-exposure, before `present`'s ACES). Implements `Controllable`. |
+| `camera` | `Camera` entity (`eye/target/up/fovy/aspect/near/far/exposure`). `aspect: None` follows the viewport: passes resolve it with `aspect_or(surface w/h)`, and `view_proj_matrix` takes the viewport aspect. **Reversed-Z** projection. `exposure` is a linear multiplier applied in `lighting.wgsl` (pre-exposure, before `present`'s ACES). Implements `Controllable`. |
 | `camera_controller` | `CameraController` (`FirstPerson` / `ThirdPerson` orbit + scroll zoom; respects `ui_wants_pointer`) |
 | `light` | Entities `PointLight`, `SpotLight`, `AreaLight`, `SkyLight` + `Gpu*` structs, `LightCounts`, `MAX_*_LIGHTS` (256/64/32/4) |
 | `mesh` | `Vertex` (pos, normal, color, uv, tangent), `Mesh` entity (+ optional albedo/normal `Arc<TextureAsset>`, `alpha_cutoff: Option<f32>` (glTF `MASK`), `double_sided`, `transform: Mat4` local→world; `is_masked()` = either of those two), `MeshBatch` |

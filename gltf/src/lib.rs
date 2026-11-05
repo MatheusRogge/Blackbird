@@ -1,3 +1,4 @@
+pub mod camera;
 pub mod lights;
 
 use assets::{Asset, AssetError, AssetResolver, LoadContext};
@@ -302,6 +303,7 @@ pub struct GltfScene {
     cameras_loaded: bool,
     textures: TextureCache,
     node_entities: HashMap<usize, Vec<EntityKey>>,
+    node_cameras: HashMap<usize, EntityKey>,
 }
 
 impl GltfScene {
@@ -313,7 +315,12 @@ impl GltfScene {
             cameras_loaded: false,
             textures: TextureCache::default(),
             node_entities: HashMap::new(),
+            node_cameras: HashMap::new(),
         }
+    }
+
+    pub fn document(&self) -> &gltf::Document {
+        &self.asset.document
     }
 
     pub fn is_complete(&self) -> bool {
@@ -326,11 +333,23 @@ impl GltfScene {
         &self.node_entities
     }
 
+    /// Camera entities keyed by glTF node index. Created by the first `load_batch`.
+    pub fn node_cameras(&self) -> &HashMap<usize, EntityKey> {
+        &self.node_cameras
+    }
+
+    /// The camera entity of the node the scene marks as its main camera.
+    pub fn main_camera(&self) -> Option<EntityKey> {
+        let document = &self.asset.document;
+        let scene = document.default_scene().or_else(|| document.scenes().next())?;
+        self.node_cameras.get(&camera::main_camera(&scene)?).copied()
+    }
+
     /// Inserts the meshes of up to `count` nodes into `world`, each placed at its
     /// node's world transform. Returns `true` if more remain.
     pub fn load_batch(&mut self, world: &mut World, count: usize) -> bool {
         if !self.cameras_loaded {
-            load_cameras(&self.asset.document, world);
+            self.node_cameras = load_cameras(&self.asset.document, world);
             self.cameras_loaded = true;
         }
 
@@ -352,23 +371,27 @@ impl GltfScene {
     }
 }
 
-/// Each perspective camera node becomes a `Camera` looking down the node's −Z.
-fn load_cameras(document: &gltf::Document, world: &mut World) {
+/// Each perspective camera node becomes a `Camera` looking down the node's −Z. Exposure is
+/// 1 unless the camera has physical settings.
+fn load_cameras(document: &gltf::Document, world: &mut World) -> HashMap<usize, EntityKey> {
+    let mut cameras = HashMap::new();
     visit_scene(document, |node, transform| {
         let Some(camera) = node.camera() else { return };
         let gltf::camera::Projection::Perspective(perspective) = camera.projection() else { return };
         let eye = transform.cols[3].xyz();
         let forward = (transform * Vec4::new(0.0, 0.0, -1.0, 0.0)).xyz().normalized();
         let up = (transform * Vec4::new(0.0, 1.0, 0.0, 0.0)).xyz().normalized();
-        world.add_entity(Camera {
+        let key = world.add_entity(Camera {
             fovy: perspective.yfov(),
             near: perspective.znear(),
-            far: perspective.zfar().unwrap_or(1000.0),
-            exposure: 1.0,
-            aspect: perspective.aspect_ratio().unwrap_or(4.0 / 3.0),
+            far: perspective.zfar().unwrap_or(crate::camera::INFINITE_FAR),
+            exposure: crate::camera::PhysicalCamera::read(&camera).map_or(1.0, |p| p.exposure()),
+            aspect: perspective.aspect_ratio(),
             up,
             eye,
             target: eye + forward,
         });
+        cameras.insert(node.index(), key);
     });
+    cameras
 }

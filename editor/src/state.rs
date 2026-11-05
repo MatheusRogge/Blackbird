@@ -6,6 +6,7 @@ use engine_core::entity::EntityKey;
 use gltf_api::Document;
 use ultraviolet::Mat4;
 
+pub use engine::gltf::camera::PhysicalCamera;
 pub use engine::gltf::lights::LightData;
 pub use project::CameraSettings;
 
@@ -36,6 +37,8 @@ pub enum NodeKind {
 
 #[derive(Clone, Debug)]
 pub struct NodeEdit {
+    /// Empty means unnamed.
+    pub name: String,
     pub translation: [f32; 3],
     pub rotation: [f32; 4],
     pub scale: [f32; 3],
@@ -43,14 +46,26 @@ pub struct NodeEdit {
     pub metallic_factor: Option<f32>,
     pub roughness_factor: Option<f32>,
     pub emissive_factor: Option<[f32; 3]>,
-    pub fov_y_deg: Option<f32>,
-    pub near_plane: Option<f32>,
-    pub far_plane: Option<f32>,
+    pub camera: Option<CameraEdit>,
+}
+
+/// A perspective camera's glTF settings plus its Blackbird `extras`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CameraEdit {
+    pub fov_y_deg: f32,
+    pub near: f32,
+    /// `None` is an infinite far plane.
+    pub far: Option<f32>,
+    /// Width / height. `None` follows the viewport.
+    pub aspect: Option<f32>,
+    /// `None` uses the project exposure.
+    pub physical: Option<PhysicalCamera>,
 }
 
 impl Default for NodeEdit {
     fn default() -> Self {
         Self {
+            name: String::new(),
             translation: [0.0; 3],
             rotation: [0.0, 0.0, 0.0, 1.0],
             scale: [1.0, 1.0, 1.0],
@@ -58,9 +73,7 @@ impl Default for NodeEdit {
             metallic_factor: None,
             roughness_factor: None,
             emissive_factor: None,
-            fov_y_deg: None,
-            near_plane: None,
-            far_plane: None,
+            camera: None,
         }
     }
 }
@@ -193,6 +206,8 @@ pub struct EditorState {
     pub add_light_requested: Option<LightKind>,
 
     pub camera_preview_node: Option<usize>,
+    /// Node whose camera the player renders from, saved in the scene's `extras`.
+    pub main_camera: Option<usize>,
 
     pub new_project_requested: bool,
     pub open_project_requested: bool,
@@ -230,6 +245,7 @@ impl EditorState {
             gizmo_mode: GizmoMode::default(),
             show_gizmos: true,
             camera_preview_node: None,
+            main_camera: None,
             editor_camera_key: None,
             camera_settings: CameraSettings::default(),
             lights: Vec::new(),
@@ -260,6 +276,7 @@ impl EditorState {
         if let Some(doc) = &self.document
             && let Some(node) = doc.nodes().nth(node_idx)
         {
+            edit.name = node.name().unwrap_or_default().to_string();
             let (translation, rotation, scale) = node.transform().decomposed();
             edit.translation = translation;
             edit.rotation = rotation;
@@ -277,9 +294,13 @@ impl EditorState {
             if let Some(cam) = node.camera()
                 && let gltf_api::camera::Projection::Perspective(p) = cam.projection()
             {
-                edit.fov_y_deg = Some(p.yfov().to_degrees());
-                edit.near_plane = Some(p.znear());
-                edit.far_plane = p.zfar();
+                edit.camera = Some(CameraEdit {
+                    fov_y_deg: p.yfov().to_degrees(),
+                    near: p.znear(),
+                    far: p.zfar(),
+                    aspect: p.aspect_ratio(),
+                    physical: PhysicalCamera::read(&cam),
+                });
             }
         }
         self.node_edits.insert(node_idx, edit);

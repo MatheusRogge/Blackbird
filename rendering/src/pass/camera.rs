@@ -15,10 +15,11 @@ struct CameraUniform {
 }
 
 impl CameraUniform {
-    pub fn from_camera(camera: &Camera) -> Self {
+    pub fn from_camera(camera: &Camera, viewport_aspect: f32) -> Self {
+        let view_proj = camera.view_proj_matrix(viewport_aspect);
         Self {
-            view_proj: camera.view_proj_matrix().into(),
-            inv_view_proj: camera.view_proj_matrix().inversed().into(),
+            view_proj: view_proj.into(),
+            inv_view_proj: view_proj.inversed().into(),
             inv_view: camera.view_matrix().inversed().into(),
         }
     }
@@ -102,7 +103,8 @@ impl Pass for CameraPass {
             return;
         };
 
-        let uniform = CameraUniform::from_camera(main_camera);
+        let (w, h) = ctx.surface_size;
+        let uniform = CameraUniform::from_camera(main_camera, w as f32 / h as f32);
         let data = bytemuck::bytes_of(&uniform);
 
         ctx.buffers[&self.camera_buffer_id].write(queue, data);

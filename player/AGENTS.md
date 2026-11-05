@@ -19,5 +19,5 @@ Profiles live in the workspace `Cargo.toml`: `development` (dev, opt-level 1) an
 
 ## Gotchas
 - Shaders are `include_str!`'d from `../../sandbox/shaders/`, as in the editor.
-- `Camera::aspect` is fixed (glTF value, or 16:9 for the fallback camera). Nothing updates it on window resize yet.
+- Cameras without a glTF `aspectRatio` (and the fallback camera) follow the window aspect. If the scene marks a main camera (`extras.blackbird_main_camera`), `ensure_camera` removes every other scene camera, since the renderer draws from the first one. Cameras with physical settings keep their own exposure; the rest get the project's.
 - The scene's lights come from `engine::gltf::lights::read_lights`. Scene cameras come from `GltfScene` (node transforms). The fallback camera sits at (0, 2, 8) looking at the origin.

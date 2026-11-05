@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use engine::assets::AssetLoadHandle;
+use engine::gltf::camera::PhysicalCamera;
 use engine::gltf::{GLTFAsset, GltfScene, lights};
 use engine::plugin::{EnginePluginError, Plugin};
 use engine::Engine;
@@ -13,7 +14,7 @@ use project::Project;
 use crate::dev_tools::{FreeCamera, SharedDevState};
 
 /// Plays the project's default scene: streams it in, spawns its lights and makes sure a camera
-/// with the project's exposure exists.
+/// exists.
 pub struct Game {
     project: Project,
     scene_path: String,
@@ -64,25 +65,40 @@ impl Game {
         self.set_status();
     }
 
-    /// After the first batch the scene's own cameras exist; fall back to a default one.
+    /// After the first batch the scene's own cameras exist. Keeps only the scene's main camera if
+    /// it marks one (the renderer draws from the first camera), gives cameras without physical
+    /// settings the project's exposure, and falls back to a default camera.
     fn ensure_camera(&mut self, engine: &mut Engine) {
         let exposure = self.project.camera.exposure();
         let mut world = engine.world();
+        if let Some(scene) = &self.scene {
+            let document = scene.document();
+            if let Some(main) = scene.main_camera() {
+                for &key in scene.node_cameras().values().filter(|&&key| key != main) {
+                    world.remove_entity(key);
+                }
+            }
+            for (&node, &key) in scene.node_cameras() {
+                let physical = document.nodes().nth(node).and_then(|n| n.camera()).and_then(|c| PhysicalCamera::read(&c));
+                if physical.is_none()
+                    && let Some(camera) = world.get_entity_mut::<Camera>(key)
+                {
+                    camera.exposure = exposure;
+                }
+            }
+        }
         if world.get_entities::<Camera>().is_empty() {
             log::info!("{} has no camera, using a default one", self.scene_path);
             world.add_entity(Camera {
                 up: (0.0, 1.0, 0.0).into(),
                 eye: (0.0, 2.0, 8.0).into(),
                 target: (0.0, 0.0, 0.0).into(),
-                aspect: 16.0 / 9.0,
+                aspect: None,
                 fovy: 45.0_f32.to_radians(),
                 near: 0.01,
                 far: 10000.0,
                 exposure,
             });
-        }
-        for camera in world.get_entities_mut::<Camera>() {
-            camera.exposure = exposure;
         }
         self.camera_ready = true;
     }

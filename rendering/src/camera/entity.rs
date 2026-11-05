@@ -6,7 +6,8 @@ pub struct Camera {
     pub eye: Vec3,
     pub target: Vec3,
     pub fovy: f32,
-    pub aspect: f32,
+    /// Width / height. `None` follows the viewport.
+    pub aspect: Option<f32>,
     pub near: f32,
     pub far: f32,
     /// Linear multiplier from physical radiance to display values. Light intensities are in
@@ -19,12 +20,16 @@ impl Camera {
         Mat4::look_at(self.eye, self.target, self.up)
     }
 
-    pub fn view_proj_matrix(&self) -> Mat4 {
+    pub fn aspect_or(&self, viewport_aspect: f32) -> f32 {
+        self.aspect.unwrap_or(viewport_aspect)
+    }
+
+    pub fn view_proj_matrix(&self, viewport_aspect: f32) -> Mat4 {
         // Reversed-Z for better depth precision — near/far swapped,
         // clip depth maps to [1, 0] instead of [0, 1].
         let proj = projection::perspective_reversed_z_wgpu_dx_gl(
             self.fovy,
-            self.aspect,
+            self.aspect_or(viewport_aspect),
             self.near,
             self.far,
         );

@@ -24,12 +24,15 @@ gltf::local_matrix(&node) -> Mat4             // node transform relative to its 
 
 `engine::register_asset_resolvers` registers the resolver for `"gltf"` and `"glb"`. The resolver eagerly imports all buffers and images. External URIs go through `LoadContext::read_relative`, so packs work. Images are always decoded to RGBA8. Don't go back to `gltf::import_buffers`/`import_images`: they read the filesystem directly.
 
+### `camera.rs`
+Camera settings in `extras`: `PhysicalCamera { aperture, shutter_speed (s), iso }` under a camera's `blackbird_physical` (`ev100()`, `exposure() = 1 / (1.2 · 2^EV100)`), and the main camera's node index under the default scene's `blackbird_main_camera`. The editor writes both in `editor/src/export.rs`.
+
 ### `lights.rs`
 `LightData` (serde, tagged `type`: sky/point/spot/area) in physical units. `read_lights(doc)` returns `KHR_lights_punctual` node lights (world position/direction, missing `range` → cutoff radius) plus area lights from root `extras.blackbird_lights`. `LightData::spawn(world)` and `apply(world, key)` create and update the matching `rendering::light` entity. The editor writes lights back in `editor/src/lights.rs`. Keep both sides of the format in step.
 
 ## Scene loading
 `GltfScene` spreads the work across frames so a large scene doesn't stall the game thread:
-1. On the first `load_batch`, every perspective camera node in the scene becomes a `rendering::camera::Camera` at the node's world transform, looking down its −Z with +Y up. A missing aspect ratio falls back to 4:3.
+1. On the first `load_batch`, every perspective camera node in the scene becomes a `rendering::camera::Camera` at the node's world transform, looking down its −Z with +Y up. A missing aspect ratio follows the viewport, a missing `zfar` becomes `camera::INFINITE_FAR`, and exposure comes from the camera's physical settings (else 1). `node_cameras()` maps node index → camera entity, and `main_camera()` resolves the scene's marked camera.
 2. `GltfScene::new` walks the default scene (or the first scene, or every root node if there are no scenes) depth-first and records each node that has a mesh, together with its **world matrix** (parent × local).
 3. Each call converts the meshes of up to `count` of those nodes. **Each primitive becomes one `rendering::mesh::Mesh` entity** with `transform` set to the node's world matrix. Vertices stay in mesh-local space. A mesh used by several nodes is created once per node.
 

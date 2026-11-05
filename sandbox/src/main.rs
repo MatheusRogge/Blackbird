@@ -50,7 +50,7 @@ impl Plugin for MyGame {
             up: (0.0, 1.0, 0.0).into(),
             eye: (8.0, 2.0, 0.0).into(),
             target: (0.0, 2.0, 0.0).into(),
-            aspect: 800.0 / 600.0,
+            aspect: None,
             fovy: 45.0_f32.to_radians(),
             near: 0.01,
             far: 100.0,

@@ -227,12 +227,12 @@ fn ortho_rh_wgpu(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) -> Mat4 {
 /// then snapped to the nearest shadow texel so the grid only shifts by whole-
 /// texel steps during camera translation. `depth_range` is the light-space
 /// near/far of the whole scene, so every caster lands in every cascade.
-fn cascade_vp(camera: &Camera, light_view: &Mat4, near_z: f32, far_z: f32, depth_range: (f32, f32)) -> Mat4 {
+fn cascade_vp(camera: &Camera, aspect: f32, light_view: &Mat4, near_z: f32, far_z: f32, depth_range: (f32, f32)) -> Mat4 {
     let th = (camera.fovy * 0.5).tan();
     let nh = near_z * th;
-    let nw = nh * camera.aspect;
+    let nw = nh * aspect;
     let fh = far_z * th;
-    let fw = fh * camera.aspect;
+    let fw = fh * aspect;
 
     let corners_vs = [
         Vec3::new(-nw, -nh, -near_z), Vec3::new( nw, -nh, -near_z),
@@ -551,13 +551,15 @@ impl Pass for ShadowPass {
         let mut masked: Vec<_> = meshes.iter().filter(|h| h.entity.is_masked()).collect();
         masked.sort_unstable_by_key(|h| albedo_key(h.entity));
         let inv_cam_view = camera.view_matrix().inversed();
+        let (w, h) = ctx.surface_size;
+        let aspect = camera.aspect_or(w as f32 / h as f32);
 
         let mut view_to_shadow_raw = [[[0f32; 4]; 4]; NUM_CASCADES];
 
         for i in 0..NUM_CASCADES {
             let near_z = if i == 0 { camera.near } else { splits[i - 1] };
             let far_z  = splits[i];
-            let light_vp = cascade_vp(camera, &light_view, near_z, far_z, depth_range);
+            let light_vp = cascade_vp(camera, aspect, &light_view, near_z, far_z, depth_range);
 
             let v2s = light_vp * inv_cam_view;
             let cols = v2s.cols;

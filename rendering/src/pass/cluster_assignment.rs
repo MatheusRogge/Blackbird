@@ -173,7 +173,7 @@ impl Pass for ClusterAssignmentPass {
             z_far: camera.far,
             log_ratio_recip: CLUSTER_Z as f32 / (camera.far / camera.near).ln(),
             num_point_lights: num_lights,
-            inv_proj_00: camera.aspect * tan_half_fov,
+            inv_proj_00: camera.aspect_or(w / h) * tan_half_fov,
             inv_proj_11: tan_half_fov,
             screen_w: w,
             screen_h: h,

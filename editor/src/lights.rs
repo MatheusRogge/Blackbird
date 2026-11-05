@@ -7,8 +7,7 @@ use gltf_api::json::extensions::scene::khr_lights_punctual::{self as khr, Type};
 use gltf_api::json::scene::UnitQuaternion;
 use gltf_api::json::validation::Checked;
 use gltf_api::json::{Index, Root};
-use serde_json::value::RawValue;
-use serde_json::{Map, Value};
+use serde_json::Map;
 use ultraviolet::Mat4;
 
 use crate::math;
@@ -151,24 +150,6 @@ fn to_khr(data: &LightData) -> Option<khr::Light> {
 
 /// Stores area lights in the root `extras`, keeping any other keys already there.
 fn write_extras(root: &mut Root, lights: &[&LightData]) -> Result<()> {
-    let mut extras = match &root.extras {
-        Some(raw) => match serde_json::from_str::<Value>(raw.get()) {
-            Ok(Value::Object(map)) => map,
-            _ => Map::new(),
-        },
-        None => Map::new(),
-    };
-
-    if lights.is_empty() {
-        extras.remove(EXTRAS_KEY);
-    } else {
-        extras.insert(EXTRAS_KEY.to_string(), serde_json::to_value(lights)?);
-    }
-
-    root.extras = if extras.is_empty() {
-        None
-    } else {
-        Some(RawValue::from_string(serde_json::to_string(&extras)?)?)
-    };
-    Ok(())
+    let value = if lights.is_empty() { None } else { Some(serde_json::to_value(lights)?) };
+    crate::export::set_extra(&mut root.extras, EXTRAS_KEY, value)
 }

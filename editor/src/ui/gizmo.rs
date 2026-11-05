@@ -88,7 +88,7 @@ struct View {
 
 impl View {
     fn new(camera: &Camera, screen: Rect) -> Self {
-        let view_proj = camera.view_proj_matrix();
+        let view_proj = camera.view_proj_matrix(screen.width() / screen.height());
         Self {
             inv_view_proj: view_proj.inversed(),
             view_proj,

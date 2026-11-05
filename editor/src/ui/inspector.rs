@@ -1,6 +1,10 @@
 use egui::Ui;
 
-use crate::state::{EditorState, LightData, LightDataExt, NodeEdit, NodeKind, Selection};
+use crate::state::{CameraEdit, EditorState, LightData, LightDataExt, NodeEdit, NodeKind, PhysicalCamera, SceneNode, Selection};
+
+const UNNAMED: &str = "(unnamed)";
+const DEFAULT_FAR: f32 = 1000.0;
+const ASPECT_PRESETS: &[(&str, f32)] = &[("16:9", 16.0 / 9.0), ("16:10", 1.6), ("4:3", 4.0 / 3.0), ("21:9", 21.0 / 9.0), ("1:1", 1.0)];
 
 pub fn draw(root: &mut Ui, state: &mut EditorState) {
     egui::Panel::right("inspector")
@@ -20,15 +24,16 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                     }
                 }
                 Some(Selection::GltfNode(idx)) => {
-                    let node_name = state.scene_nodes.iter()
-                        .find_map(|n| find_node(n, idx))
-                        .map(|n| n.name.clone())
-                        .unwrap_or_default();
                     let node_kind = state.scene_nodes.iter()
                         .find_map(|n| find_node(n, idx))
                         .map(|n| n.kind.clone());
 
-                    ui.label(egui::RichText::new(&node_name).strong());
+                    if let Some(edit) = state.node_edits.get_mut(&idx) {
+                        let name = egui::TextEdit::singleline(&mut edit.name).hint_text(UNNAMED);
+                        if ui.add(name).changed() {
+                            rename_node(&mut state.scene_nodes, idx, &edit.name);
+                        }
+                    }
                     if let Some(mesh) = state.document.as_ref()
                         .and_then(|doc| doc.nodes().nth(idx))
                         .and_then(|node| node.mesh())
@@ -48,8 +53,14 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                             if let Some(NodeKind::Mesh(_)) = &node_kind {
                                 draw_material(ui, edit);
                             }
-                            if let Some(NodeKind::Camera) = &node_kind {
-                                draw_camera(ui, edit);
+                            if let Some(camera) = &mut edit.camera {
+                                let mut is_main = state.main_camera == Some(idx);
+                                draw_camera(ui, camera, &mut is_main, state.camera_settings.exposure_stops);
+                                if is_main {
+                                    state.main_camera = Some(idx);
+                                } else if state.main_camera == Some(idx) {
+                                    state.main_camera = None;
+                                }
                             }
                         });
                     }
@@ -277,28 +288,101 @@ fn draw_material(ui: &mut egui::Ui, edit: &mut NodeEdit) {
     });
 }
 
-fn draw_camera(ui: &mut egui::Ui, edit: &mut NodeEdit) {
+fn draw_camera(ui: &mut egui::Ui, camera: &mut CameraEdit, is_main: &mut bool, project_stops: f32) {
     ui.collapsing("Camera", |ui| {
+        ui.checkbox(is_main, "Player camera")
+            .on_hover_text("The camera the player renders this scene from. Other cameras are removed when it plays.");
+
         egui::Grid::new("camera_grid")
             .num_columns(2)
             .spacing([12.0, 4.0])
             .show(ui, |ui| {
-                let fov = edit.fov_y_deg.get_or_insert(45.0);
                 ui.label("FOV Y");
-                ui.add(egui::DragValue::new(fov).speed(0.5).range(1.0..=170.0).suffix("°"));
+                ui.add(egui::DragValue::new(&mut camera.fov_y_deg).speed(0.5).range(1.0..=170.0).suffix("°"));
                 ui.end_row();
 
-                let near = edit.near_plane.get_or_insert(0.01);
                 ui.label("Near");
-                ui.add(egui::DragValue::new(near).speed(0.001).range(0.0001..=1000.0));
+                ui.add(egui::DragValue::new(&mut camera.near).speed(0.001).range(0.0001..=1000.0));
                 ui.end_row();
 
-                let far = edit.far_plane.get_or_insert(1000.0);
                 ui.label("Far");
-                ui.add(egui::DragValue::new(far).speed(1.0).range(1.0..=1_000_000.0));
+                ui.horizontal(|ui| {
+                    let mut infinite = camera.far.is_none();
+                    if let Some(far) = &mut camera.far {
+                        ui.add(egui::DragValue::new(far).speed(1.0).range(camera.near..=1_000_000.0));
+                    }
+                    if ui.checkbox(&mut infinite, "Infinite").changed() {
+                        camera.far = (!infinite).then_some(DEFAULT_FAR.max(camera.near * 2.0));
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Aspect");
+                ui.horizontal(|ui| {
+                    let selected = match camera.aspect {
+                        None => "Viewport".to_string(),
+                        Some(a) => ASPECT_PRESETS
+                            .iter()
+                            .find(|(_, r)| (r - a).abs() < 1e-3)
+                            .map_or_else(|| "Custom".to_string(), |(name, _)| name.to_string()),
+                    };
+                    egui::ComboBox::from_id_salt("camera_aspect").selected_text(selected).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut camera.aspect, None, "Viewport");
+                        for &(name, ratio) in ASPECT_PRESETS {
+                            ui.selectable_value(&mut camera.aspect, Some(ratio), name);
+                        }
+                    });
+                    if let Some(aspect) = &mut camera.aspect {
+                        ui.add(egui::DragValue::new(aspect).speed(0.01).range(0.1..=10.0).max_decimals(3));
+                    }
+                });
                 ui.end_row();
             });
+
+        ui.add_space(4.0);
+        let mut physical = camera.physical.is_some();
+        if ui.checkbox(&mut physical, "Physical exposure").changed() {
+            camera.physical = physical.then(PhysicalCamera::default);
+        }
+        match &mut camera.physical {
+            Some(p) => {
+                egui::Grid::new("camera_exposure_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Aperture");
+                        ui.add(egui::DragValue::new(&mut p.aperture).speed(0.05).range(0.7..=64.0).prefix("f/"));
+                        ui.end_row();
+
+                        ui.label("Shutter");
+                        let mut denominator = 1.0 / p.shutter_speed;
+                        let shutter = egui::DragValue::new(&mut denominator).speed(1.0).range(1.0..=8000.0).prefix("1/").suffix(" s");
+                        if ui.add(shutter).changed() {
+                            p.shutter_speed = 1.0 / denominator;
+                        }
+                        ui.end_row();
+
+                        ui.label("ISO");
+                        ui.add(egui::DragValue::new(&mut p.iso).speed(10.0).range(25.0..=102_400.0));
+                        ui.end_row();
+                    });
+                ui.label(egui::RichText::new(format!("EV₁₀₀ {:.1}", p.ev100())).weak());
+            }
+            None => {
+                ui.label(egui::RichText::new(format!("Uses the project exposure ({project_stops:+.1} EV, Camera menu)")).weak());
+            }
+        }
     });
+}
+
+fn rename_node(nodes: &mut [SceneNode], idx: usize, name: &str) {
+    for node in nodes {
+        if node.index == idx {
+            node.name = if name.is_empty() { UNNAMED.to_string() } else { name.to_string() };
+            return;
+        }
+        rename_node(&mut node.children, idx, name);
+    }
 }
 
 fn find_node(
