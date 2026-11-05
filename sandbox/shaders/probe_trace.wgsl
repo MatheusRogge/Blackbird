@@ -48,6 +48,39 @@ struct GpuSkyLight {
     _pad:         f32,
 }
 
+struct GpuPointLight {
+    position_vs: vec3<f32>,
+    radius:      f32,
+    color:       vec3<f32>,
+    intensity:   f32,
+}
+
+// Scalar padding: a trailing vec3 would be 16-aligned and break the 64-byte Rust layout.
+struct GpuSpotLight {
+    position_vs:  vec3<f32>,
+    radius:       f32,
+    direction_vs: vec3<f32>,
+    inner_cos:    f32,
+    color:        vec3<f32>,
+    outer_cos:    f32,
+    intensity:    f32,
+    _pad0:        f32,
+    _pad1:        f32,
+    _pad2:        f32,
+}
+
+// right_vs / up_vs are half-extent vectors of the rectangle.
+struct GpuAreaLight {
+    position_vs: vec3<f32>,
+    intensity:   f32,
+    right_vs:    vec3<f32>,
+    _pad0:       f32,
+    up_vs:       vec3<f32>,
+    _pad1:       f32,
+    color:       vec3<f32>,
+    _pad2:       f32,
+}
+
 struct LightCounts {
     num_point: u32,
     num_spot:  u32,
@@ -80,6 +113,14 @@ struct TraceResult {
 @group(0) @binding(6) var<uniform>       frame:        ProbeTraceFrame;
 @group(0) @binding(7) var<storage, read_write> ray_radiance:  array<vec4<f32>>;
 @group(0) @binding(8) var<storage, read_write> ray_direction: array<vec4<f32>>;
+@group(0) @binding(9)  var<storage, read> point_lights: array<GpuPointLight>;
+@group(0) @binding(10) var<storage, read> spot_lights:  array<GpuSpotLight>;
+@group(0) @binding(11) var<storage, read> area_lights:  array<GpuAreaLight>;
+
+// Shadow rays start this far off the surface, as a fraction of the probe spacing.
+const SHADOW_BIAS: f32 = 0.002;
+// Shadow rays toward directional lights stop here.
+const SKY_SHADOW_DISTANCE: f32 = 1.0e4;
 
 // ── Ray–AABB intersection (slab method) ───────────────────────────────────────
 
@@ -114,7 +155,9 @@ fn ray_tri_hit(ro: vec3<f32>, rd: vec3<f32>, v0: vec3<f32>, v1: vec3<f32>, v2: v
 
 // ── Iterative BVH traversal ───────────────────────────────────────────────────
 
-fn bvh_trace(ro: vec3<f32>, rd: vec3<f32>, max_dist: f32) -> TraceResult {
+// With `any_hit`, returns at the first hit closer than `max_dist` (for shadow rays), without the
+// closest-hit position, normal or triangle.
+fn bvh_trace(ro: vec3<f32>, rd: vec3<f32>, max_dist: f32, any_hit: bool) -> TraceResult {
     var result: TraceResult;
     result.hit  = false;
     result.dist = max_dist;
@@ -140,6 +183,7 @@ fn bvh_trace(ro: vec3<f32>, rd: vec3<f32>, max_dist: f32) -> TraceResult {
                 if t > 0.0 && t < result.dist {
                     result.hit    = true;
                     result.dist   = t;
+                    if any_hit { return result; }
                     result.pos    = ro + rd * t;
                     let e1 = tri.v1 - tri.v0;
                     let e2 = tri.v2 - tri.v0;
@@ -183,6 +227,17 @@ fn probe_world_position(probe_index: u32) -> vec3<f32> {
 
 // ── Shading helpers ───────────────────────────────────────────────────────────
 
+fn view_to_world(p: vec3<f32>) -> vec3<f32> {
+    return (frame.inv_view * vec4<f32>(p, 1.0)).xyz;
+}
+
+// KHR_lights_punctual recommended falloff, as in lighting.wgsl.
+fn range_attenuation(dist: f32, range: f32) -> f32 {
+    let r = dist / range;
+    let window = clamp(1.0 - r * r * r * r, 0.0, 1.0);
+    return window * window / max(dist * dist, 1e-4);
+}
+
 // Karis' analytic fit of the split-sum environment BRDF. Same as in lighting.wgsl.
 fn env_brdf_approx(f0: vec3<f32>, roughness: f32, n_dot_v: f32) -> vec3<f32> {
     let c0 = vec4f(-1.0, -0.0275, -0.572, 0.022);
@@ -202,13 +257,68 @@ fn shade_hit(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>, tri: BvhTri
     let f0        = mix(vec3f(0.04), material.rgb, metallic);
     let specular  = env_brdf_approx(f0, tri.roughness, max(dot(normal, to_probe), 1e-4));
     let albedo    = material.rgb * (1.0 - metallic) * (1.0 - specular) + specular;
+    let brdf      = albedo / PI;
+    // Local-light shadow rays also stop `bias` short, so a light touching its fixture or emitter
+    // mesh doesn't shadow itself.
+    let bias      = SHADOW_BIAS * probe_params.probe_spacing;
+    let origin    = pos + normal * bias;
+
     var radiance = vec3<f32>(0.0);
     for (var i = 0u; i < light_counts.num_sky; i++) {
-        let dir_ws  = (frame.inv_view * vec4<f32>(sky_lights[i].direction_vs, 0.0)).xyz;
-        let L       = -dir_ws;
+        let L = -(frame.inv_view * vec4<f32>(sky_lights[i].direction_vs, 0.0)).xyz;
         if L.y < 0.0 { continue; }
-        let n_dot_l = max(0.0, dot(normal, L));
-        radiance   += albedo / PI * sky_lights[i].color * sky_lights[i].intensity * n_dot_l;
+        let n_dot_l = dot(normal, L);
+        if n_dot_l <= 0.0 || bvh_trace(origin, L, SKY_SHADOW_DISTANCE, true).hit { continue; }
+        radiance += brdf * sky_lights[i].color * sky_lights[i].intensity * n_dot_l;
+    }
+
+    for (var i = 0u; i < light_counts.num_point; i++) {
+        let light    = point_lights[i];
+        let to_light = view_to_world(light.position_vs) - pos;
+        let dist     = length(to_light);
+        if dist >= light.radius { continue; }
+        let L        = to_light / dist;
+        let n_dot_l  = dot(normal, L);
+        if n_dot_l <= 0.0 || bvh_trace(origin, L, dist - bias, true).hit { continue; }
+        radiance += brdf * light.color * (light.intensity * n_dot_l * range_attenuation(dist, light.radius));
+    }
+
+    for (var i = 0u; i < light_counts.num_spot; i++) {
+        let light    = spot_lights[i];
+        let to_light = view_to_world(light.position_vs) - pos;
+        let dist     = length(to_light);
+        if dist >= light.radius { continue; }
+        let L        = to_light / dist;
+        let dir_ws   = normalize((frame.inv_view * vec4<f32>(light.direction_vs, 0.0)).xyz);
+        let t        = clamp((dot(-L, dir_ws) - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
+        let n_dot_l  = dot(normal, L);
+        if t <= 0.0 || n_dot_l <= 0.0 || bvh_trace(origin, L, dist - bias, true).hit { continue; }
+        radiance += brdf * light.color * (light.intensity * n_dot_l * t * t * range_attenuation(dist, light.radius));
+    }
+
+    // Representative point, as in lighting.wgsl: the closest point on the rectangle, scaled by its area.
+    for (var i = 0u; i < light_counts.num_area; i++) {
+        let light  = area_lights[i];
+        let half_r = length(light.right_vs);
+        let half_u = length(light.up_vs);
+        if half_r <= 0.0 || half_u <= 0.0 { continue; }
+        let center = view_to_world(light.position_vs);
+        let r_dir  = (frame.inv_view * vec4<f32>(light.right_vs / half_r, 0.0)).xyz;
+        let u_dir  = (frame.inv_view * vec4<f32>(light.up_vs / half_u, 0.0)).xyz;
+
+        let rel     = pos - center;
+        let closest = center
+            + r_dir * clamp(dot(rel, r_dir), -half_r, half_r)
+            + u_dir * clamp(dot(rel, u_dir), -half_u, half_u);
+        let to_light = closest - pos;
+        let dist     = max(length(to_light), 1e-2);
+        let L        = to_light / dist;
+        let n_dot_l  = dot(normal, L);
+        if n_dot_l <= 0.0 || bvh_trace(origin, L, dist - bias, true).hit { continue; }
+
+        let area   = 4.0 * half_r * half_u;
+        let facing = abs(dot(L, cross(r_dir, u_dir)));
+        radiance += brdf * light.color * (light.intensity * n_dot_l * facing * area / (dist * dist + area));
     }
     return radiance;
 }
@@ -245,7 +355,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let probe_pos = probe_world_position(probe_index);
     let ray_dir   = spherical_fibonacci(ray_index, probe_params.rays_per_probe);
-    let result    = bvh_trace(probe_pos, ray_dir, probe_params.max_ray_distance);
+    let result    = bvh_trace(probe_pos, ray_dir, probe_params.max_ray_distance, false);
 
     var radiance: vec3<f32>;
     var hit_dist: f32;

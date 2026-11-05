@@ -38,6 +38,9 @@ pub struct ProbeTracePass {
     bvh_info_id: ResourceId,
     probe_params_id: ResourceId,
     sky_buffer_id: ResourceId,
+    point_buffer_id: ResourceId,
+    spot_buffer_id: ResourceId,
+    area_buffer_id: ResourceId,
     counts_buffer_id: ResourceId,
     ray_radiance_id: ResourceId,
     ray_direction_id: ResourceId,
@@ -80,6 +83,9 @@ impl ProbeTracePass {
                 bvh_info_id: bvh.info_id,
                 probe_params_id: probe_atlas.probe_params_id,
                 sky_buffer_id: light_buffers.sky_buffer_id,
+                point_buffer_id: light_buffers.point_buffer_id,
+                spot_buffer_id: light_buffers.spot_buffer_id,
+                area_buffer_id: light_buffers.area_buffer_id,
                 counts_buffer_id: light_buffers.counts_buffer_id,
                 ray_radiance_id,
                 ray_direction_id,
@@ -112,6 +118,19 @@ fn make_frame_rotation(frame_index: u32) -> [[f32; 4]; 3] {
     ]
 }
 
+fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
 fn mat4_to_cols(m: Mat4) -> [[f32; 4]; 4] {
     let c = m.cols;
     [c[0].into(), c[1].into(), c[2].into(), c[3].into()]
@@ -129,6 +148,9 @@ impl PassDesc for ProbeTracePass {
             self.bvh_info_id,
             self.probe_params_id,
             self.sky_buffer_id,
+            self.point_buffer_id,
+            self.spot_buffer_id,
+            self.area_buffer_id,
             self.counts_buffer_id,
         ]
     }
@@ -163,6 +185,9 @@ impl Pass for ProbeTracePass {
         let Some(&probe_params_buf) = ctx.buffers.get(&self.probe_params_id) else { return };
         let Some(&sky_buf) = ctx.buffers.get(&self.sky_buffer_id) else { return };
         let Some(&counts_buf) = ctx.buffers.get(&self.counts_buffer_id) else { return };
+        let Some(&point_buf) = ctx.buffers.get(&self.point_buffer_id) else { return };
+        let Some(&spot_buf) = ctx.buffers.get(&self.spot_buffer_id) else { return };
+        let Some(&area_buf) = ctx.buffers.get(&self.area_buffer_id) else { return };
         let Some(&radiance_buf) = ctx.buffers.get(&self.ray_radiance_id) else { return };
         let Some(&direction_buf) = ctx.buffers.get(&self.ray_direction_id) else { return };
         let Some(&frame_buf) = ctx.buffers.get(&self.frame_uniform_id) else { return };
@@ -289,6 +314,10 @@ impl Pass for ProbeTracePass {
                         },
                         count: None,
                     },
+                    // 9-11: point, spot and area lights
+                    storage_entry(9),
+                    storage_entry(10),
+                    storage_entry(11),
                 ],
             });
 
@@ -323,6 +352,9 @@ impl Pass for ProbeTracePass {
                     wgpu::BindGroupEntry { binding: 6, resource: frame_buf.binding() },
                     wgpu::BindGroupEntry { binding: 7, resource: radiance_buf.binding() },
                     wgpu::BindGroupEntry { binding: 8, resource: direction_buf.binding() },
+                    wgpu::BindGroupEntry { binding: 9, resource: point_buf.binding() },
+                    wgpu::BindGroupEntry { binding: 10, resource: spot_buf.binding() },
+                    wgpu::BindGroupEntry { binding: 11, resource: area_buf.binding() },
                 ],
             }));
         }
