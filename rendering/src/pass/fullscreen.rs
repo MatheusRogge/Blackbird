@@ -21,15 +21,30 @@ impl FullscreenInput {
     }
 }
 
-/// A fullscreen triangle that reads screen textures and uniforms and writes one screen texture.
-/// The shader's group 0 holds the inputs at bindings `0..n`, then the uniforms, then a linear
-/// clamp-to-edge sampler. Its entry points are `vs_main` and `fs_main`.
+#[derive(Clone, Copy)]
+pub enum FullscreenBuffer {
+    Uniform(ResourceId),
+    /// Bound read-only.
+    Storage(ResourceId),
+}
+
+impl FullscreenBuffer {
+    fn id(self) -> ResourceId {
+        match self {
+            Self::Uniform(id) | Self::Storage(id) => id,
+        }
+    }
+}
+
+/// A fullscreen triangle that reads screen textures and buffers and writes one screen texture.
+/// The shader's group 0 holds the inputs at bindings `0..n`, then the buffers in order, then a
+/// linear clamp-to-edge sampler. Its entry points are `vs_main` and `fs_main`.
 pub struct FullscreenPass {
     name: &'static str,
     node_id: Option<NodeId>,
     shader: ShaderAsset,
     inputs: Vec<FullscreenInput>,
-    uniforms: Vec<ResourceId>,
+    buffers: Vec<FullscreenBuffer>,
     output_id: ResourceId,
     output_format: wgpu::TextureFormat,
     pipeline: Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::Sampler)>,
@@ -42,7 +57,7 @@ impl FullscreenPass {
         graph: &mut RenderGraph,
         name: &'static str,
         inputs: Vec<FullscreenInput>,
-        uniforms: Vec<ResourceId>,
+        buffers: Vec<FullscreenBuffer>,
         output_format: wgpu::TextureFormat,
         shader: ShaderAsset,
     ) -> (Self, ResourceId) {
@@ -55,7 +70,7 @@ impl FullscreenPass {
             node_id: None,
             shader,
             inputs,
-            uniforms,
+            buffers,
             output_id,
             output_format,
             pipeline: None,
@@ -77,8 +92,11 @@ impl FullscreenPass {
                 view_dimension: wgpu::TextureViewDimension::D2,
                 sample_type,
             })
-            .chain(self.uniforms.iter().map(|_| wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
+            .chain(self.buffers.iter().map(|buffer| wgpu::BindingType::Buffer {
+                ty: match buffer {
+                    FullscreenBuffer::Uniform(_) => wgpu::BufferBindingType::Uniform,
+                    FullscreenBuffer::Storage(_) => wgpu::BufferBindingType::Storage { read_only: true },
+                },
                 has_dynamic_offset: false,
                 min_binding_size: None,
             }))
@@ -142,7 +160,7 @@ impl PassDesc for FullscreenPass {
     }
 
     fn reads(&self) -> Vec<ResourceId> {
-        self.inputs.iter().map(|i| i.id()).chain(self.uniforms.iter().copied()).collect()
+        self.inputs.iter().map(|i| i.id()).chain(self.buffers.iter().map(|b| b.id())).collect()
     }
 
     fn writes(&self) -> Vec<ResourceId> {
@@ -172,7 +190,7 @@ impl Pass for FullscreenPass {
         else {
             return;
         };
-        let Some(uniforms) = self.uniforms.iter().map(|id| ctx.buffers.get(id)).collect::<Option<Vec<_>>>() else {
+        let Some(buffers) = self.buffers.iter().map(|b| ctx.buffers.get(&b.id())).collect::<Option<Vec<_>>>() else {
             return;
         };
 
@@ -186,7 +204,7 @@ impl Pass for FullscreenPass {
             let resources = views
                 .iter()
                 .map(|view| wgpu::BindingResource::TextureView(view))
-                .chain(uniforms.iter().map(|buffer| buffer.binding()))
+                .chain(buffers.iter().map(|buffer| buffer.binding()))
                 .chain([wgpu::BindingResource::Sampler(sampler)]);
             let entries: Vec<wgpu::BindGroupEntry> = resources
                 .enumerate()

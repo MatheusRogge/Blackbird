@@ -107,6 +107,8 @@ fn main() -> Result<()> {
         ShaderAsset::from_raw(include_str!("../../sandbox/shaders/debug_overlay.wgsl")),
         ShaderAsset::from_raw(include_str!("../../sandbox/shaders/ssr.wgsl")),
         ShaderAsset::from_raw(include_str!("../../sandbox/shaders/composite.wgsl")),
+        ShaderAsset::from_raw(include_str!("../../sandbox/shaders/local_shadows.wgsl")),
+        ShaderAsset::from_raw(include_str!("../../sandbox/shaders/local_shadow_blur.wgsl")),
     );
 
     #[cfg(feature = "dev")]

@@ -8,7 +8,7 @@
 //!   --target x,y,z       point the camera looks at
 //!   --exposure E         linear exposure override
 //!   --no-specular --no-reflections --no-ssr --no-emissive-lights --no-indirect --no-direct --no-shadows
-//!   --view lit|albedo|normal|material|emissive
+//!   --view lit|albedo|normal|material|emissive|shadows
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
 //! ```
 
@@ -95,6 +95,7 @@ fn parse_args() -> Result<Options> {
                     "normal" => GBufferView::Normal,
                     "material" => GBufferView::Material,
                     "emissive" => GBufferView::Emissive,
+                    "shadows" => GBufferView::LocalShadows,
                     other => bail!("unknown view {other}"),
                 }
             }
@@ -192,6 +193,8 @@ fn main() -> Result<()> {
         shader("debug_overlay.wgsl")?,
         shader("ssr.wgsl")?,
         shader("composite.wgsl")?,
+        shader("local_shadows.wgsl")?,
+        shader("local_shadow_blur.wgsl")?,
     )
     .with_debug_flags(flags);
 

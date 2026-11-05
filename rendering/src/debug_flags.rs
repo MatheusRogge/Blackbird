@@ -24,10 +24,13 @@ pub enum GBufferView {
     Material,
     /// Emitted radiance, exposed.
     Emissive,
+    /// Ray-traced visibility of the first three shadowed local lights, one per channel.
+    LocalShadows,
 }
 
 impl GBufferView {
-    pub const ALL: [Self; 5] = [Self::Lit, Self::Albedo, Self::Normal, Self::Material, Self::Emissive];
+    pub const ALL: [Self; 6] =
+        [Self::Lit, Self::Albedo, Self::Normal, Self::Material, Self::Emissive, Self::LocalShadows];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -36,6 +39,7 @@ impl GBufferView {
             Self::Normal => "Normal",
             Self::Material => "Roughness / metallic / AO",
             Self::Emissive => "Emissive",
+            Self::LocalShadows => "Local light shadows",
         }
     }
 }

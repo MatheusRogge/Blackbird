@@ -6,6 +6,8 @@
 @group(0) @binding(4) var s_linear:   sampler;
 // Emitted radiance (texture × factor × strength), not yet exposed.
 @group(0) @binding(5) var t_emissive: texture_2d<f32>;
+// Ray-traced visibility of the `shadowed` lights, one channel each (local_shadows.wgsl).
+@group(0) @binding(6) var t_local_shadow: texture_2d<f32>;
 
 // Probe atlases + params
 const PROBES_PER_ROW: u32 = 30u;
@@ -43,7 +45,7 @@ struct DebugFlags {
     disable_indirect: u32,
     disable_direct:   u32,
     disable_shadows:  u32,
-    // 0 lit, 1 albedo, 2 normal, 3 material, 4 emissive (rendering::debug_flags::GBufferView).
+    // 0 lit, 1 albedo, 2 normal, 3 material, 4 emissive, 5 local shadows (rendering::debug_flags::GBufferView).
     view:             u32,
     disable_specular: u32,
     disable_reflections: u32,
@@ -51,6 +53,29 @@ struct DebugFlags {
 }
 
 @group(4) @binding(0) var<uniform> debug: DebugFlags;
+
+// Mirrors rendering::light::ShadowedLights. Entry = kind << 16 | index.
+struct ShadowedLights {
+    entries: vec4<u32>,
+    count:   u32,
+}
+
+@group(4) @binding(1) var<uniform> shadowed: ShadowedLights;
+
+const SHADOW_KIND_POINT: u32 = 0u;
+const SHADOW_KIND_SPOT:  u32 = 1u;
+const SHADOW_KIND_AREA:  u32 = 2u;
+
+// Visibility of a local light at this pixel: its channel in the shadow mask if it is one of the
+// shadowed lights, else 1.
+fn local_shadow(kind: u32, index: u32, mask: vec4<f32>) -> f32 {
+    if debug.disable_shadows != 0u { return 1.0; }
+    let entry = kind << 16u | index;
+    for (var slot = 0u; slot < min(shadowed.count, 4u); slot++) {
+        if shadowed.entries[slot] == entry { return mask[slot]; }
+    }
+    return 1.0;
+}
 
 fn octahedral_encode(n: vec3<f32>) -> vec2<f32> {
     let l1 = abs(n.x) + abs(n.y) + abs(n.z);
@@ -400,6 +425,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
         case 2u: { return unreflective(textureSample(t_normal, s_linear, in.uv).rgb); }
         case 3u: { return unreflective(textureSample(t_material, s_linear, in.uv).rgb); }
         case 4u: { return unreflective(textureSample(t_emissive, s_linear, in.uv).rgb * cp.exposure); }
+        case 5u: { return unreflective(textureLoad(t_local_shadow, frag_xy, 0).rgb); }
         default: {}
     }
 
@@ -410,6 +436,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
     let roughness  = max(material.r, MIN_ROUGHNESS);
     let metallic   = material.g;
     let emissive   = textureSample(t_emissive, s_linear, in.uv).rgb;
+    let shadow_mask = textureLoad(t_local_shadow, frag_xy, 0);
 
     // Reconstruct view-space depth from reversed-Z depth buffer value.
     // z_view_pos = z_near * z_far / (depth * (z_far - z_near) + z_near)
@@ -483,7 +510,8 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
             }
 
             let L = to_light / dist;
-            color += brdf(surf_vs, L) * light.color * (light.intensity * range_attenuation(dist, light.radius));
+            let vis = local_shadow(SHADOW_KIND_POINT, li, shadow_mask);
+            color += brdf(surf_vs, L) * light.color * (light.intensity * vis * range_attenuation(dist, light.radius));
         }
 
         for (var i = 0u; i < light_counts.num_spot; i++) {
@@ -498,7 +526,8 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
             let L  = to_light / dist;
             let cd = dot(-L, normalize(light.direction_vs));
             let t  = clamp((cd - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
-            color += brdf(surf_vs, L) * light.color * (light.intensity * t * t * range_attenuation(dist, light.radius));
+            let vis = local_shadow(SHADOW_KIND_SPOT, i, shadow_mask);
+            color += brdf(surf_vs, L) * light.color * (light.intensity * vis * t * t * range_attenuation(dist, light.radius));
         }
 
         // Representative-point approximation. Diffuse takes light from the closest point on the
@@ -526,7 +555,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
 
             let area     = 4.0 * half_r * half_u;
             let normal   = normalize(cross(r_dir, u_dir));
-            let radiance = light.color * light.intensity;
+            let radiance = light.color * light.intensity * local_shadow(SHADOW_KIND_AREA, i, shadow_mask);
             let facing   = area_facing(light, -L, normal);
             color += diffuse_brdf(surf_vs, L) * radiance * (facing * area / (dist2 + area));
 

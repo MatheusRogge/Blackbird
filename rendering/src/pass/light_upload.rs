@@ -13,7 +13,7 @@ use crate::{
         emissive::{self, EmissiveRect},
         AreaLight, GpuAreaLight, GpuPointLight, GpuSkyLight, GpuSpotLight, LightCounts,
         MAX_AREA_LIGHTS, MAX_POINT_LIGHTS, MAX_SKY_LIGHTS, MAX_SPOT_LIGHTS, PointLight, SkyLight,
-        SpotLight,
+        SpotLight, MAX_SHADOWED_LIGHTS, SHADOW_KIND_AREA, SHADOW_KIND_POINT, SHADOW_KIND_SPOT, ShadowedLights,
     },
     mesh::Mesh,
     pass::{PassContext, Pass, PassDesc},
@@ -29,6 +29,8 @@ pub struct LightBuffers {
     pub area_buffer_id: ResourceId,
     pub sky_buffer_id: ResourceId,
     pub counts_buffer_id: ResourceId,
+    /// Uniform `ShadowedLights`.
+    pub shadowed_buffer_id: ResourceId,
 }
 
 pub struct LightUploadPass {
@@ -68,12 +70,18 @@ impl LightUploadPass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        let shadowed_buffer_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
+            size: size_of::<ShadowedLights>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         let buffers = LightBuffers {
             point_buffer_id,
             spot_buffer_id,
             area_buffer_id,
             sky_buffer_id,
             counts_buffer_id,
+            shadowed_buffer_id,
         };
 
         let pass = Self {
@@ -87,6 +95,7 @@ impl LightUploadPass {
                 area_buffer_id,
                 sky_buffer_id,
                 counts_buffer_id,
+                shadowed_buffer_id,
             },
         };
 
@@ -110,6 +119,7 @@ impl PassDesc for LightUploadPass {
             self.buffers.area_buffer_id,
             self.buffers.sky_buffer_id,
             self.buffers.counts_buffer_id,
+            self.buffers.shadowed_buffer_id,
         ]
     }
 }
@@ -199,7 +209,11 @@ impl Pass for LightUploadPass {
             .take(MAX_AREA_LIGHTS)
             .map(|l| AreaLight { ..*l })
             .collect();
-        if self.debug_flags.read().expect("debug_flags poisoned").emissive_lights {
+        let (emissive_lights, shadows) = {
+            let flags = self.debug_flags.read().expect("debug_flags poisoned");
+            (flags.emissive_lights, flags.shadows)
+        };
+        if emissive_lights {
             let free = MAX_AREA_LIGHTS - areas.len();
             areas.extend(self.emissive_lights(world).into_iter().take(free));
         }
@@ -242,6 +256,32 @@ impl Pass for LightUploadPass {
         };
         let area_lights: Vec<GpuAreaLight> = areas.iter().map(to_gpu).collect();
 
+        // The lights most likely to matter on screen: flux over squared distance to the camera.
+        let importance = |position: ultraviolet::Vec3, flux: f32| flux / ((position - camera.eye).mag_sq() + 1.0);
+        let four_pi = 4.0 * std::f32::consts::PI;
+        let mut candidates: Vec<(f32, u32)> = points
+            .iter()
+            .take(MAX_POINT_LIGHTS)
+            .enumerate()
+            .map(|(i, l)| (importance(l.position, four_pi * l.intensity), SHADOW_KIND_POINT << 16 | i as u32))
+            .chain(spots.iter().take(MAX_SPOT_LIGHTS).enumerate().map(|(i, l)| {
+                (importance(l.position, four_pi * l.intensity), SHADOW_KIND_SPOT << 16 | i as u32)
+            }))
+            .chain(areas.iter().enumerate().map(|(i, l)| {
+                let sides = if l.two_sided { 2.0 } else { 1.0 };
+                let flux = sides * std::f32::consts::PI * l.intensity * 4.0 * l.right.mag() * l.up.mag();
+                (importance(l.position, flux), SHADOW_KIND_AREA << 16 | i as u32)
+            }))
+            .filter(|(score, _)| *score > 0.0)
+            .collect();
+        candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
+        // With shadows off nothing is traced: `local_shadows` skips pixels when the count is 0.
+        let mut shadowed = ShadowedLights::default();
+        let traced = if shadows { MAX_SHADOWED_LIGHTS } else { 0 };
+        for (slot, &(_, entry)) in candidates.iter().take(traced).enumerate() {
+            shadowed.entries[slot] = entry;
+            shadowed.count += 1;
+        }
 
         let sky_lights: Vec<GpuSkyLight> = world
             .get_entities::<SkyLight>()
@@ -284,5 +324,6 @@ impl Pass for LightUploadPass {
 
         ctx.buffers[&self.buffers.counts_buffer_id].write(queue, bytemuck::bytes_of(&counts),
         );
+        ctx.buffers[&self.buffers.shadowed_buffer_id].write(queue, bytemuck::bytes_of(&shadowed));
     }
 }

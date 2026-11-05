@@ -43,6 +43,21 @@ pub struct GpuSkyLight {
     pub _pad: f32,
 }
 
+/// Local lights that get ray-traced shadows, one `local_shadows` mask channel each. An entry is
+/// `kind << 16 | index` into that kind's light buffer (`SHADOW_KIND_*`).
+#[repr(C)]
+#[derive(Copy, Clone, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ShadowedLights {
+    pub entries: [u32; MAX_SHADOWED_LIGHTS],
+    pub count: u32,
+    pub _pad: [u32; 3],
+}
+
+pub const MAX_SHADOWED_LIGHTS: usize = 4;
+pub const SHADOW_KIND_POINT: u32 = 0;
+pub const SHADOW_KIND_SPOT: u32 = 1;
+pub const SHADOW_KIND_AREA: u32 = 2;
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct LightCounts {
