@@ -6,8 +6,9 @@ struct LightUniform {
 struct Model {
     model: mat4x4<f32>,
     normal: mat4x4<f32>,
-    // x: alpha cutoff (0 = never discard), y: 1 if double-sided.
+    // x: alpha cutoff (0 = never discard), y: 1 if double-sided, z: metallic, w: roughness.
     material: vec4<f32>,
+    base_color: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> light: LightUniform;
@@ -29,6 +30,7 @@ struct MaskedOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) cutoff: f32,
+    @location(2) @interpolate(flat) alpha: f32,
 }
 
 @vertex
@@ -42,12 +44,13 @@ fn vs_masked(
     out.position = light.view_proj * m.model * vec4<f32>(position, 1.0);
     out.uv = uv;
     out.cutoff = m.material.x;
+    out.alpha = m.base_color.a;
     return out;
 }
 
 @fragment
 fn fs_masked(in: MaskedOutput) {
-    if textureSample(albedo_tex, albedo_sampler, in.uv).a < in.cutoff {
+    if textureSample(albedo_tex, albedo_sampler, in.uv).a * in.alpha < in.cutoff {
         discard;
     }
 }

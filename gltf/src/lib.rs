@@ -7,7 +7,7 @@ use gltf::{Gltf, buffer, image, image::Format, mesh::util::ReadIndices};
 use rendering::{
     TextureAsset,
     camera::Camera,
-    mesh::{Mat4, Mesh, Vertex},
+    mesh::{Mat4, MaterialFactors, Mesh, Vertex},
 };
 use std::{
     borrow::Cow,
@@ -240,12 +240,29 @@ fn build_mesh_primitives(
             .normal_texture()
             .and_then(|info| textures.get(images, info.texture()));
 
+        let metallic_roughness_texture = pbr
+            .metallic_roughness_texture()
+            .and_then(|info| textures.get(images, info.texture()));
+
+        let emissive_texture = material
+            .emissive_texture()
+            .and_then(|info| textures.get(images, info.texture()));
+
+        let factors = MaterialFactors {
+            base_color: pbr.base_color_factor(),
+            metallic: pbr.metallic_factor(),
+            roughness: pbr.roughness_factor(),
+            emissive: material.emissive_factor(),
+            emissive_strength: material.emissive_strength().unwrap_or(1.0),
+        };
+
         let alpha_cutoff = match material.alpha_mode() {
             gltf::material::AlphaMode::Mask => Some(material.alpha_cutoff().unwrap_or(0.5)),
             gltf::material::AlphaMode::Opaque | gltf::material::AlphaMode::Blend => None,
         };
         out.push(
             Mesh::new(vertices, indices, albedo_texture, normal_texture)
+                .with_material(factors, metallic_roughness_texture, emissive_texture)
                 .with_alpha_cutoff(alpha_cutoff)
                 .with_double_sided(material.double_sided()),
         );

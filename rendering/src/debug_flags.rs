@@ -7,6 +7,32 @@ pub struct DebugFlagsGpu {
     pub disable_indirect: u32,
     pub disable_direct:   u32,
     pub disable_shadows:  u32,
+    pub view:             u32,
+    pub _pad:             [u32; 3],
+}
+
+/// What the `lighting` pass outputs: the lit image, or one G-buffer target as-is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GBufferView {
+    #[default]
+    Lit,
+    Albedo,
+    Normal,
+    /// R = roughness, G = metallic, B = ambient occlusion.
+    Material,
+}
+
+impl GBufferView {
+    pub const ALL: [Self; 4] = [Self::Lit, Self::Albedo, Self::Normal, Self::Material];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lit => "Lit",
+            Self::Albedo => "Albedo",
+            Self::Normal => "Normal",
+            Self::Material => "Roughness / metallic / AO",
+        }
+    }
 }
 
 pub struct RenderDebugFlags {
@@ -14,6 +40,7 @@ pub struct RenderDebugFlags {
     pub indirect: bool,
     pub direct:   bool,
     pub shadows:  bool,
+    pub view:     GBufferView,
 
     pub show_bvh:        bool,
     pub bvh_leaves_only: bool,
@@ -35,6 +62,7 @@ impl Default for RenderDebugFlags {
             indirect: true,
             direct:   true,
             shadows:  true,
+            view:     GBufferView::Lit,
 
             show_bvh:        false,
             bvh_leaves_only: false,
@@ -58,6 +86,8 @@ impl RenderDebugFlags {
             disable_indirect: !self.indirect as u32,
             disable_direct:   !self.direct as u32,
             disable_shadows:  !self.shadows as u32,
+            view:             self.view as u32,
+            _pad:             [0; 3],
         }
     }
 }

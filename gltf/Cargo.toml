@@ -15,6 +15,7 @@ gltf = { version = "1.4.1", features = [
   "utils",
   "guess_mime_type",
   "KHR_lights_punctual",
+  "KHR_materials_emissive_strength",
 ] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 urlencoding = "2.1"

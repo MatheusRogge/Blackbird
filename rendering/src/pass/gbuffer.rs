@@ -19,6 +19,29 @@ pub struct GBufferOutputs {
     pub depth_id: ResourceId,
 }
 
+/// Texture `Arc` pointers of a mesh's material (albedo, normal, metallic-roughness), 0 for none.
+type MaterialKey = (usize, usize, usize);
+
+fn texture_key(texture: &Option<Arc<TextureAsset>>) -> usize {
+    texture.as_ref().map_or(0, |t| Arc::as_ptr(t) as usize)
+}
+
+fn material_key(mesh: &Mesh) -> MaterialKey {
+    (
+        texture_key(&mesh.albedo_texture),
+        texture_key(&mesh.normal_texture),
+        texture_key(&mesh.metallic_roughness_texture),
+    )
+}
+
+fn cached_view<'a>(
+    cache: &'a HashMap<usize, (wgpu::Texture, wgpu::TextureView)>,
+    key: usize,
+    fallback: &'a Option<(wgpu::Texture, wgpu::TextureView)>,
+) -> Option<&'a wgpu::TextureView> {
+    cache.get(&key).or(fallback.as_ref()).map(|(_, v)| v)
+}
+
 pub struct GBufferPass {
     node_id: Option<NodeId>,
 
@@ -33,9 +56,10 @@ pub struct GBufferPass {
 
     texture_sampler: Option<wgpu::Sampler>,
     texture_cache: HashMap<usize, (wgpu::Texture, wgpu::TextureView)>,
-    texture_bind_groups: HashMap<(usize, usize), wgpu::BindGroup>,
+    texture_bind_groups: HashMap<MaterialKey, wgpu::BindGroup>,
     fallback_albedo: Option<(wgpu::Texture, wgpu::TextureView)>,
     fallback_normal: Option<(wgpu::Texture, wgpu::TextureView)>,
+    fallback_metallic_roughness: Option<(wgpu::Texture, wgpu::TextureView)>,
     fallback_bind_group: Option<wgpu::BindGroup>,
     camera_bind_group: Option<wgpu::BindGroup>,
 
@@ -96,6 +120,7 @@ impl GBufferPass {
                 texture_bind_groups: HashMap::new(),
                 fallback_albedo: None,
                 fallback_normal: None,
+                fallback_metallic_roughness: None,
                 fallback_bind_group: None,
                 camera_bind_group: None,
                 camera_buffer_id,
@@ -188,6 +213,7 @@ impl GBufferPass {
         sampler: &wgpu::Sampler,
         albedo_view: &wgpu::TextureView,
         normal_view: &wgpu::TextureView,
+        metallic_roughness_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -203,6 +229,10 @@ impl GBufferPass {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: wgpu::BindingResource::TextureView(metallic_roughness_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
@@ -399,6 +429,16 @@ impl Pass for GBufferPass {
                             binding: 2,
                             count: None,
                             visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                multisampled: false,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            },
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            count: None,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         },
                     ],
@@ -498,12 +538,18 @@ impl Pass for GBufferPass {
                 wgpu::TextureFormat::Rgba8Unorm,
             );
 
+            // White leaves the factors unscaled.
+            let fallback_mr_asset = TextureAsset::new(1, 1, vec![255, 255, 255, 255]);
+            let (fallback_mr_tex, fallback_mr_view) =
+                Self::upload_texture(device, queue, &fallback_mr_asset, wgpu::TextureFormat::Rgba8Unorm);
+
             let fallback_bg = Self::create_texture_bind_group(
                 device,
                 &texture_layout,
                 &sampler,
                 &fallback_albedo_view,
                 &fallback_normal_view,
+                &fallback_mr_view,
             );
 
             self.pipeline = Some(pipeline);
@@ -514,6 +560,7 @@ impl Pass for GBufferPass {
             self.texture_sampler = Some(sampler);
             self.fallback_albedo = Some((fallback_albedo_tex, fallback_albedo_view));
             self.fallback_normal = Some((fallback_normal_tex, fallback_normal_view));
+            self.fallback_metallic_roughness = Some((fallback_mr_tex, fallback_mr_view));
             self.fallback_bind_group = Some(fallback_bg);
         }
 
@@ -600,38 +647,33 @@ impl Pass for GBufferPass {
         // pass opens, so no resource creation happens during command recording.
         for handle in meshes.iter() {
             let mesh = handle.entity;
-            let albedo_key = mesh.albedo_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
-            let normal_key = mesh.normal_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
-
-            if let (Some(k), Some(tex)) = (albedo_key, &mesh.albedo_texture) {
-                self.texture_cache.entry(k).or_insert_with(|| {
-                    Self::upload_texture(device, queue, tex, wgpu::TextureFormat::Rgba8UnormSrgb)
-                });
+            let textures = [
+                (&mesh.albedo_texture, wgpu::TextureFormat::Rgba8UnormSrgb),
+                (&mesh.normal_texture, wgpu::TextureFormat::Rgba8Unorm),
+                (&mesh.metallic_roughness_texture, wgpu::TextureFormat::Rgba8Unorm),
+            ];
+            for (texture, format) in textures {
+                if let Some(tex) = texture {
+                    self.texture_cache
+                        .entry(Arc::as_ptr(tex) as usize)
+                        .or_insert_with(|| Self::upload_texture(device, queue, tex, format));
+                }
             }
-            if let (Some(k), Some(tex)) = (normal_key, &mesh.normal_texture) {
-                self.texture_cache.entry(k).or_insert_with(|| {
-                    Self::upload_texture(device, queue, tex, wgpu::TextureFormat::Rgba8Unorm)
-                });
-            }
 
-            let bg_key = (albedo_key.unwrap_or(0), normal_key.unwrap_or(0));
+            let bg_key = material_key(mesh);
             if !self.texture_bind_groups.contains_key(&bg_key) {
-                let av = albedo_key
-                    .and_then(|k| self.texture_cache.get(&k))
-                    .map(|(_, v)| v)
-                    .or_else(|| self.fallback_albedo.as_ref().map(|(_, v)| v));
-                let nv = normal_key
-                    .and_then(|k| self.texture_cache.get(&k))
-                    .map(|(_, v)| v)
-                    .or_else(|| self.fallback_normal.as_ref().map(|(_, v)| v));
+                let cache = &self.texture_cache;
+                let view = |key: usize, fallback| cached_view(cache, key, fallback);
+                let (albedo_key, normal_key, mr_key) = bg_key;
 
-                if let (Some(av), Some(nv), Some(layout), Some(sampler)) = (
-                    av,
-                    nv,
+                if let (Some(av), Some(nv), Some(mv), Some(layout), Some(sampler)) = (
+                    view(albedo_key, &self.fallback_albedo),
+                    view(normal_key, &self.fallback_normal),
+                    view(mr_key, &self.fallback_metallic_roughness),
                     self.texture_bind_group_layout.as_ref(),
                     self.texture_sampler.as_ref(),
                 ) {
-                    let bg = Self::create_texture_bind_group(device, layout, sampler, av, nv);
+                    let bg = Self::create_texture_bind_group(device, layout, sampler, av, nv, mv);
                     self.texture_bind_groups.insert(bg_key, bg);
                 }
             }
@@ -642,9 +684,7 @@ impl Pass for GBufferPass {
         let mut draw_order: Vec<usize> = (0..meshes.len()).collect();
         draw_order.sort_unstable_by_key(|&i| {
             let m = meshes[i].entity;
-            let ak = m.albedo_texture.as_ref().map(|t| Arc::as_ptr(t) as usize).unwrap_or(0);
-            let nk = m.normal_texture.as_ref().map(|t| Arc::as_ptr(t) as usize).unwrap_or(0);
-            (m.double_sided, ak, nk)
+            (m.double_sided, material_key(m))
         });
 
         pass.set_pipeline(pipeline);
@@ -659,7 +699,7 @@ impl Pass for GBufferPass {
             pass.set_bind_group(0, camera_bg, &[]);
         }
 
-        let mut current_bg_key: Option<(usize, usize)> = None;
+        let mut current_bg_key: Option<MaterialKey> = None;
 
         for i in draw_order {
             let handle = &meshes[i];
@@ -667,9 +707,7 @@ impl Pass for GBufferPass {
                 continue;
             };
             let mesh = handle.entity;
-            let albedo_key = mesh.albedo_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
-            let normal_key = mesh.normal_texture.as_ref().map(|t| Arc::as_ptr(t) as usize);
-            let bg_key = (albedo_key.unwrap_or(0), normal_key.unwrap_or(0));
+            let bg_key = material_key(mesh);
 
             if mesh.double_sided != double_sided {
                 double_sided = mesh.double_sided;

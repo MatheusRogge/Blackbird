@@ -29,12 +29,41 @@ impl Vertex {
     }
 }
 
+/// glTF metallic-roughness factors. Each multiplies its texture, if any. The default is a
+/// dielectric at roughness 0.5, not glTF's fully rough metal, so meshes built in code look plain.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaterialFactors {
+    pub base_color: [f32; 4],
+    pub metallic: f32,
+    pub roughness: f32,
+    pub emissive: [f32; 3],
+    /// `KHR_materials_emissive_strength`, a multiplier on `emissive`.
+    pub emissive_strength: f32,
+}
+
+impl Default for MaterialFactors {
+    fn default() -> Self {
+        Self {
+            base_color: [1.0; 4],
+            metallic: 0.0,
+            roughness: 0.5,
+            emissive: [0.0; 3],
+            emissive_strength: 1.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Mesh {
     pub indices: Vec<u32>,
     pub vertices: Vec<Vertex>,
     pub albedo_texture: Option<Arc<TextureAsset>>,
     pub normal_texture: Option<Arc<TextureAsset>>,
+    /// glTF layout: G = roughness, B = metallic, linear.
+    pub metallic_roughness_texture: Option<Arc<TextureAsset>>,
+    /// sRGB.
+    pub emissive_texture: Option<Arc<TextureAsset>>,
+    pub material: MaterialFactors,
     /// Alpha-tested ("cutout") material: fragments with albedo alpha below this are discarded,
     /// in the G-buffer and in shadow maps. `None` is opaque.
     pub alpha_cutoff: Option<f32>,
@@ -51,6 +80,9 @@ impl Default for Mesh {
             vertices: Vec::new(),
             albedo_texture: None,
             normal_texture: None,
+            metallic_roughness_texture: None,
+            emissive_texture: None,
+            material: MaterialFactors::default(),
             alpha_cutoff: None,
             double_sided: false,
             transform: Mat4::identity(),
@@ -70,10 +102,25 @@ impl Mesh {
             vertices,
             albedo_texture,
             normal_texture,
+            metallic_roughness_texture: None,
+            emissive_texture: None,
+            material: MaterialFactors::default(),
             alpha_cutoff: None,
             double_sided: false,
             transform: Mat4::identity(),
         }
+    }
+
+    pub fn with_material(
+        mut self,
+        material: MaterialFactors,
+        metallic_roughness_texture: Option<Arc<TextureAsset>>,
+        emissive_texture: Option<Arc<TextureAsset>>,
+    ) -> Self {
+        self.material = material;
+        self.metallic_roughness_texture = metallic_roughness_texture;
+        self.emissive_texture = emissive_texture;
+        self
     }
 
     pub fn with_alpha_cutoff(mut self, cutoff: Option<f32>) -> Self {

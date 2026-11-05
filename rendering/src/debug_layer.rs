@@ -4,7 +4,7 @@ use engine_core::world::World;
 use ui::UiLayer;
 
 use crate::arena::texture_pool::AliasingReport;
-use crate::debug_flags::RenderDebugFlags;
+use crate::debug_flags::{GBufferView, RenderDebugFlags};
 use crate::profiler::FrameStats;
 
 const LABEL_WIDTH: f32 = 64.0;
@@ -101,6 +101,13 @@ impl UiLayer for DebugLayer {
                     ui.checkbox(&mut flags.indirect, "Indirect (GI)");
                     ui.checkbox(&mut flags.direct, "Direct lights");
                     ui.checkbox(&mut flags.shadows, "Shadows");
+                    egui::ComboBox::from_label("View")
+                        .selected_text(flags.view.label())
+                        .show_ui(ui, |ui| {
+                            for view in GBufferView::ALL {
+                                ui.selectable_value(&mut flags.view, view, view.label());
+                            }
+                        });
 
                     ui.separator();
                     ui.label("Visualization");

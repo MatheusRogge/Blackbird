@@ -41,6 +41,8 @@ struct DebugFlags {
     disable_indirect: u32,
     disable_direct:   u32,
     disable_shadows:  u32,
+    // 0 lit, 1 albedo, 2 normal, 3 material (rendering::debug_flags::GBufferView).
+    view:             u32,
 }
 
 @group(4) @binding(0) var<uniform> debug: DebugFlags;
@@ -302,6 +304,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let near_ws4 = camera.inv_view_proj * vec4f(ndc_x, ndc_y, 1.0, 1.0);
         let ray_dir  = normalize(far_ws4.xyz / far_ws4.w - near_ws4.xyz / near_ws4.w);
         return vec4f(sky_color(ray_dir) * cp.exposure, 1.0);
+    }
+
+    switch debug.view {
+        case 1u: { return vec4f(textureSample(t_albedo, s_linear, in.uv).rgb, 1.0); }
+        case 2u: { return vec4f(textureSample(t_normal, s_linear, in.uv).rgb, 1.0); }
+        case 3u: { return vec4f(textureSample(t_material, s_linear, in.uv).rgb, 1.0); }
+        default: {}
     }
 
     let albedo_raw = textureSample(t_albedo, s_linear, in.uv).rgb;

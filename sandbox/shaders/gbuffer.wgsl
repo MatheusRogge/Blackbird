@@ -9,15 +9,19 @@ var<uniform> camera: CameraUniform;
 var albedo_tex: texture_2d<f32>;
 @group(1) @binding(1)
 var normal_tex: texture_2d<f32>;
+// glTF layout: G = roughness, B = metallic.
 @group(1) @binding(2)
+var metallic_roughness_tex: texture_2d<f32>;
+@group(1) @binding(3)
 var tex_sampler: sampler;
 
 // Mirrors rendering::arena::GpuModel.
 struct Model {
     model: mat4x4<f32>,
     normal: mat4x4<f32>,
-    // x: alpha cutoff (0 = never discard), y: 1 if double-sided.
+    // x: alpha cutoff (0 = never discard), y: 1 if double-sided, z: metallic, w: roughness.
     material: vec4<f32>,
+    base_color: vec4<f32>,
 };
 
 @group(2) @binding(0)
@@ -37,7 +41,8 @@ struct VertexOutput {
     @location(1) color: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) world_tangent: vec4<f32>,
-    @location(4) @interpolate(flat) material: vec2<f32>,
+    @location(4) @interpolate(flat) material: vec4<f32>,
+    @location(5) @interpolate(flat) base_color: vec4<f32>,
 };
 
 struct GBufferOutput {
@@ -56,7 +61,8 @@ fn vs_main(in: VertexInput, @builtin(instance_index) instance: u32) -> VertexOut
     out.color = in.color;
     out.uv = in.uv;
     out.world_tangent = vec4<f32>(normalize((m.model * vec4<f32>(in.tangent.xyz, 0.0)).xyz), in.tangent.w);
-    out.material = m.material.xy;
+    out.material = m.material;
+    out.base_color = m.base_color;
 
     return out;
 }
@@ -66,8 +72,9 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> GBuff
     var out: GBufferOutput;
 
     // Sample before discarding: implicit-derivative sampling must stay in uniform control flow.
-    let albedo = textureSample(albedo_tex, tex_sampler, in.uv);
+    let albedo = textureSample(albedo_tex, tex_sampler, in.uv) * in.base_color * vec4<f32>(in.color, 1.0);
     let normal_sample = textureSample(normal_tex, tex_sampler, in.uv).rgb;
+    let metallic_roughness = textureSample(metallic_roughness_tex, tex_sampler, in.uv);
     if albedo.a < in.material.x {
         discard;
     }
@@ -84,7 +91,9 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> GBuff
 
     out.albedo = albedo;
     out.normal = vec4<f32>(world_normal * 0.5 + 0.5, 1.0);
-    out.material = vec4<f32>(0.5, 0.0, 1.0, 1.0);
+    let roughness = metallic_roughness.g * in.material.w;
+    let metallic = metallic_roughness.b * in.material.z;
+    out.material = vec4<f32>(roughness, metallic, 1.0, 0.0);
 
     return out;
 }

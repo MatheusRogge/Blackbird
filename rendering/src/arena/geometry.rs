@@ -22,8 +22,9 @@ pub struct GpuModel {
     pub model: [[f32; 4]; 4],
     /// Inverse-transpose of `model`, for normals.
     pub normal: [[f32; 4]; 4],
-    /// x: alpha cutoff (0 = never discard), y: 1 if double-sided, zw: unused.
+    /// x: alpha cutoff (0 = never discard), y: 1 if double-sided, z: metallic, w: roughness.
     pub material: [f32; 4],
+    pub base_color: [f32; 4],
 }
 
 /// Where a mesh lives inside the shared geometry buffers. `instance` indexes
@@ -203,9 +204,10 @@ impl GeometryArena {
                     material: [
                         mesh.alpha_cutoff.unwrap_or(0.0),
                         if mesh.double_sided { 1.0 } else { 0.0 },
-                        0.0,
-                        0.0,
+                        mesh.material.metallic,
+                        mesh.material.roughness,
                     ],
+                    base_color: mesh.material.base_color,
                 };
             }
         }

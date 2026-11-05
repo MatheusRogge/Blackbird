@@ -1,7 +1,7 @@
 use std::sync::RwLock;
 
 use egui::Ui;
-use engine::rendering::debug_flags::RenderDebugFlags;
+use engine::rendering::debug_flags::{GBufferView, RenderDebugFlags};
 
 use crate::state::{CameraSettings, EditorState};
 
@@ -107,6 +107,12 @@ fn draw_view_menu(ui: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<Ren
     if ui.add(egui::Button::selectable(state.show_gizmos, "Gizmos")).clicked() {
         state.show_gizmos = !state.show_gizmos;
     }
+    ui.separator();
+    ui.menu_button("G-buffer view", |ui| {
+        for view in GBufferView::ALL {
+            ui.radio_value(&mut flags.view, view, view.label());
+        }
+    });
 }
 
 fn draw_camera_settings(ui: &mut Ui, settings: &mut CameraSettings) {
