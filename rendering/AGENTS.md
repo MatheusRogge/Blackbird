@@ -10,7 +10,7 @@ wgpu 30 renderer (Vulkan backend forced). Contains the render graph, every rende
 
 | Module | Contents |
 |--------|----------|
-| `renderer` | `Renderer` (instance/surface/device/queue, resize, `render(world, overlay)`), `RenderGraphBuilder` trait, `OverlayPass` trait, `RendererError` |
+| `renderer` | `Renderer` (instance/device/queue + a target, resize, `render(world, overlay)`, `size()`), `Frame`, `RenderGraphBuilder` trait, `OverlayPass` trait, `RendererError`. Two targets share everything else: `Renderer::new(window, builder)` draws to a window surface; `Renderer::new_headless(builder, w, h)` draws to an offscreen `Rgba8UnormSrgb` texture (with an `Rgba8Unorm` view format for overlays), waits for the GPU after each `render`, and `read_frame() -> Frame { width, height, rgba }` reads it back (`RendererError::NotHeadless` on a window renderer). The graph sees the same `SurfaceConfiguration` either way |
 | `graph` | `RenderGraph`, `GraphContext`, `SubGraphBuilder`, `GraphNode`, `NodeId` |
 | `arena` | `BufferRange`, `UploadArena` (packed upload buffers), `GeometryArena` (shared mesh buffers), `FrameArena` (per-frame linear uploads), `texture_pool::assign` (screen texture aliasing), `ArenaStats` |
 | `resource` | `ResourceId`, `ResourceDescriptor`, `BindingResource`, `AllocatedResource`, `GraphResource` |
@@ -102,8 +102,8 @@ Lighting follows `KHR_lights_punctual`, so glTF intensities map 1:1. `SkyLight::
 - Only point lights are clustered. Spot (≤64) and area (≤32) lights are looped over for every pixel in `lighting.wgsl`, so keep their counts low. Area lights use a representative-point approximation (diffuse: closest point on the rectangle; specular: where the reflection ray meets it, with roughness widened by the equivalent disc radius, Karis 2013), are two-sided, and treat `right` / `up` as **half-extent** vectors.
 - The GBuffer stores **world-space** normals but local lights are in view space. `lighting.wgsl` converts the normal to view space (`N_vs`) for point/spot/area lights. Sky lights convert `L` to world space instead.
 - `pass/sdf_voxelize.rs` is **not** in `pass/mod.rs`, so it is dead code. Wire it in or delete it.
-- `Renderer::new` uses `adapter.limits()` and only the timestamp features the adapter supports. The GPU profiler activates only if `TIMESTAMP_QUERY | TIMESTAMP_QUERY_INSIDE_ENCODERS` are present.
-- The surface is sRGB, so passes output linear color. The egui overlay gets a non-sRGB view of the same texture.
+- `Renderer::new` / `new_headless` use `adapter.limits()` and only the timestamp features the adapter supports. The GPU profiler activates only if `TIMESTAMP_QUERY | TIMESTAMP_QUERY_INSIDE_ENCODERS` are present.
+- The surface (and the headless target) is sRGB, so passes output linear color. The egui overlay gets a non-sRGB view of the same texture.
 - `Renderer::resize` ignores 0×0 sizes and clamps to `max_texture_dimension_2d`.
 - `RenderDebugFlags` is shared by `Arc<RwLock>` between `DebugLayer` (render-thread UI), `ProbeAtlasPass`, `LightingPass` and `DebugOverlayPass`. To control it from outside, inject your own with `RenderGraphPBRBuilder::with_debug_flags` (the editor does this).
 

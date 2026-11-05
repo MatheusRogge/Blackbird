@@ -15,7 +15,7 @@ Each member crate has its own `AGENTS.md` with architecture, public API and gotc
 | `gltf/` | `gltf` | glTF/GLB resolver, `GltfScene` incremental loader into `World`. |
 | `ui/` | `ui` | egui integration: `UiLayer` trait, `EguiRenderer`. |
 | `engine/` | `engine` | Facade: `Engine`, `Plugin`, `HeadlessApplication`, `WindowedApplication`. Feature-gated re-exports. |
-| `sandbox/` | `sandbox` | Demo binaries (`sandbox` PBR scene, `sprites` 2D). Owns the WGSL shaders. |
+| `sandbox/` | `sandbox` | Demo binaries (`sandbox` PBR scene, `sprites` 2D, `capture` headless PNG renderer). Owns the WGSL shaders. |
 | `editor/` | `editor` | egui scene editor binary (projects, glTF load/hot-reload, lights, export, asset browser, Build menu). |
 | `project/` | `project` | `project.json` model (`Project`, `CameraSettings`, `BuildSettings`) and build output layout consts. |
 | `build_tool/` | `build_tool` | Library + `blackbird` CLI: collects a project's assets, packs them, compiles `player`. |
@@ -59,6 +59,7 @@ cargo check --workspace
 cargo clippy --workspace          # workspace lints: clippy correctness=deny, others warn
 cargo run -p sandbox              # PBR demo (hard-coded glTF path in sandbox/src/main.rs)
 cargo run -p sandbox --bin sprites
+cargo run -p sandbox --bin capture -- <asset-root> <scene> out.png [options]   # headless PNG of a scene (see sandbox/AGENTS.md)
 cargo run -p editor
 cargo test --workspace            # assets has unit tests (paths, manifest, pack, dependency walk)
 

@@ -2371,7 +2371,9 @@ dependencies = [
  "engine",
  "engine_core",
  "env_logger",
+ "image",
  "log",
+ "pollster 1.0.1",
  "rendering",
  "ultraviolet",
 ]
