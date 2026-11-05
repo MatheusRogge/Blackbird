@@ -42,8 +42,6 @@ fn main() -> anyhow::Result<()> {
     let debug_overlay    = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/debug_overlay.wgsl"));
     let ssr              = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/ssr.wgsl"));
     let composite        = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/composite.wgsl"));
-    let local_shadows    = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/local_shadows.wgsl"));
-    let local_shadow_blur = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/local_shadow_blur.wgsl"));
 
     let debug_flags = Arc::new(RwLock::new(RenderDebugFlags {
         show_grid: true,
@@ -61,8 +59,6 @@ fn main() -> anyhow::Result<()> {
         debug_overlay,
         ssr,
         composite,
-        local_shadows,
-        local_shadow_blur,
     ).with_debug_flags(debug_flags.clone());
 
     WindowedApplication::new(render_graph)

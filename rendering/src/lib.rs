@@ -1,4 +1,5 @@
 pub mod arena;
+pub mod bounds;
 pub mod bvh;
 #[cfg(feature = "debug")]
 pub mod debug_layer;

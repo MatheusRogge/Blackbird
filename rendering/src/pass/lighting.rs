@@ -45,8 +45,9 @@ pub struct LightingPass {
     material_id: ResourceId,
     emissive_id: ResourceId,
     depth_id: ResourceId,
-    local_shadow_id: ResourceId,
     shadowed_buffer_id: ResourceId,
+    local_shadow_map_id: ResourceId,
+    local_shadow_params_id: ResourceId,
 
     cluster_params_id: ResourceId,
     point_buffer_id: ResourceId,
@@ -101,7 +102,6 @@ impl LightingPass {
         light_buffers: &LightBuffers,
         shadow: &ShadowOutputs,
         probe_atlas: &ProbeAtlasOutputs,
-        local_shadow_id: ResourceId,
         camera_buffer_id: ResourceId,
         _surface_config: &wgpu::SurfaceConfiguration,
         shader: ShaderAsset,
@@ -140,8 +140,9 @@ impl LightingPass {
                 normal_id: gbuffer.normal_id,
                 material_id: gbuffer.material_id,
                 emissive_id: gbuffer.emissive_id,
-                local_shadow_id,
                 shadowed_buffer_id: light_buffers.shadowed_buffer_id,
+                local_shadow_map_id: shadow.local_shadow_map_id,
+                local_shadow_params_id: shadow.local_shadow_params_id,
                 depth_id: gbuffer.depth_id,
                 cluster_params_id: cluster.cluster_params_id,
                 point_buffer_id: light_buffers.point_buffer_id,
@@ -196,8 +197,9 @@ impl PassDesc for LightingPass {
             self.material_id,
             self.emissive_id,
             self.depth_id,
-            self.local_shadow_id,
             self.shadowed_buffer_id,
+            self.local_shadow_map_id,
+            self.local_shadow_params_id,
             self.cluster_params_id,
             self.point_buffer_id,
             self.light_grid_id,
@@ -262,10 +264,6 @@ impl Pass for LightingPass {
             return;
         };
 
-        let Some(&local_shadow_view) = ctx.views.get(&self.local_shadow_id) else {
-            return;
-        };
-
         let Some(&material_view) = ctx.views.get(&self.material_id) else {
             return;
         };
@@ -310,6 +308,11 @@ impl Pass for LightingPass {
             return;
         };
 
+        let (Some(&local_shadow_map_view), Some(&local_shadow_params_buf)) =
+            (ctx.views.get(&self.local_shadow_map_id), ctx.buffers.get(&self.local_shadow_params_id))
+        else {
+            return;
+        };
         let Some(&shadow_map_view) = ctx.views.get(&self.shadow_map_id) else {
             return;
         };
@@ -387,16 +390,6 @@ impl Pass for LightingPass {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 5,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 6,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             multisampled: false,
@@ -521,6 +514,26 @@ impl Pass for LightingPass {
                         binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2Array,
+                            sample_type: wgpu::TextureSampleType::Depth,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
                         count: None,
                     },
                 ],
@@ -747,10 +760,6 @@ impl Pass for LightingPass {
                         binding: 5,
                         resource: wgpu::BindingResource::TextureView(emissive_view),
                     },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: wgpu::BindingResource::TextureView(local_shadow_view),
-                    },
                 ],
             }));
             self.cached_albedo_ptr = albedo_ptr;
@@ -781,6 +790,14 @@ impl Pass for LightingPass {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(local_shadow_map_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: local_shadow_params_buf.binding(),
                     },
                 ],
             }));

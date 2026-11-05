@@ -3,12 +3,13 @@ use std::sync::{Arc, RwLock};
 use crate::{
     debug_flags::RenderDebugFlags,
     graph::RenderGraph,
+    light::SharedShadowCasters,
     pass::{
         bvh_upload::BvhUploadPass,
         camera::CameraPass,
         cluster_assignment::ClusterAssignmentPass,
         debug_overlay::DebugOverlayPass,
-        fullscreen::{FullscreenBuffer, FullscreenInput, FullscreenPass},
+        fullscreen::{FullscreenInput, FullscreenPass},
         gbuffer::GBufferPass,
         light_upload::LightUploadPass,
         lighting::LightingPass,
@@ -34,8 +35,6 @@ pub struct RenderGraphPBRBuilder {
     debug_overlay_shader:  ShaderAsset,
     ssr_shader:            ShaderAsset,
     composite_shader:      ShaderAsset,
-    local_shadows_shader:  ShaderAsset,
-    local_shadow_blur_shader: ShaderAsset,
     debug_flags:           Option<Arc<RwLock<RenderDebugFlags>>>,
 }
 
@@ -52,8 +51,6 @@ impl RenderGraphPBRBuilder {
         debug_overlay_shader: ShaderAsset,
         ssr_shader:           ShaderAsset,
         composite_shader:     ShaderAsset,
-        local_shadows_shader: ShaderAsset,
-        local_shadow_blur_shader: ShaderAsset,
     ) -> Self {
         Self {
             gbuffer_shader,
@@ -66,8 +63,6 @@ impl RenderGraphPBRBuilder {
             debug_overlay_shader,
             ssr_shader,
             composite_shader,
-            local_shadows_shader,
-            local_shadow_blur_shader,
             debug_flags: None,
         }
     }
@@ -96,7 +91,9 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
 
         let debug_flags = graph.debug_flags_arc();
 
-        let (light_upload_pass, light_buffers) = LightUploadPass::new(&mut graph, Arc::clone(&debug_flags));
+        let shadow_casters: SharedShadowCasters = Arc::default();
+        let (light_upload_pass, light_buffers) =
+            LightUploadPass::new(&mut graph, Arc::clone(&debug_flags), Arc::clone(&shadow_casters));
         graph.add_pass(device, light_upload_pass);
 
         let (bvh_pass, bvh_outputs) = BvhUploadPass::new(&mut graph);
@@ -123,7 +120,8 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         );
         graph.add_pass(device, probe_update_pass);
 
-        let (shadow_pass, shadow_outputs) = ShadowPass::new(&mut graph, self.shadow_shader);
+        let (shadow_pass, shadow_outputs) =
+            ShadowPass::new(&mut graph, self.shadow_shader, light_buffers.shadowed_buffer_id, shadow_casters);
         graph.add_pass(device, shadow_pass);
 
         let (gbuffer_pass, gbuffer_outputs) = GBufferPass::new(
@@ -139,39 +137,6 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             ClusterAssignmentPass::new(&mut graph, &light_buffers, self.cluster_shader);
         graph.add_pass(device, cluster_pass);
 
-        let (local_shadow_pass, local_shadow_mask_id) = FullscreenPass::new(
-            &mut graph,
-            "local_shadows",
-            vec![FullscreenInput::Depth(gbuffer_outputs.depth_id), FullscreenInput::Color(gbuffer_outputs.normal_id)],
-            vec![
-                FullscreenBuffer::Uniform(camera_buffer_id),
-                FullscreenBuffer::Uniform(light_buffers.shadowed_buffer_id),
-                FullscreenBuffer::Uniform(bvh_outputs.info_id),
-                FullscreenBuffer::Storage(light_buffers.point_buffer_id),
-                FullscreenBuffer::Storage(light_buffers.spot_buffer_id),
-                FullscreenBuffer::Storage(light_buffers.area_buffer_id),
-                FullscreenBuffer::Storage(bvh_outputs.nodes_id),
-                FullscreenBuffer::Storage(bvh_outputs.tris_id),
-            ],
-            wgpu::TextureFormat::Rgba8Unorm,
-            self.local_shadows_shader,
-        );
-        graph.add_pass(device, local_shadow_pass);
-
-        let (local_shadow_blur_pass, local_shadow_id) = FullscreenPass::new(
-            &mut graph,
-            "local_shadow_blur",
-            vec![
-                FullscreenInput::Color(local_shadow_mask_id),
-                FullscreenInput::Depth(gbuffer_outputs.depth_id),
-                FullscreenInput::Color(gbuffer_outputs.normal_id),
-            ],
-            vec![FullscreenBuffer::Uniform(camera_buffer_id)],
-            wgpu::TextureFormat::Rgba8Unorm,
-            self.local_shadow_blur_shader,
-        );
-        graph.add_pass(device, local_shadow_blur_pass);
-
         let (lighting_pass, lighting_outputs) = LightingPass::new(
             &mut graph,
             &gbuffer_outputs,
@@ -179,7 +144,6 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             &light_buffers,
             &shadow_outputs,
             &probe_atlas_outputs,
-            local_shadow_id,
             camera_buffer_id,
             surface_config,
             self.lighting_shader,
@@ -196,10 +160,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
                 FullscreenInput::Color(lighting_outputs.lit_id),
                 FullscreenInput::Color(lighting_outputs.specular_weight_id),
             ],
-            vec![
-                FullscreenBuffer::Uniform(camera_buffer_id),
-                FullscreenBuffer::Uniform(lighting_outputs.debug_flags_id),
-            ],
+            vec![camera_buffer_id, lighting_outputs.debug_flags_id],
             wgpu::TextureFormat::Rgba16Float,
             self.ssr_shader,
         );

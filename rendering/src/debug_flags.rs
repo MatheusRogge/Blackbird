@@ -24,7 +24,7 @@ pub enum GBufferView {
     Material,
     /// Emitted radiance, exposed.
     Emissive,
-    /// Ray-traced visibility of the first three shadowed local lights, one per channel.
+    /// Cube shadow map visibility of the first three shadowed local lights, one per channel.
     LocalShadows,
 }
 

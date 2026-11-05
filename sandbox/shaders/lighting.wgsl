@@ -6,8 +6,6 @@
 @group(0) @binding(4) var s_linear:   sampler;
 // Emitted radiance (texture × factor × strength), not yet exposed.
 @group(0) @binding(5) var t_emissive: texture_2d<f32>;
-// Ray-traced visibility of the `shadowed` lights, one channel each (local_shadows.wgsl).
-@group(0) @binding(6) var t_local_shadow: texture_2d<f32>;
 
 // Probe atlases + params
 const PROBES_PER_ROW: u32 = 30u;
@@ -55,9 +53,11 @@ struct DebugFlags {
 @group(4) @binding(0) var<uniform> debug: DebugFlags;
 
 // Mirrors rendering::light::ShadowedLights. Entry = kind << 16 | index.
+// lights[slot]: shadow origin in world space (xyz), light half size (w, 0 for point/spot).
 struct ShadowedLights {
     entries: vec4<u32>,
     count:   u32,
+    lights:  array<vec4<f32>, 4>,
 }
 
 @group(4) @binding(1) var<uniform> shadowed: ShadowedLights;
@@ -66,13 +66,58 @@ const SHADOW_KIND_POINT: u32 = 0u;
 const SHADOW_KIND_SPOT:  u32 = 1u;
 const SHADOW_KIND_AREA:  u32 = 2u;
 
-// Visibility of a local light at this pixel: its channel in the shadow mask if it is one of the
-// shadowed lights, else 1.
-fn local_shadow(kind: u32, index: u32, mask: vec4<f32>) -> f32 {
+// 12-tap Poisson disc on the unit disc, for cube shadow PCF.
+const POISSON: array<vec2<f32>, 12> = array<vec2<f32>, 12>(
+    vec2f(-0.326, -0.406), vec2f(-0.840, -0.074), vec2f(-0.696,  0.457),
+    vec2f(-0.203,  0.621), vec2f( 0.962, -0.195), vec2f( 0.473, -0.480),
+    vec2f( 0.519,  0.767), vec2f( 0.185, -0.893), vec2f( 0.507,  0.064),
+    vec2f( 0.896,  0.412), vec2f(-0.322, -0.933), vec2f(-0.792, -0.598),
+);
+
+// Visibility of shadowed light `slot` at world position `pos` (normal `N`), from its cube map.
+// The face is the dominant axis of the light-to-point direction, projected with that face's own
+// view-projection so the lookup matches what was rasterized. Area lights widen the PCF by their
+// size over the distance, a cheap stand-in for a penumbra.
+fn cube_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> f32 {
+    let light = shadowed.lights[slot];
+    let d = pos - light.xyz;
+    let dist = length(d);
+    let a = abs(d);
+    var face: u32;
+    if a.x >= a.y && a.x >= a.z {
+        face = select(1u, 0u, d.x > 0.0);
+    } else if a.y >= a.z {
+        face = select(3u, 2u, d.y > 0.0);
+    } else {
+        face = select(5u, 4u, d.z > 0.0);
+    }
+    let layer = slot * 6u + face;
+
+    // A 90° face spans 2·dist across at this distance: offset by ~1.5 texels along the normal.
+    let texel = 2.0 * dist * local_shadow.inv_size;
+    let clip = local_shadow.face_vp[layer] * vec4f(pos + N * (1.5 * texel), 1.0);
+    let ndc = clip.xyz / clip.w;
+    let uv = ndc.xy * vec2f(0.5, -0.5) + 0.5;
+
+    let radius_texels = select(1.5, clamp(light.w / max(dist, 1e-3) / local_shadow.inv_size * 0.5, 1.5, 8.0), light.w > 0.0);
+    let radius = radius_texels * local_shadow.inv_size;
+    let angle = fract(52.9829189 * fract(dot(pixel, vec2f(0.06711056, 0.00583715)))) * 6.28318531;
+    let rot = mat2x2<f32>(cos(angle), sin(angle), -sin(angle), cos(angle));
+    var lit = 0.0;
+    for (var i = 0u; i < 12u; i++) {
+        let tap = clamp(uv + rot * POISSON[i] * radius, vec2f(0.0), vec2f(1.0));
+        lit += textureSampleCompareLevel(t_local_shadow, s_shadow, tap, i32(layer), ndc.z);
+    }
+    return lit / 12.0;
+}
+
+// Visibility of a local light at this pixel: its cube shadow if it is one of the shadowed
+// lights, else 1.
+fn local_shadow_of(kind: u32, index: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> f32 {
     if debug.disable_shadows != 0u { return 1.0; }
     let entry = kind << 16u | index;
     for (var slot = 0u; slot < min(shadowed.count, 4u); slot++) {
-        if shadowed.entries[slot] == entry { return mask[slot]; }
+        if shadowed.entries[slot] == entry { return cube_shadow(slot, pos, N, pixel); }
     }
     return 1.0;
 }
@@ -335,6 +380,16 @@ struct ShadowParams {
 @group(2) @binding(0) var<uniform> sp:       ShadowParams;
 @group(2) @binding(1) var          t_shadow: texture_depth_2d_array;
 @group(2) @binding(2) var          s_shadow: sampler_comparison;
+// One cube (6 layers, +X −X +Y −Y +Z −Z) per shadowed local light.
+@group(2) @binding(3) var          t_local_shadow: texture_depth_2d_array;
+
+// Mirrors rendering::pass::shadow::LocalShadowParams.
+struct LocalShadowParams {
+    face_vp:  array<mat4x4<f32>, 24>,
+    inv_size: f32,
+}
+
+@group(2) @binding(4) var<uniform> local_shadow: LocalShadowParams;
 
 fn select_cascade(depth_vs: f32) -> u32 {
     if depth_vs < sp.cascade_splits.x { return 0u; }
@@ -425,7 +480,6 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
         case 2u: { return unreflective(textureSample(t_normal, s_linear, in.uv).rgb); }
         case 3u: { return unreflective(textureSample(t_material, s_linear, in.uv).rgb); }
         case 4u: { return unreflective(textureSample(t_emissive, s_linear, in.uv).rgb * cp.exposure); }
-        case 5u: { return unreflective(textureLoad(t_local_shadow, frag_xy, 0).rgb); }
         default: {}
     }
 
@@ -436,7 +490,6 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
     let roughness  = max(material.r, MIN_ROUGHNESS);
     let metallic   = material.g;
     let emissive   = textureSample(t_emissive, s_linear, in.uv).rgb;
-    let shadow_mask = textureLoad(t_local_shadow, frag_xy, 0);
 
     // Reconstruct view-space depth from reversed-Z depth buffer value.
     // z_view_pos = z_near * z_far / (depth * (z_far - z_near) + z_near)
@@ -455,6 +508,14 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
     // Reconstruct world-space position from NDC + raw depth
     let pos_ws4 = camera.inv_view_proj * vec4f(ndc_x, ndc_y, depth_v, 1.0);
     let pos_ws  = pos_ws4.xyz / pos_ws4.w;
+
+    if debug.view == 5u {
+        var vis = vec3f(1.0);
+        for (var slot = 0u; slot < min(shadowed.count, 3u); slot++) {
+            vis[slot] = cube_shadow(slot, pos_ws, N, in.pos.xy);
+        }
+        return unreflective(vis);
+    }
 
     // Cluster lookup
     let cx = u32(in.pos.x / cp.tile_w);
@@ -510,7 +571,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
             }
 
             let L = to_light / dist;
-            let vis = local_shadow(SHADOW_KIND_POINT, li, shadow_mask);
+            let vis = local_shadow_of(SHADOW_KIND_POINT, li, pos_ws, N, in.pos.xy);
             color += brdf(surf_vs, L) * light.color * (light.intensity * vis * range_attenuation(dist, light.radius));
         }
 
@@ -526,7 +587,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
             let L  = to_light / dist;
             let cd = dot(-L, normalize(light.direction_vs));
             let t  = clamp((cd - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
-            let vis = local_shadow(SHADOW_KIND_SPOT, i, shadow_mask);
+            let vis = local_shadow_of(SHADOW_KIND_SPOT, i, pos_ws, N, in.pos.xy);
             color += brdf(surf_vs, L) * light.color * (light.intensity * vis * t * t * range_attenuation(dist, light.radius));
         }
 
@@ -555,7 +616,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
 
             let area     = 4.0 * half_r * half_u;
             let normal   = normalize(cross(r_dir, u_dir));
-            let radiance = light.color * light.intensity * local_shadow(SHADOW_KIND_AREA, i, shadow_mask);
+            let radiance = light.color * light.intensity * local_shadow_of(SHADOW_KIND_AREA, i, pos_ws, N, in.pos.xy);
             let facing   = area_facing(light, -L, normal);
             color += diffuse_brdf(surf_vs, L) * radiance * (facing * area / (dist2 + area));
 

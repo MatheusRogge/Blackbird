@@ -9,6 +9,7 @@
 //!   --exposure E         linear exposure override
 //!   --no-specular --no-reflections --no-ssr --no-emissive-lights --no-indirect --no-direct --no-shadows
 //!   --view lit|albedo|normal|material|emissive|shadows
+//!   --point x,y,z,I      add a white point light of I candela (range 10)
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
 //! ```
 
@@ -39,6 +40,7 @@ struct Options {
     target: Option<Vec3>,
     exposure: Option<f32>,
     reloads: u32,
+    points: Vec<(Vec3, f32)>,
     flags: RenderDebugFlags,
 }
 
@@ -64,6 +66,7 @@ fn parse_args() -> Result<Options> {
         target: None,
         exposure: None,
         reloads: 0,
+        points: Vec::new(),
         flags: RenderDebugFlags::default(),
     };
 
@@ -81,6 +84,11 @@ fn parse_args() -> Result<Options> {
             "--target" => options.target = Some(parse_vec3(&value()?)?),
             "--exposure" => options.exposure = Some(value()?.parse()?),
             "--reloads" => options.reloads = value()?.parse()?,
+            "--point" => {
+                let v = value()?;
+                let (position, intensity) = v.rsplit_once(',').context("--point x,y,z,intensity")?;
+                options.points.push((parse_vec3(position)?, intensity.parse()?));
+            }
             "--no-specular" => flags.specular = false,
             "--no-reflections" => flags.reflections = false,
             "--no-ssr" => flags.ssr = false,
@@ -115,6 +123,9 @@ fn load_scene(options: &Options, world: &mut World) -> Result<()> {
 
     for (_, light) in lights::read_lights(&asset.document)? {
         light.spawn(world);
+    }
+    for &(position, intensity) in &options.points {
+        world.add_entity(PointLight { position, color: Vec3::one(), intensity, radius: 10.0 });
     }
     let mut scene = GltfScene::new(Arc::clone(&asset));
     while scene.load_batch(world, 1000) {}
@@ -193,8 +204,6 @@ fn main() -> Result<()> {
         shader("debug_overlay.wgsl")?,
         shader("ssr.wgsl")?,
         shader("composite.wgsl")?,
-        shader("local_shadows.wgsl")?,
-        shader("local_shadow_blur.wgsl")?,
     )
     .with_debug_flags(flags);
 

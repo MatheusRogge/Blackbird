@@ -1,19 +1,18 @@
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use engine_core::{
-    entity::EntityKey,
-    world::{EntityHandle, World},
-};
+use engine_core::world::{EntityHandle, World};
 use ultraviolet::{Mat4, Vec3, Vec4};
 
 use crate::{
-    arena::GeometryArena,
+    arena::{GeometryArena, MeshDraw},
+    bounds::Aabb,
     camera::Camera,
     graph::{NodeId, RenderGraph},
-    light::SkyLight,
+    light::{MAX_SHADOWED_LIGHTS, ShadowCaster, SharedShadowCasters, SkyLight},
     mesh::Mesh,
     pass::{Pass, PassContext, PassDesc, gbuffer::GBufferPass},
     resource::{ResourceDescriptor, ResourceId},
@@ -28,6 +27,30 @@ const CASCADE_LAMBDA: f32 = 0.75;
 const CASCADE_VP_STRIDE: u64 = 256;
 const VP_SIZE: u64 = std::mem::size_of::<[[f32; 4]; 4]>() as u64;
 
+/// Face size of each shadowed local light's cube map.
+pub const LOCAL_SHADOW_SIZE: u32 = 512;
+pub const LOCAL_SHADOW_FACES: usize = MAX_SHADOWED_LIGHTS * 6;
+const LOCAL_SHADOW_NEAR: f32 = 0.02;
+/// Cube faces in the order `lighting.wgsl` picks them by dominant axis: +X, −X, +Y, −Y, +Z, −Z.
+const CUBE_FACES: [(Vec3, Vec3); 6] = [
+    (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, -1.0, 0.0)),
+    (Vec3::new(-1.0, 0.0, 0.0), Vec3::new(0.0, -1.0, 0.0)),
+    (Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
+    (Vec3::new(0.0, -1.0, 0.0), Vec3::new(0.0, 0.0, -1.0)),
+    (Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, -1.0, 0.0)),
+    (Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.0, -1.0, 0.0)),
+];
+
+/// View-projections of every cube face, slot-major (`slot * 6 + face`). Mirrors
+/// `LocalShadowParams` in `lighting.wgsl`.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct LocalShadowParams {
+    pub face_vp: [[[f32; 4]; 4]; LOCAL_SHADOW_FACES],
+    pub inv_size: f32,
+    pub _pad: [f32; 3],
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct ShadowParams {
@@ -41,6 +64,10 @@ pub struct ShadowParams {
 pub struct ShadowOutputs {
     pub shadow_map_id: ResourceId,
     pub shadow_params_id: ResourceId,
+    /// Depth32Float, `LOCAL_SHADOW_FACES` layers: one cube per shadowed local light.
+    pub local_shadow_map_id: ResourceId,
+    /// Uniform `LocalShadowParams`.
+    pub local_shadow_params_id: ResourceId,
 }
 
 pub struct ShadowPass {
@@ -64,38 +91,20 @@ pub struct ShadowPass {
     cascade_views: Vec<wgpu::TextureView>,
     cascade_bind_group: Option<wgpu::BindGroup>,
 
-    local_bounds: HashMap<EntityKey, Aabb>,
-}
-
-#[derive(Clone, Copy)]
-struct Aabb {
-    min: Vec3,
-    max: Vec3,
-}
-
-impl Aabb {
-    fn empty() -> Self {
-        Self { min: Vec3::broadcast(f32::MAX), max: Vec3::broadcast(f32::MIN) }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.min.x > self.max.x
-    }
-
-    fn extend(&mut self, p: Vec3) {
-        self.min = self.min.min_by_component(p);
-        self.max = self.max.max_by_component(p);
-    }
-
-    fn corners(&self) -> [Vec3; 8] {
-        let (a, b) = (self.min, self.max);
-        [
-            Vec3::new(a.x, a.y, a.z), Vec3::new(b.x, a.y, a.z),
-            Vec3::new(a.x, b.y, a.z), Vec3::new(b.x, b.y, a.z),
-            Vec3::new(a.x, a.y, b.z), Vec3::new(b.x, a.y, b.z),
-            Vec3::new(a.x, b.y, b.z), Vec3::new(b.x, b.y, b.z),
-        ]
-    }
+    /// Read only to run after `light_upload`, which fills `casters` this frame.
+    shadowed_buffer_id: ResourceId,
+    casters: SharedShadowCasters,
+    local_map_id: ResourceId,
+    local_params_id: ResourceId,
+    local_vp_id: ResourceId,
+    local_views: Vec<wgpu::TextureView>,
+    local_bind_group: Option<wgpu::BindGroup>,
+    /// Unculled, depth-biased variants of the two pipelines: cube faces see both sides of walls.
+    local_pipeline: Option<wgpu::RenderPipeline>,
+    local_masked_pipeline: Option<wgpu::RenderPipeline>,
+    /// What each slot's cube was last rendered for, with the scene geometry signature then.
+    rendered: [Option<(ShadowCaster, u64)>; MAX_SHADOWED_LIGHTS],
+    local_params: LocalShadowParams,
 }
 
 /// Key of a mesh's albedo texture in `ShadowPass::masked_textures`: its `TextureAsset::id`, 0 for none.
@@ -138,7 +147,12 @@ impl ShadowPass {
         self.masked_textures.retain(|key, _| *key == 0 || live.contains(key));
     }
 
-    pub fn new(graph: &mut RenderGraph, shader: ShaderAsset) -> (Self, ShadowOutputs) {
+    pub fn new(
+        graph: &mut RenderGraph,
+        shader: ShaderAsset,
+        shadowed_buffer_id: ResourceId,
+        casters: SharedShadowCasters,
+    ) -> (Self, ShadowOutputs) {
         let shadow_map_id = graph.alloc_resource_id(ResourceDescriptor::FixedTexture {
             size: wgpu::Extent3d {
                 width: SHADOW_MAP_SIZE,
@@ -159,7 +173,32 @@ impl ShadowPass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let outputs = ShadowOutputs { shadow_map_id, shadow_params_id };
+        let local_map_id = graph.alloc_resource_id(ResourceDescriptor::FixedTexture {
+            size: wgpu::Extent3d {
+                width: LOCAL_SHADOW_SIZE,
+                height: LOCAL_SHADOW_SIZE,
+                depth_or_array_layers: LOCAL_SHADOW_FACES as u32,
+            },
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        });
+
+        let local_params_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
+            size: std::mem::size_of::<LocalShadowParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let local_vp_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
+            size: CASCADE_VP_STRIDE * LOCAL_SHADOW_FACES as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let outputs = ShadowOutputs {
+            shadow_map_id,
+            shadow_params_id,
+            local_shadow_map_id: local_map_id,
+            local_shadow_params_id: local_params_id,
+        };
 
         (
             Self {
@@ -178,36 +217,140 @@ impl ShadowPass {
                 cascade_vp_id,
                 cascade_views: Vec::new(),
                 cascade_bind_group: None,
-                local_bounds: HashMap::new(),
+                shadowed_buffer_id,
+                casters,
+                local_map_id,
+                local_params_id,
+                local_vp_id,
+                local_views: Vec::new(),
+                local_bind_group: None,
+                local_pipeline: None,
+                local_masked_pipeline: None,
+                rendered: [None; MAX_SHADOWED_LIGHTS],
+                local_params: LocalShadowParams::zeroed(),
             },
             outputs,
         )
     }
+}
 
-    /// World-space bounds of every mesh. Local bounds are computed once per
-    /// entity, so only the transforms are re-applied each frame.
-    fn scene_bounds(&mut self, meshes: &[EntityHandle<'_, Mesh>]) -> Aabb {
-        let live: HashSet<EntityKey> = meshes.iter().map(|h| h.id).collect();
-        self.local_bounds.retain(|key, _| live.contains(key));
+impl ShadowPass {
+    /// Renders the cube map of every shadowed light whose light or scene geometry changed since
+    /// its last render, and uploads all face view-projections.
+    fn render_local_shadows(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        ctx: &PassContext<'_>,
+        meshes: &[EntityHandle<'_, Mesh>],
+        masked: &[&EntityHandle<'_, Mesh>],
+    ) {
+        let (Some(&vp_buf), Some(&params_buf)) = (ctx.buffers.get(&self.local_vp_id), ctx.buffers.get(&self.local_params_id))
+        else {
+            return;
+        };
+        let (Some(pipeline), Some(masked_pipeline), Some(bind_group), Some((_, instance_bg))) = (
+            &self.local_pipeline,
+            &self.local_masked_pipeline,
+            &self.local_bind_group,
+            &self.instance_bind_group,
+        ) else {
+            return;
+        };
+        if self.local_views.len() != LOCAL_SHADOW_FACES {
+            return;
+        }
 
-        let mut scene = Aabb::empty();
+        let mut hasher = std::hash::DefaultHasher::new();
+        ctx.geometry.generation().hash(&mut hasher);
         for handle in meshes {
-            let local = self.local_bounds.entry(handle.id).or_insert_with(|| {
-                let mut bounds = Aabb::empty();
-                for v in &handle.entity.vertices {
-                    bounds.extend(Vec3::from(v.position));
-                }
-                bounds
-            });
-            if local.is_empty() {
-                continue;
-            }
-            for corner in local.corners() {
-                scene.extend(handle.entity.transform.transform_point3(corner));
+            handle.id.hash(&mut hasher);
+            for value in handle.entity.transform.as_array() {
+                value.to_bits().hash(&mut hasher);
             }
         }
-        scene
+        let geometry = hasher.finish();
+
+        let casters = *self.casters.lock().expect("shadow_casters poisoned");
+        for (slot, caster) in casters.iter().enumerate() {
+            let Some(caster) = *caster else {
+                self.rendered[slot] = None;
+                continue;
+            };
+            if self.rendered[slot] == Some((caster, geometry)) {
+                continue;
+            }
+            self.rendered[slot] = Some((caster, geometry));
+
+            let proj = ultraviolet::projection::perspective_wgpu_dx(
+                std::f32::consts::FRAC_PI_2,
+                1.0,
+                LOCAL_SHADOW_NEAR,
+                caster.range.max(LOCAL_SHADOW_NEAR * 2.0),
+            );
+            for (face, &(dir, up)) in CUBE_FACES.iter().enumerate() {
+                let layer = slot * 6 + face;
+                let vp = proj * Mat4::look_at(caster.origin, caster.origin + dir, up);
+                let cols = vp.cols;
+                let vp_raw: [[f32; 4]; 4] = [cols[0].into(), cols[1].into(), cols[2].into(), cols[3].into()];
+                self.local_params.face_vp[layer] = vp_raw;
+                let offset = CASCADE_VP_STRIDE * layer as u64;
+                vp_buf.write_at(queue, offset, bytemuck::bytes_of(&vp_raw));
+
+
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("shadow_local_face"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.local_views[layer],
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bind_group, &[offset as u32]);
+                pass.set_bind_group(1, instance_bg, &[]);
+                pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
+                pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
+                for (_, draw) in visible(meshes.iter().filter(|h| !h.entity.is_masked()), ctx.geometry, vp) {
+                    pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
+                }
+
+                pass.set_pipeline(masked_pipeline);
+                pass.set_bind_group(0, bind_group, &[offset as u32]);
+                pass.set_bind_group(1, instance_bg, &[]);
+                let mut current_texture = None;
+                for (handle, draw) in visible(masked.iter().copied(), ctx.geometry, vp) {
+                    let key = albedo_key(handle.entity);
+                    if current_texture != Some(key) {
+                        let Some((_, texture_bg)) = self.masked_textures.get(&key).or(self.masked_textures.get(&0))
+                        else {
+                            continue;
+                        };
+                        pass.set_bind_group(2, texture_bg, &[]);
+                        current_texture = Some(key);
+                    }
+                    pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
+                }
+            }
+        }
+
+        self.local_params.inv_size = 1.0 / LOCAL_SHADOW_SIZE as f32;
+        params_buf.write(queue, bytemuck::bytes_of(&self.local_params));
     }
+}
+
+/// The meshes with geometry whose bounds reach into the clip volume of `view_proj`.
+fn visible<'m, 'w: 'm, 'g>(
+    meshes: impl Iterator<Item = &'m EntityHandle<'w, Mesh>>,
+    geometry: &'g GeometryArena,
+    view_proj: Mat4,
+) -> impl Iterator<Item = (&'m EntityHandle<'w, Mesh>, &'g MeshDraw)> {
+    meshes.filter_map(move |h| {
+        let draw = geometry.get(h.id)?;
+        (!draw.bounds.outside_clip(view_proj * h.entity.transform)).then_some((h, draw))
+    })
 }
 
 fn ortho_rh_wgpu(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) -> Mat4 {
@@ -297,11 +440,18 @@ impl PassDesc for ShadowPass {
     }
 
     fn reads(&self) -> Vec<ResourceId> {
-        vec![]
+        vec![self.shadowed_buffer_id]
     }
 
     fn writes(&self) -> Vec<ResourceId> {
-        vec![self.shadow_map_id, self.shadow_params_id, self.cascade_vp_id]
+        vec![
+            self.shadow_map_id,
+            self.shadow_params_id,
+            self.cascade_vp_id,
+            self.local_map_id,
+            self.local_params_id,
+            self.local_vp_id,
+        ]
     }
 }
 
@@ -344,7 +494,16 @@ impl Pass for ShadowPass {
         let light_view = Mat4::look_at(camera.eye - dir, camera.eye, up);
 
         let meshes = world.get_entity_handles::<Mesh>();
-        let scene = self.scene_bounds(&meshes);
+        let mut scene = Aabb::empty();
+        for handle in &meshes {
+            if let Some(draw) = ctx.geometry.get(handle.id) {
+                let world_bounds = draw.bounds.transformed(handle.entity.transform);
+                if !world_bounds.is_empty() {
+                    scene.extend(world_bounds.min);
+                    scene.extend(world_bounds.max);
+                }
+            }
+        }
         if scene.is_empty() {
             return;
         }
@@ -396,31 +555,51 @@ impl Pass for ShadowPass {
                 immediate_size: 0,
             });
 
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("shadow_pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("vs_main"),
-                    buffers: &[Some(crate::mesh::Vertex::buffer_descriptor())],
-                    compilation_options: Default::default(),
-                },
-                fragment: None,
-                primitive: wgpu::PrimitiveState {
-                    cull_mode: Some(wgpu::Face::Front),
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
+            let depth_pipeline = |label: &str,
+                                  layout: &wgpu::PipelineLayout,
+                                  masked: bool,
+                                  cull_mode: Option<wgpu::Face>,
+                                  bias: wgpu::DepthBiasState| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(layout),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some(if masked { "vs_masked" } else { "vs_main" }),
+                        buffers: &[Some(crate::mesh::Vertex::buffer_descriptor())],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: masked.then(|| wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some("fs_masked"),
+                        targets: &[],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState { cull_mode, ..Default::default() },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(true),
+                        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                        stencil: wgpu::StencilState::default(),
+                        bias,
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+            // Cube faces sit inside rooms and see walls from both sides, so they can't rely on
+            // front-face culling against acne like the cascades do.
+            let local_bias = wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 };
+
+            let pipeline = depth_pipeline(
+                "shadow_pipeline",
+                &pipeline_layout,
+                false,
+                Some(wgpu::Face::Front),
+                wgpu::DepthBiasState::default(),
+            );
+            self.local_pipeline = Some(depth_pipeline("shadow_local_pipeline", &pipeline_layout, false, None, local_bias));
 
             let masked_texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("shadow_masked_texture_layout"),
@@ -450,36 +629,15 @@ impl Pass for ShadowPass {
                 immediate_size: 0,
             });
 
-            let masked_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("shadow_masked_pipeline"),
-                layout: Some(&masked_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("vs_masked"),
-                    buffers: &[Some(crate::mesh::Vertex::buffer_descriptor())],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some("fs_masked"),
-                    targets: &[],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
+            let masked_pipeline = depth_pipeline(
+                "shadow_masked_pipeline",
+                &masked_pipeline_layout,
+                true,
+                None,
+                wgpu::DepthBiasState::default(),
+            );
+            self.local_masked_pipeline =
+                Some(depth_pipeline("shadow_local_masked_pipeline", &masked_pipeline_layout, true, None, local_bias));
 
             self.masked_sampler = Some(device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("shadow_masked_sampler"),
@@ -504,9 +662,38 @@ impl Pass for ShadowPass {
                 }],
             }));
 
+            if let Some(&local_vp_buf) = ctx.buffers.get(&self.local_vp_id) {
+                self.local_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("shadow_local_bg"),
+                    layout: &bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            size: wgpu::BufferSize::new(VP_SIZE),
+                            ..local_vp_buf.buffer_binding()
+                        }),
+                    }],
+                }));
+            }
+
             self.bgl = Some(bgl);
             self.instance_layout = Some(instance_layout);
             self.pipeline = Some(pipeline);
+        }
+
+        if self.local_views.is_empty()
+            && let Some(&tex) = ctx.textures.get(&self.local_map_id)
+        {
+            self.local_views = (0..LOCAL_SHADOW_FACES as u32)
+                .map(|layer| {
+                    tex.create_view(&wgpu::TextureViewDescriptor {
+                        dimension: Some(wgpu::TextureViewDimension::D2),
+                        base_array_layer: layer,
+                        array_layer_count: Some(1),
+                        ..Default::default()
+                    })
+                })
+                .collect();
         }
 
         // Create per-layer render attachment views once, from the graph-allocated texture.
@@ -598,8 +785,7 @@ impl Pass for ShadowPass {
             pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
             pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
 
-            let opaque = meshes.iter().filter(|h| !h.entity.is_masked());
-            for draw in opaque.filter_map(|h| ctx.geometry.get(h.id)) {
+            for (_, draw) in visible(meshes.iter().filter(|h| !h.entity.is_masked()), ctx.geometry, light_vp) {
                 pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
             }
 
@@ -610,8 +796,7 @@ impl Pass for ShadowPass {
             pass.set_bind_group(0, bg, &[vp_offset as u32]);
             pass.set_bind_group(1, instance_bg, &[]);
             let mut current_texture = None;
-            for handle in &masked {
-                let Some(draw) = ctx.geometry.get(handle.id) else { continue };
+            for (handle, draw) in visible(masked.iter().copied(), ctx.geometry, light_vp) {
                 let key = albedo_key(handle.entity);
                 if current_texture != Some(key) {
                     let Some((_, texture_bg)) = self.masked_textures.get(&key).or(self.masked_textures.get(&0)) else {
@@ -623,6 +808,8 @@ impl Pass for ShadowPass {
                 pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
             }
         }
+
+        self.render_local_shadows(encoder, queue, ctx, &meshes, &masked);
 
         let params = ShadowParams {
             view_to_shadow: view_to_shadow_raw,

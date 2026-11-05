@@ -13,7 +13,8 @@ use crate::{
         emissive::{self, EmissiveRect},
         AreaLight, GpuAreaLight, GpuPointLight, GpuSkyLight, GpuSpotLight, LightCounts,
         MAX_AREA_LIGHTS, MAX_POINT_LIGHTS, MAX_SKY_LIGHTS, MAX_SPOT_LIGHTS, PointLight, SkyLight,
-        SpotLight, MAX_SHADOWED_LIGHTS, SHADOW_KIND_AREA, SHADOW_KIND_POINT, SHADOW_KIND_SPOT, ShadowedLights,
+        SpotLight, MAX_SHADOWED_LIGHTS, SHADOW_ENTRY_NONE, SHADOW_KIND_AREA, SHADOW_KIND_POINT, SHADOW_KIND_SPOT, ShadowCaster,
+        ShadowedLights, SharedShadowCasters,
     },
     mesh::Mesh,
     pass::{PassContext, Pass, PassDesc},
@@ -22,6 +23,11 @@ use crate::{
 
 /// Emissive meshes dimmer than this (in lumens, emitting from one side) don't become lights.
 const MIN_EMISSIVE_FLUX: f32 = 0.01;
+/// An area light's shadow range ends where its illuminance drops below this (lux), up to the max.
+const MIN_SHADOW_ILLUMINANCE: f32 = 1e-3;
+const MAX_AREA_SHADOW_RANGE: f32 = 50.0;
+/// How far in front of a one-sided area light its shadow map is centred.
+const AREA_SHADOW_OFFSET: f32 = 0.02;
 
 pub struct LightBuffers {
     pub point_buffer_id: ResourceId,
@@ -41,10 +47,16 @@ pub struct LightUploadPass {
     /// Emissive texture means per `TextureAsset::id`.
     emissive_means: HashMap<u64, [f32; 3]>,
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
+    /// The slots picked this frame, for `ShadowPass` to render.
+    shadow_casters: SharedShadowCasters,
 }
 
 impl LightUploadPass {
-    pub fn new(graph: &mut RenderGraph, debug_flags: Arc<RwLock<RenderDebugFlags>>) -> (Self, LightBuffers) {
+    pub fn new(
+        graph: &mut RenderGraph,
+        debug_flags: Arc<RwLock<RenderDebugFlags>>,
+        shadow_casters: SharedShadowCasters,
+    ) -> (Self, LightBuffers) {
         let point_buffer_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: (MAX_POINT_LIGHTS * size_of::<GpuPointLight>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -89,6 +101,7 @@ impl LightUploadPass {
             emissive_rects: HashMap::new(),
             emissive_means: HashMap::new(),
             debug_flags,
+            shadow_casters,
             buffers: LightBuffers {
                 point_buffer_id,
                 spot_buffer_id,
@@ -259,29 +272,63 @@ impl Pass for LightUploadPass {
         // The lights most likely to matter on screen: flux over squared distance to the camera.
         let importance = |position: ultraviolet::Vec3, flux: f32| flux / ((position - camera.eye).mag_sq() + 1.0);
         let four_pi = 4.0 * std::f32::consts::PI;
-        let mut candidates: Vec<(f32, u32)> = points
+        let caster = |kind: u32, i: usize, origin, range| ShadowCaster { entry: kind << 16 | i as u32, origin, range };
+        let mut candidates: Vec<(f32, ShadowCaster, f32)> = points
             .iter()
             .take(MAX_POINT_LIGHTS)
             .enumerate()
-            .map(|(i, l)| (importance(l.position, four_pi * l.intensity), SHADOW_KIND_POINT << 16 | i as u32))
+            .map(|(i, l)| {
+                (importance(l.position, four_pi * l.intensity), caster(SHADOW_KIND_POINT, i, l.position, l.radius), 0.0)
+            })
             .chain(spots.iter().take(MAX_SPOT_LIGHTS).enumerate().map(|(i, l)| {
-                (importance(l.position, four_pi * l.intensity), SHADOW_KIND_SPOT << 16 | i as u32)
+                (importance(l.position, four_pi * l.intensity), caster(SHADOW_KIND_SPOT, i, l.position, l.radius), 0.0)
             }))
             .chain(areas.iter().enumerate().map(|(i, l)| {
                 let sides = if l.two_sided { 2.0 } else { 1.0 };
-                let flux = sides * std::f32::consts::PI * l.intensity * 4.0 * l.right.mag() * l.up.mag();
-                (importance(l.position, flux), SHADOW_KIND_AREA << 16 | i as u32)
+                let area = 4.0 * l.right.mag() * l.up.mag();
+                let flux = sides * std::f32::consts::PI * l.intensity * area;
+                // Where its illuminance (≈ L·A / d²) falls below MIN_SHADOW_ILLUMINANCE.
+                let range = (l.intensity * area / MIN_SHADOW_ILLUMINANCE).sqrt().clamp(1.0, MAX_AREA_SHADOW_RANGE);
+                // One-sided lights shadow from just in front, so their own emitter mesh isn't a caster.
+                let origin = if l.two_sided {
+                    l.position
+                } else {
+                    l.position + l.right.cross(l.up).normalized() * AREA_SHADOW_OFFSET
+                };
+                let half_size = l.right.mag().max(l.up.mag());
+                (importance(l.position, flux), caster(SHADOW_KIND_AREA, i, origin, range), half_size)
             }))
-            .filter(|(score, _)| *score > 0.0)
+            .filter(|(score, ..)| *score > 0.0)
             .collect();
         candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
-        // With shadows off nothing is traced: `local_shadows` skips pixels when the count is 0.
-        let mut shadowed = ShadowedLights::default();
-        let traced = if shadows { MAX_SHADOWED_LIGHTS } else { 0 };
-        for (slot, &(_, entry)) in candidates.iter().take(traced).enumerate() {
-            shadowed.entries[slot] = entry;
-            shadowed.count += 1;
+
+        // A light keeps its slot while it stays selected, so its cube map stays cached when the
+        // ranking reshuffles as the camera moves.
+        let selected = &candidates[..candidates.len().min(if shadows { MAX_SHADOWED_LIGHTS } else { 0 })];
+        let mut shared = self.shadow_casters.lock().expect("shadow_casters poisoned");
+        let mut slots: [Option<(ShadowCaster, f32)>; MAX_SHADOWED_LIGHTS] = [None; MAX_SHADOWED_LIGHTS];
+        for (slot, previous) in shared.iter().enumerate() {
+            slots[slot] = previous
+                .and_then(|p| selected.iter().find(|(_, c, _)| c.entry == p.entry))
+                .map(|&(_, c, half_size)| (c, half_size));
         }
+        for &(_, caster, half_size) in selected {
+            if slots.iter().flatten().all(|(c, _)| c.entry != caster.entry)
+                && let Some(free) = slots.iter_mut().find(|s| s.is_none())
+            {
+                *free = Some((caster, half_size));
+            }
+        }
+
+        let mut shadowed = ShadowedLights { entries: [SHADOW_ENTRY_NONE; MAX_SHADOWED_LIGHTS], ..Default::default() };
+        for (slot, entry) in slots.iter().enumerate() {
+            let Some((caster, half_size)) = *entry else { continue };
+            shadowed.entries[slot] = caster.entry;
+            shadowed.lights[slot] = [caster.origin.x, caster.origin.y, caster.origin.z, half_size];
+            shadowed.count = slot as u32 + 1;
+        }
+        *shared = slots.map(|s| s.map(|(c, _)| c));
+        drop(shared);
 
         let sky_lights: Vec<GpuSkyLight> = world
             .get_entities::<SkyLight>()

@@ -8,7 +8,10 @@ use engine_core::{
 use bytemuck::Zeroable;
 use offset_allocator::{Allocation, Allocator};
 
-use crate::mesh::{Mesh, Vertex};
+use crate::{
+    bounds::Aabb,
+    mesh::{Mesh, Vertex},
+};
 
 const INITIAL_VERTICES: u32 = 256 * 1024;
 const INITIAL_INDICES: u32 = 1024 * 1024;
@@ -36,6 +39,8 @@ pub struct MeshDraw {
     pub base_vertex: i32,
     pub indices: Range<u32>,
     pub instance: u32,
+    /// Local-space bounds of the vertices.
+    pub bounds: Aabb,
 }
 
 impl MeshDraw {
@@ -240,6 +245,7 @@ impl GeometryArena {
             base_vertex: vertex.offset as i32,
             indices: index.offset..index.offset + mesh.indices.len() as u32,
             instance,
+            bounds: Aabb::from_points(mesh.vertices.iter().map(|v| v.position.into())),
         };
         self.meshes.insert(key, MeshAlloc { vertex, index, draw });
         true

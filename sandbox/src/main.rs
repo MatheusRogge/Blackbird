@@ -119,8 +119,6 @@ fn main() -> anyhow::Result<()> {
     let debug_overlay_shader  = ShaderAsset::from_raw(include_str!("../shaders/debug_overlay.wgsl"));
     let ssr_shader            = ShaderAsset::from_raw(include_str!("../shaders/ssr.wgsl"));
     let composite_shader      = ShaderAsset::from_raw(include_str!("../shaders/composite.wgsl"));
-    let local_shadows_shader  = ShaderAsset::from_raw(include_str!("../shaders/local_shadows.wgsl"));
-    let local_shadow_blur     = ShaderAsset::from_raw(include_str!("../shaders/local_shadow_blur.wgsl"));
 
     let render_graph = RenderGraphPBRBuilder::new(
         gbuffer_shader,
@@ -133,8 +131,6 @@ fn main() -> anyhow::Result<()> {
         debug_overlay_shader,
         ssr_shader,
         composite_shader,
-        local_shadows_shader,
-        local_shadow_blur,
     );
 
     WindowedApplication::new(render_graph)

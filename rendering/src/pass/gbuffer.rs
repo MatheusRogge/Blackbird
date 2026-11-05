@@ -6,6 +6,7 @@ use std::{
 use engine_core::world::World;
 
 use crate::{
+    camera::Camera,
     graph::{NodeId, RenderGraph},
     mesh::{Mesh, Vertex},
     arena::GeometryArena,
@@ -742,7 +743,15 @@ impl Pass for GBufferPass {
 
         // Group draws by pipeline, then by bind group key, so consecutive meshes
         // that share a material don't trigger a GPU state switch.
-        let mut draw_order: Vec<usize> = (0..meshes.len()).collect();
+        let (w, h) = ctx.surface_size;
+        let view_proj = world.get_entities::<Camera>().first().map(|c| c.view_proj_matrix(w as f32 / h as f32));
+        let in_view = |i: usize| {
+            let handle = &meshes[i];
+            view_proj.is_none_or(|vp| {
+                ctx.geometry.get(handle.id).is_some_and(|d| !d.bounds.outside_clip(vp * handle.entity.transform))
+            })
+        };
+        let mut draw_order: Vec<usize> = (0..meshes.len()).filter(|&i| in_view(i)).collect();
         draw_order.sort_unstable_by_key(|&i| {
             let m = meshes[i].entity;
             (m.double_sided, material_key(m))

@@ -4,8 +4,8 @@ mod gpu;
 
 pub use entity::{AreaLight, PointLight, SkyLight, SpotLight};
 pub use gpu::{
-    GpuAreaLight, GpuPointLight, GpuSkyLight, GpuSpotLight, LightCounts, MAX_SHADOWED_LIGHTS, SHADOW_KIND_AREA,
-    SHADOW_KIND_POINT, SHADOW_KIND_SPOT, ShadowedLights,
+    GpuAreaLight, GpuPointLight, GpuSkyLight, GpuSpotLight, LightCounts, MAX_SHADOWED_LIGHTS, SHADOW_ENTRY_NONE, SHADOW_KIND_AREA,
+    SHADOW_KIND_POINT, SHADOW_KIND_SPOT, ShadowCaster, ShadowedLights, SharedShadowCasters,
 };
 
 pub const MAX_POINT_LIGHTS: usize = 256;

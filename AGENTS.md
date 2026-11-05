@@ -81,6 +81,8 @@ project.json + default_scene + build.include
 
 Only assets reachable from the roots ship. A resolver that reads extra files must report them from `AssetResolver::dependencies`, or production builds will be missing them.
 
+The `dev` profile builds dependencies at `opt-level = 2` (workspace crates stay unoptimized): unoptimized wgpu costs several times more CPU per draw, which made debug frame timings misleading.
+
 Only `assets` has tests so far. CI (`.github/workflows/rust.yml`) runs `cargo build` and `cargo test` on `master`.
 
 ## Conventions
