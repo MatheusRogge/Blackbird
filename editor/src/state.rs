@@ -183,6 +183,8 @@ pub struct EditorState {
     pub selected: Option<Selection>,
     pub node_edits: HashMap<usize, NodeEdit>,
     pub gizmo_mode: GizmoMode,
+    /// Light markers for unselected lights. The selection's gizmo is always drawn.
+    pub show_gizmos: bool,
 
     pub editor_camera_key: Option<EntityKey>,
     pub camera_settings: CameraSettings,
@@ -226,6 +228,7 @@ impl EditorState {
             selected: None,
             node_edits: HashMap::new(),
             gizmo_mode: GizmoMode::default(),
+            show_gizmos: true,
             camera_preview_node: None,
             editor_camera_key: None,
             camera_settings: CameraSettings::default(),

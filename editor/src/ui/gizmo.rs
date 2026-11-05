@@ -375,6 +375,9 @@ fn paint_light_markers(painter: &egui::Painter, view: &View, state: &EditorState
     let mut markers = Vec::new();
     let mut marks = Marks::default();
     for (idx, light) in state.lights.iter().enumerate() {
+        if !state.show_gizmos && selected != Some(idx) {
+            continue;
+        }
         let stroke_color = if selected == Some(idx) { ACTIVE_COLOR } else { Color32::from_gray(230) };
         let (position, color) = match light.data {
             LightData::Sky { direction, color, .. } => {

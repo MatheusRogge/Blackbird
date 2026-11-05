@@ -71,7 +71,7 @@ pub fn draw(root: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<RenderD
             ui.add_enabled_ui(state.project.is_some(), |ui| {
                 ui.menu_button("Build", |ui| super::build::draw_menu(ui, state));
             });
-            ui.menu_button("View", |ui| draw_view_menu(ui, debug_flags));
+            ui.menu_button("View", |ui| draw_view_menu(ui, state, debug_flags));
             ui.menu_button("Camera", |ui| draw_camera_settings(ui, &mut state.camera_settings));
         });
     });
@@ -98,11 +98,14 @@ fn draw_project_menu(ui: &mut Ui, state: &mut EditorState) {
     });
 }
 
-fn draw_view_menu(ui: &mut Ui, debug_flags: &RwLock<RenderDebugFlags>) {
+fn draw_view_menu(ui: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<RenderDebugFlags>) {
     let mut flags = debug_flags.write().expect("debug_flags poisoned");
     let grid = egui::Button::selectable(flags.show_grid, "Grid").shortcut_text(ui.ctx().format_shortcut(&GRID_SHORTCUT));
     if ui.add(grid).clicked() {
         flags.show_grid = !flags.show_grid;
+    }
+    if ui.add(egui::Button::selectable(state.show_gizmos, "Gizmos")).clicked() {
+        state.show_gizmos = !state.show_gizmos;
     }
 }
 
