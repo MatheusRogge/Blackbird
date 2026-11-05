@@ -5,7 +5,10 @@ mod hierarchy;
 mod inspector;
 mod toolbar;
 
+use std::sync::{Arc, RwLock};
+
 use engine_core::world::World;
+use engine::rendering::debug_flags::RenderDebugFlags;
 use engine::ui::UiLayer;
 
 use crate::state::SharedState;
@@ -13,11 +16,12 @@ use crate::state::SharedState;
 pub struct EditorUiLayer {
     state: SharedState,
     assets: assets::AssetPanel,
+    debug_flags: Arc<RwLock<RenderDebugFlags>>,
 }
 
 impl EditorUiLayer {
-    pub fn new(state: SharedState) -> Self {
-        Self { state, assets: assets::AssetPanel::default() }
+    pub fn new(state: SharedState, debug_flags: Arc<RwLock<RenderDebugFlags>>) -> Self {
+        Self { state, assets: assets::AssetPanel::default(), debug_flags }
     }
 }
 
@@ -25,7 +29,7 @@ impl UiLayer for EditorUiLayer {
     fn ui(&mut self, ctx: &egui::Context, world: &World) {
         let Ok(mut state) = self.state.try_lock() else { return };
         let viewport = ctx.root_ui(|root| {
-            toolbar::draw(root, &mut state);
+            toolbar::draw(root, &mut state, &self.debug_flags);
             hierarchy::draw(root, &mut state);
             inspector::draw(root, &mut state);
             self.assets.draw(root, &mut state);
@@ -66,6 +70,7 @@ fn draw_camera_hints(ctx: &egui::Context) {
                         ("LMB + Scroll", "Move speed"),
                         ("Click",    "Select"),
                         ("1 / 2 / 3", "Move / Rotate / Scale"),
+                        ("G",        "Toggle grid"),
                     ] {
                         ui.horizontal(|ui| {
                             ui.add(egui::Label::new(

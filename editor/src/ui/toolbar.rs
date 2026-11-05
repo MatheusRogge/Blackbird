@@ -1,13 +1,22 @@
+use std::sync::RwLock;
+
 use egui::Ui;
+use engine::rendering::debug_flags::RenderDebugFlags;
 
 use crate::state::{CameraSettings, EditorState};
 
 const SAVE_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+const GRID_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::G);
 
-pub fn draw(root: &mut Ui, state: &mut EditorState) {
+pub fn draw(root: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<RenderDebugFlags>) {
     let can_save = state.document.is_some();
     if can_save && root.ctx().input_mut(|i| i.consume_shortcut(&SAVE_SHORTCUT)) {
         state.save_requested = true;
+    }
+    let typing = root.ctx().egui_wants_keyboard_input();
+    if !typing && root.ctx().input_mut(|i| i.consume_shortcut(&GRID_SHORTCUT)) {
+        let mut flags = debug_flags.write().expect("debug_flags poisoned");
+        flags.show_grid = !flags.show_grid;
     }
 
     egui::Panel::top("toolbar").show(root, |ui| {
@@ -62,6 +71,7 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
             ui.add_enabled_ui(state.project.is_some(), |ui| {
                 ui.menu_button("Build", |ui| super::build::draw_menu(ui, state));
             });
+            ui.menu_button("View", |ui| draw_view_menu(ui, debug_flags));
             ui.menu_button("Camera", |ui| draw_camera_settings(ui, &mut state.camera_settings));
         });
     });
@@ -86,6 +96,14 @@ fn draw_project_menu(ui: &mut Ui, state: &mut EditorState) {
             ui.radio_value(&mut project.default_scene, Some(scene), label);
         }
     });
+}
+
+fn draw_view_menu(ui: &mut Ui, debug_flags: &RwLock<RenderDebugFlags>) {
+    let mut flags = debug_flags.write().expect("debug_flags poisoned");
+    let grid = egui::Button::selectable(flags.show_grid, "Grid").shortcut_text(ui.ctx().format_shortcut(&GRID_SHORTCUT));
+    if ui.add(grid).clicked() {
+        flags.show_grid = !flags.show_grid;
+    }
 }
 
 fn draw_camera_settings(ui: &mut Ui, settings: &mut CameraSettings) {

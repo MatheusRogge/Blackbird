@@ -55,12 +55,12 @@ fn main() -> anyhow::Result<()> {
         probe_trace,
         probe_update,
         debug_overlay,
-    ).with_debug_flags(debug_flags);
+    ).with_debug_flags(debug_flags.clone());
 
     WindowedApplication::new(render_graph)
         .with_title("Blackbird Editor")
         .add_plugin(EditorPlugin::new(shared_state.clone()))
-        .add_ui_layer(EditorUiLayer::new(shared_state))
+        .add_ui_layer(EditorUiLayer::new(shared_state, debug_flags))
         .run()?;
 
     Ok(())
