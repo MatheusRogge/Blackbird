@@ -7,6 +7,11 @@ rust-version = "1.99"
 [lints]
 workspace = true
 
+# The crate shares its name with the upstream `gltf` it depends on, so rustdoc finds two `gltf`
+# rlibs and can't build doctests. There are none.
+[lib]
+doctest = false
+
 [dependencies]
 gltf = { version = "1.4.1", features = [
   "extras",
