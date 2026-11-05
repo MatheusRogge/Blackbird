@@ -12,6 +12,7 @@ use engine::gltf::{GLTFAsset, GltfScene};
 use engine::plugin::{EnginePluginError, Plugin};
 use engine::rendering::camera::Camera;
 use engine::rendering::mesh::Mesh;
+use ultraviolet::Vec3;
 
 use build_tool::{BuildKind, BuildOptions, BuildOutput};
 use project::Project;
@@ -27,6 +28,11 @@ type TransformSnapshot = Vec<(usize, [f32; 10])>;
 const PROJECT_SAVE_DELAY: Duration = Duration::from_millis(500);
 /// Lines of build output kept for the build log window.
 const BUILD_LOG_LINES: usize = 4000;
+/// Quiet period after the last scene file event before hot reloading.
+const RELOAD_QUIET: Duration = Duration::from_millis(500);
+/// Delay before retrying a failed hot reload, e.g. one that read a half-written file.
+const RELOAD_RETRY_DELAY: Duration = Duration::from_secs(1);
+const RELOAD_MAX_RETRIES: u32 = 3;
 /// Lens of the editor's viewport camera, restored after Assume Camera View.
 const EDITOR_FOV_Y_DEG: f32 = 45.0;
 const EDITOR_NEAR: f32 = 0.01;
@@ -44,7 +50,11 @@ pub struct EditorPlugin {
     pending_gltf: Option<AssetLoadHandle<GLTFAsset>>,
     watcher: Option<notify::RecommendedWatcher>,
     watch_rx: Option<mpsc::Receiver<notify::Result<notify::Event>>>,
-    last_reload: Option<Instant>,
+    /// Set when a load is a hot reload: the current scene stays until it succeeds.
+    reloading: bool,
+    /// When to hot reload: pushed back by every file event, so a reload waits for the writer to finish.
+    reload_due: Option<Instant>,
+    reload_retries: u32,
     ignore_changes_until: Option<Instant>,
     applied_transforms: TransformSnapshot,
     applied_entities: usize,
@@ -65,7 +75,9 @@ impl EditorPlugin {
             pending_gltf: None,
             watcher: None,
             watch_rx: None,
-            last_reload: None,
+            reloading: false,
+            reload_due: None,
+            reload_retries: 0,
             ignore_changes_until: None,
             applied_transforms: Vec::new(),
             applied_entities: 0,
@@ -425,14 +437,26 @@ impl EditorPlugin {
     }
 
     fn start_load(&mut self, engine: &mut Engine, path: PathBuf) {
+        self.clear_scene(engine, path.clone());
+        self.reload_due = None;
+        self.reloading = false;
+        self.pending_gltf = Some(engine.assets().load_async::<GLTFAsset>(path.to_str().unwrap_or("")));
+    }
+
+    /// Loads the open scene again in the background, keeping the current one until it succeeds.
+    fn start_reload(&mut self, engine: &mut Engine) {
+        let Some(path) = self.state.lock().expect("editor state mutex poisoned").file_path.clone() else { return };
+        self.reloading = true;
+        self.pending_gltf = Some(engine.assets().load_async::<GLTFAsset>(path.to_str().unwrap_or("")));
+    }
+
+    fn clear_scene(&mut self, engine: &mut Engine, path: PathBuf) {
         self.watcher = None;
         self.watch_rx = None;
         let camera_key = self.reset_world(engine);
         self.scene = None;
         self.applied_transforms.clear();
         self.applied_entities = 0;
-        let handle = engine.assets().load_async::<GLTFAsset>(path.to_str().unwrap_or(""));
-        self.pending_gltf = Some(handle);
 
         let mut s = self.state.lock().expect("editor state mutex poisoned");
         s.editor_camera_key = Some(camera_key);
@@ -457,9 +481,17 @@ impl EditorPlugin {
         };
         let Some(result) = result else { return };
         self.pending_gltf = None;
+        let reloading = std::mem::take(&mut self.reloading);
 
         match result {
             Ok(asset) => {
+                if reloading {
+                    let path = self.state.lock().expect("editor state mutex poisoned").file_path.clone();
+                    let view = self.editor_camera_pose(engine);
+                    self.clear_scene(engine, path.unwrap_or_default());
+                    self.restore_editor_camera_pose(engine, view);
+                }
+                self.reload_retries = 0;
                 let doc = asset.document.clone();
                 let nodes = build_scene_nodes(&doc);
                 let (lights, lights_error) = match engine::gltf::lights::read_lights(&doc) {
@@ -494,12 +526,31 @@ impl EditorPlugin {
                     s.file_path.clone()
                 };
                 if let Some(path) = scene_path {
-                    self.setup_watcher(&path, &doc);
+                    self.setup_watcher(&path, Some(&doc));
                 }
             }
-            Err(e) => {
+            Err(e) if reloading => {
+                let retry = self.reload_retries < RELOAD_MAX_RETRIES;
+                if retry {
+                    self.reload_retries += 1;
+                    self.reload_due = Some(Instant::now() + RELOAD_RETRY_DELAY);
+                }
                 let mut s = self.state.lock().expect("editor state mutex poisoned");
-                s.status = format!("Load error: {e}");
+                s.status = format!(
+                    "Reload failed, keeping the previous version{}: {e}",
+                    if retry { " (retrying)" } else { "" },
+                );
+            }
+            Err(e) => {
+                let path = {
+                    let mut s = self.state.lock().expect("editor state mutex poisoned");
+                    s.status = format!("Load error: {e}");
+                    s.file_path.clone()
+                };
+                // Without a document only the scene file can be watched; fixing it reloads.
+                if let Some(path) = path {
+                    self.setup_watcher(&path, None);
+                }
             }
         }
     }
@@ -543,8 +594,8 @@ impl EditorPlugin {
         match preview {
             Some((node_world, edit)) => {
                 cam.eye = node_world.extract_translation();
-                cam.target = cam.eye + node_world.transform_vec3(-ultraviolet::Vec3::unit_z()).normalized();
-                cam.up = node_world.transform_vec3(ultraviolet::Vec3::unit_y()).normalized();
+                cam.target = cam.eye + node_world.transform_vec3(-Vec3::unit_z()).normalized();
+                cam.up = node_world.transform_vec3(Vec3::unit_y()).normalized();
                 cam.fovy = edit.fov_y_deg.to_radians();
                 cam.near = edit.near;
                 cam.far = edit.far.unwrap_or(INFINITE_FAR);
@@ -697,7 +748,8 @@ impl EditorPlugin {
         s.status = format!("Building {kind}… (uses the saved scene files)");
     }
 
-    fn setup_watcher(&mut self, scene_path: &Path, doc: &gltf_api::Document) {
+    /// Watches the scene file and, given its document, every external buffer and image.
+    fn setup_watcher(&mut self, scene_path: &Path, doc: Option<&gltf_api::Document>) {
         use notify::Watcher;
 
         let (tx, rx) = mpsc::channel();
@@ -718,18 +770,20 @@ impl EditorPlugin {
         watch(&mut watcher, scene_path);
 
         let base = scene_path.parent().unwrap_or(Path::new("."));
-        for buffer in doc.buffers() {
-            if let gltf_api::buffer::Source::Uri(uri) = buffer.source()
-                && !uri.starts_with("data:")
-            {
-                watch(&mut watcher, &base.join(uri));
+        if let Some(doc) = doc {
+            for buffer in doc.buffers() {
+                if let gltf_api::buffer::Source::Uri(uri) = buffer.source()
+                    && !uri.starts_with("data:")
+                {
+                    watch(&mut watcher, &base.join(uri));
+                }
             }
-        }
-        for image in doc.images() {
-            if let gltf_api::image::Source::Uri { uri, .. } = image.source()
-                && !uri.starts_with("data:")
-            {
-                watch(&mut watcher, &base.join(uri));
+            for image in doc.images() {
+                if let gltf_api::image::Source::Uri { uri, .. } = image.source()
+                    && !uri.starts_with("data:")
+                {
+                    watch(&mut watcher, &base.join(uri));
+                }
             }
         }
 
@@ -756,25 +810,29 @@ impl EditorPlugin {
         };
 
         let now = Instant::now();
-        if !changed || self.ignore_changes_until.is_some_and(|t| now < t) {
-            return;
+        if changed && self.ignore_changes_until.is_none_or(|t| now >= t) {
+            self.reload_due = Some(now + RELOAD_QUIET);
+            self.reload_retries = 0;
         }
 
-        let debounce_elapsed = self.last_reload
-            .map(|t| now.duration_since(t).as_millis() >= 300)
-            .unwrap_or(true);
-
-        if !debounce_elapsed {
-            return;
+        if self.pending_gltf.is_none() && self.reload_due.is_some_and(|t| now >= t) {
+            self.reload_due = None;
+            self.start_reload(engine);
         }
+    }
 
-        let path = match self.state.lock().expect("editor state mutex poisoned").file_path.clone() {
-            Some(p) => p,
-            None => return,
-        };
+    fn editor_camera_pose(&self, engine: &mut Engine) -> Option<(Vec3, Vec3)> {
+        let key = self.state.lock().expect("editor state mutex poisoned").editor_camera_key?;
+        engine.world().get_entity::<Camera>(key).map(|cam| (cam.eye, cam.target))
+    }
 
-        self.last_reload = Some(now);
-        self.start_load(engine, path);
+    fn restore_editor_camera_pose(&self, engine: &mut Engine, pose: Option<(Vec3, Vec3)>) {
+        let Some((eye, target)) = pose else { return };
+        let Some(key) = self.state.lock().expect("editor state mutex poisoned").editor_camera_key else { return };
+        if let Some(cam) = engine.world().get_entity_mut::<Camera>(key) {
+            cam.eye = eye;
+            cam.target = target;
+        }
     }
 }
 
