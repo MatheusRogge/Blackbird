@@ -10,10 +10,11 @@ struct BvhNode {
     right_or_prim_count: u32,      // internal→right child; leaf→(0x80000000 | count)
 }
 
+// Mirrors rendering::bvh::GpuTriangle.
 struct BvhTriangle {
-    v0: vec3<f32>, _pad0: u32,
-    v1: vec3<f32>, _pad1: u32,
-    v2: vec3<f32>, _pad2: u32,
+    v0: vec3<f32>, albedo_metallic: u32,  // linear albedo rgb + metallic, unorm8
+    v1: vec3<f32>, roughness: f32,
+    v2: vec3<f32>, _pad: u32,
 }
 
 struct BvhInfo {
@@ -65,6 +66,7 @@ struct TraceResult {
     pos:    vec3<f32>,
     normal: vec3<f32>,
     dist:   f32,
+    tri:    u32,
 }
 
 // ── Bindings ──────────────────────────────────────────────────────────────────
@@ -144,6 +146,7 @@ fn bvh_trace(ro: vec3<f32>, rd: vec3<f32>, max_dist: f32) -> TraceResult {
                     var n = normalize(cross(e1, e2));
                     if dot(n, rd) > 0.0 { n = -n; }
                     result.normal = n;
+                    result.tri    = first + i;
                 }
             }
         } else {
@@ -180,8 +183,25 @@ fn probe_world_position(probe_index: u32) -> vec3<f32> {
 
 // ── Shading helpers ───────────────────────────────────────────────────────────
 
-fn shade_hit(pos: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
-    let albedo = vec3<f32>(0.5);
+// Karis' analytic fit of the split-sum environment BRDF. Same as in lighting.wgsl.
+fn env_brdf_approx(f0: vec3<f32>, roughness: f32, n_dot_v: f32) -> vec3<f32> {
+    let c0 = vec4f(-1.0, -0.0275, -0.572, 0.022);
+    let c1 = vec4f(1.0, 0.0425, 1.04, -0.04);
+    let r = roughness * c0 + c1;
+    let a004 = min(r.x * r.x, exp2(-9.28 * n_dot_v)) * r.x + r.y;
+    let ab = vec2f(-1.04, 1.04) * a004 + r.zw;
+    return f0 * ab.x + ab.y;
+}
+
+// Radiance leaving the hit toward the probe. The specular part uses the reflectance seen from
+// the probe but is spread like diffuse: tracing the real lobe would make glossy floors flicker
+// through the probes, and the probes only store irradiance anyway.
+fn shade_hit(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>, tri: BvhTriangle) -> vec3<f32> {
+    let material  = unpack4x8unorm(tri.albedo_metallic);
+    let metallic  = material.a;
+    let f0        = mix(vec3f(0.04), material.rgb, metallic);
+    let specular  = env_brdf_approx(f0, tri.roughness, max(dot(normal, to_probe), 1e-4));
+    let albedo    = material.rgb * (1.0 - metallic) * (1.0 - specular) + specular;
     var radiance = vec3<f32>(0.0);
     for (var i = 0u; i < light_counts.num_sky; i++) {
         let dir_ws  = (frame.inv_view * vec4<f32>(sky_lights[i].direction_vs, 0.0)).xyz;
@@ -232,7 +252,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if result.hit {
         hit_dist = result.dist;
-        radiance = shade_hit(result.pos, result.normal);
+        radiance = shade_hit(result.pos, result.normal, -ray_dir, bvh_tris[result.tri]);
     } else {
         hit_dist = probe_params.max_ray_distance;
         radiance = sample_sky(ray_dir);

@@ -43,6 +43,7 @@ struct DebugFlags {
     disable_shadows:  u32,
     // 0 lit, 1 albedo, 2 normal, 3 material (rendering::debug_flags::GBufferView).
     view:             u32,
+    disable_specular: u32,
 }
 
 @group(4) @binding(0) var<uniform> debug: DebugFlags;
@@ -89,7 +90,9 @@ fn chebyshev_weight(mean_d: f32, mean_d2: f32, dist: f32) -> f32 {
     return variance / (variance + d * d);
 }
 
-fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {
+// `dir` is the direction the irradiance is looked up in: the normal for diffuse, or near the
+// reflection vector as a stand-in for glossy reflections. Bias and visibility always follow `N_ws`.
+fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>, dir: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {
     let biased_pos = pos_ws
         + N_ws    * probe_params.normal_bias
         + view_dir * probe_params.view_bias;
@@ -99,6 +102,7 @@ fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>, view_dir: vec3<f3
     let frac     = grid_pos - base_f;
     let dim      = vec3<i32>(probe_params.grid_dim);
     let oct_uv   = octahedral_encode(N_ws);
+    let dir_uv   = octahedral_encode(dir);
 
     var irradiance   = vec3f(0.0);
     var weight_total = 0.0;
@@ -125,7 +129,7 @@ fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>, view_dir: vec3<f3
                 let vis    = textureSample(visibility_atlas, probe_sampler, vis_uv).rg;
                 let w_vis  = chebyshev_weight(vis.r, vis.g, probe_dist);
 
-                let irr_uv = irradiance_atlas_uv(probe_index, oct_uv);
+                let irr_uv = irradiance_atlas_uv(probe_index, dir_uv);
                 let irr    = textureSample(irradiance_atlas, probe_sampler, irr_uv).rgb;
 
                 let w = max(w_tri * w_vis, 0.0001);
@@ -158,6 +162,68 @@ struct ClusterParams {
 }
 
 const PI: f32 = 3.14159265;
+// Keeps the GGX peak finite so point lights don't turn into single-pixel fireflies.
+const MIN_ROUGHNESS: f32 = 0.045;
+
+struct Surface {
+    N: vec3<f32>,
+    V: vec3<f32>,
+    diffuse_color: vec3<f32>,
+    f0: vec3<f32>,
+    // GGX alpha (perceptual roughness squared).
+    alpha: f32,
+}
+
+fn fresnel_schlick(f0: vec3<f32>, v_dot_h: f32) -> vec3<f32> {
+    return f0 + (1.0 - f0) * pow(1.0 - v_dot_h, 5.0);
+}
+
+fn d_ggx(n_dot_h: f32, alpha: f32) -> f32 {
+    let a2 = alpha * alpha;
+    let d = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d);
+}
+
+// Height-correlated Smith, with the 1 / (4 N.L N.V) folded in.
+fn v_smith_ggx(n_dot_v: f32, n_dot_l: f32, alpha: f32) -> f32 {
+    let a2 = alpha * alpha;
+    let gv = n_dot_l * sqrt(n_dot_v * n_dot_v * (1.0 - a2) + a2);
+    let gl = n_dot_v * sqrt(n_dot_l * n_dot_l * (1.0 - a2) + a2);
+    return 0.5 / max(gv + gl, 1e-5);
+}
+
+// Cook-Torrance specular times N.L, for light arriving from `L`.
+fn specular_brdf(s: Surface, L: vec3<f32>, alpha: f32) -> vec3<f32> {
+    let n_dot_l = max(dot(s.N, L), 0.0);
+    if n_dot_l <= 0.0 { return vec3f(0.0); }
+    let H = normalize(s.V + L);
+    let n_dot_v = max(dot(s.N, s.V), 1e-4);
+    let F = fresnel_schlick(s.f0, max(dot(s.V, H), 0.0));
+    let spec = d_ggx(max(dot(s.N, H), 0.0), alpha) * v_smith_ggx(n_dot_v, n_dot_l, alpha) * F;
+    return select(spec, vec3f(0.0), debug.disable_specular != 0u) * n_dot_l;
+}
+
+// Lambert, minus the energy Fresnel sent to specular, times N.L.
+fn diffuse_brdf(s: Surface, L: vec3<f32>) -> vec3<f32> {
+    let n_dot_l = max(dot(s.N, L), 0.0);
+    let H = normalize(s.V + L);
+    let F = select(fresnel_schlick(s.f0, max(dot(s.V, H), 0.0)), vec3f(0.0), debug.disable_specular != 0u);
+    return (1.0 - F) * s.diffuse_color / PI * n_dot_l;
+}
+
+fn brdf(s: Surface, L: vec3<f32>) -> vec3<f32> {
+    return diffuse_brdf(s, L) + specular_brdf(s, L, s.alpha);
+}
+
+// Karis' analytic fit of the split-sum environment BRDF (scale, bias applied to F0).
+fn env_brdf_approx(f0: vec3<f32>, roughness: f32, n_dot_v: f32) -> vec3<f32> {
+    let c0 = vec4f(-1.0, -0.0275, -0.572, 0.022);
+    let c1 = vec4f(1.0, 0.0425, 1.04, -0.04);
+    let r = roughness * c0 + c1;
+    let a004 = min(r.x * r.x, exp2(-9.28 * n_dot_v)) * r.x + r.y;
+    let ab = vec2f(-1.04, 1.04) * a004 + r.zw;
+    return f0 * ab.x + ab.y;
+}
 
 // KHR_lights_punctual recommended falloff: inverse-square, smoothly windowed to zero at `range`.
 fn range_attenuation(dist: f32, range: f32) -> f32 {
@@ -316,6 +382,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let albedo_raw = textureSample(t_albedo, s_linear, in.uv).rgb;
     let albedo     = select(albedo_raw, vec3f(1.0), debug.disable_albedo != 0u);
     let norm_enc   = textureSample(t_normal, s_linear, in.uv).rgb;
+    let material   = textureSample(t_material, s_linear, in.uv);
+    let roughness  = max(material.r, MIN_ROUGHNESS);
+    let metallic   = material.g;
 
     // Reconstruct view-space depth from reversed-Z depth buffer value.
     // z_view_pos = z_near * z_far / (depth * (z_far - z_near) + z_near)
@@ -351,12 +420,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let cam_pos  = camera.inv_view[3].xyz;
     let view_dir = normalize(cam_pos - pos_ws);
-    let indirect = sample_probe_irradiance(pos_ws, N, view_dir);
-    var color: vec3f;
-    if debug.disable_indirect != 0u {
-        color = vec3f(0.0);
-    } else {
-        color = albedo * indirect;
+
+    let diffuse_color = albedo * (1.0 - metallic);
+    let f0 = mix(vec3f(0.04), albedo, metallic);
+    let alpha = roughness * roughness;
+    // Local lights are shaded in view space, sky lights and probes in world space.
+    let surf_vs = Surface(N_vs, normalize(-pos_vs), diffuse_color, f0, alpha);
+    let surf_ws = Surface(N, view_dir, diffuse_color, f0, alpha);
+
+    var color = vec3f(0.0);
+    if debug.disable_indirect == 0u {
+        color = diffuse_color * sample_probe_irradiance(pos_ws, N, N, view_dir);
+
+        // Stand-in for reflections: probe irradiance around the reflection vector, leaning toward
+        // N as roughness grows (Filament's dominant direction).
+        if debug.disable_specular == 0u {
+            let n_dot_v = max(dot(N, view_dir), 1e-4);
+            let R = normalize(mix(reflect(-view_dir, N), N, alpha));
+            let env = sample_probe_irradiance(pos_ws, N, R, view_dir);
+            color += env * env_brdf_approx(f0, roughness, n_dot_v);
+        }
     }
 
     if debug.disable_direct == 0u {
@@ -370,9 +453,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 continue;
             }
 
-            let L    = to_light / dist;
-            let diff = max(dot(N_vs, L), 0.0);
-            color += albedo / PI * light.color * (light.intensity * diff * range_attenuation(dist, light.radius));
+            let L = to_light / dist;
+            color += brdf(surf_vs, L) * light.color * (light.intensity * range_attenuation(dist, light.radius));
         }
 
         for (var i = 0u; i < light_counts.num_spot; i++) {
@@ -384,15 +466,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 continue;
             }
 
-            let L    = to_light / dist;
-            let cd   = dot(-L, normalize(light.direction_vs));
-            let t    = clamp((cd - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
-            let diff = max(dot(N_vs, L), 0.0);
-            color += albedo / PI * light.color * (light.intensity * diff * t * t * range_attenuation(dist, light.radius));
+            let L  = to_light / dist;
+            let cd = dot(-L, normalize(light.direction_vs));
+            let t  = clamp((cd - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
+            color += brdf(surf_vs, L) * light.color * (light.intensity * t * t * range_attenuation(dist, light.radius));
         }
 
-        // Representative-point approximation: light from the closest point on the rectangle,
-        // scaled by its area so the falloff stays bounded as the surface approaches the light.
+        // Representative-point approximation. Diffuse takes light from the closest point on the
+        // rectangle, specular from where the reflection ray meets it, both scaled by the area so
+        // the falloff stays bounded as the surface approaches the light.
         for (var i = 0u; i < light_counts.num_area; i++) {
             let light = area_lights[i];
 
@@ -413,18 +495,38 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let dist2    = max(dot(to_light, to_light), 1e-4);
             let L        = to_light * inverseSqrt(dist2);
 
-            let area    = 4.0 * half_r * half_u;
-            let facing  = abs(dot(L, normalize(cross(r_dir, u_dir))));
-            let diff    = max(dot(N_vs, L), 0.0);
-            let falloff = area / (dist2 + area);
-            color += albedo / PI * light.color * (light.intensity * diff * facing * falloff);
+            let area     = 4.0 * half_r * half_u;
+            let normal   = normalize(cross(r_dir, u_dir));
+            let radiance = light.color * light.intensity;
+            let facing   = abs(dot(L, normal));
+            color += diffuse_brdf(surf_vs, L) * radiance * (facing * area / (dist2 + area));
+
+            // A ray parallel to or facing away from the plane falls back to the closest point.
+            let R     = reflect(-surf_vs.V, N_vs);
+            let r_dot = dot(R, normal);
+            let t_hit = dot(light.position_vs - pos_vs, normal) / select(r_dot, 1.0, abs(r_dot) < 1e-4);
+            var spec_point = closest;
+            if abs(r_dot) >= 1e-4 && t_hit > 0.0 {
+                let hit = pos_vs + R * t_hit - light.position_vs;
+                spec_point = light.position_vs
+                    + r_dir * clamp(dot(hit, r_dir), -half_r, half_r)
+                    + u_dir * clamp(dot(hit, u_dir), -half_u, half_u);
+            }
+            let to_spec     = spec_point - pos_vs;
+            let spec_dist2  = max(dot(to_spec, to_spec), 1e-4);
+            let L_spec      = to_spec * inverseSqrt(spec_dist2);
+            // Karis' sphere-light widening, using the radius of a disc with the rectangle's area.
+            let source_r    = sqrt(area / PI);
+            let spec_alpha  = clamp(alpha + source_r / (2.0 * sqrt(spec_dist2)), 0.0, 1.0);
+            let spec_facing = abs(dot(L_spec, normal));
+            color += specular_brdf(surf_vs, L_spec, spec_alpha) * radiance
+                * (spec_facing * area / (spec_dist2 + area));
         }
 
         for (var i = 0u; i < cp.num_sky_lights; i++) {
             let sky = sky_lights[i];
             let L = normalize((camera.inv_view * vec4f(-sky.direction_vs, 0.0)).xyz);
             if L.y < 0.0 { continue; }
-            let diff = max(dot(N, L), 0.0);
 
             // Select cascade based on view-space depth and project into shadow space.
             let cascade     = select_cascade(depth_vs);
@@ -450,7 +552,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 lit = shadow_sum / 9.0;
             }
 
-            color += albedo / PI * sky.color * (sky.intensity * diff * lit);
+            color += brdf(surf_ws, L) * sky.color * (sky.intensity * lit);
         }
     }
 

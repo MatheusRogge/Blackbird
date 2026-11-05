@@ -101,6 +101,7 @@ impl UiLayer for DebugLayer {
                     ui.checkbox(&mut flags.indirect, "Indirect (GI)");
                     ui.checkbox(&mut flags.direct, "Direct lights");
                     ui.checkbox(&mut flags.shadows, "Shadows");
+                    ui.checkbox(&mut flags.specular, "Specular");
                     egui::ComboBox::from_label("View")
                         .selected_text(flags.view.label())
                         .show_ui(ui, |ui| {

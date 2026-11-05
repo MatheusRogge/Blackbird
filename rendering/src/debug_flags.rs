@@ -8,7 +8,8 @@ pub struct DebugFlagsGpu {
     pub disable_direct:   u32,
     pub disable_shadows:  u32,
     pub view:             u32,
-    pub _pad:             [u32; 3],
+    pub disable_specular: u32,
+    pub _pad:             [u32; 2],
 }
 
 /// What the `lighting` pass outputs: the lit image, or one G-buffer target as-is.
@@ -40,6 +41,7 @@ pub struct RenderDebugFlags {
     pub indirect: bool,
     pub direct:   bool,
     pub shadows:  bool,
+    pub specular: bool,
     pub view:     GBufferView,
 
     pub show_bvh:        bool,
@@ -62,6 +64,7 @@ impl Default for RenderDebugFlags {
             indirect: true,
             direct:   true,
             shadows:  true,
+            specular: true,
             view:     GBufferView::Lit,
 
             show_bvh:        false,
@@ -87,7 +90,8 @@ impl RenderDebugFlags {
             disable_direct:   !self.direct as u32,
             disable_shadows:  !self.shadows as u32,
             view:             self.view as u32,
-            _pad:             [0; 3],
+            disable_specular: !self.specular as u32,
+            _pad:             [0; 2],
         }
     }
 }

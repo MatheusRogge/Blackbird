@@ -22,11 +22,12 @@ pub struct BvhNode {
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct GpuTriangle {
     pub v0: [f32; 3],
-    pub _pad0: u32,
+    /// Linear albedo RGB + metallic, packed unorm8 (`unpack4x8unorm`).
+    pub albedo_metallic: u32,
     pub v1: [f32; 3],
-    pub _pad1: u32,
+    pub roughness: f32,
     pub v2: [f32; 3],
-    pub _pad2: u32,
+    pub _pad: u32,
 }
 
 #[repr(C)]

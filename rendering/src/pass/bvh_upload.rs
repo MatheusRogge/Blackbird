@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -11,6 +12,7 @@ use crate::{
     mesh::Mesh,
     pass::{Pass, PassContext, PassDesc},
     resource::{ResourceDescriptor, ResourceId},
+    texture::TextureAsset,
 };
 
 /// Frames a transform change must stay unchanged before the BVH is rebuilt, so
@@ -35,6 +37,15 @@ pub struct BvhUploadPass {
     seen_transforms: Vec<Mat4>,
     settled_frames: u32,
     node_count: Arc<AtomicU32>,
+    /// `TextureAsset::mean` per (`Arc` pointer, sRGB).
+    texture_means: HashMap<(usize, bool), [f32; 4]>,
+}
+
+fn pack_unorm4x8(v: [f32; 4]) -> u32 {
+    v.iter()
+        .enumerate()
+        .map(|(i, c)| ((c.clamp(0.0, 1.0) * 255.0).round() as u32) << (8 * i))
+        .sum()
 }
 
 impl BvhUploadPass {
@@ -66,6 +77,7 @@ impl BvhUploadPass {
                 seen_transforms: Vec::new(),
                 settled_frames: 0,
                 node_count,
+                texture_means: HashMap::new(),
             },
             outputs,
         )
@@ -136,9 +148,22 @@ impl Pass for BvhUploadPass {
             return;
         }
 
-        // Collect triangles from all meshes.
+        // Collect triangles from all meshes. Probe rays can't sample textures, so each triangle
+        // carries its material factors times the average of its textures.
         let mut gpu_tris: Vec<GpuTriangle> = Vec::new();
         for mesh in &meshes {
+            let mut mean = |texture: &Option<Arc<TextureAsset>>, srgb: bool| {
+                texture.as_ref().map_or([1.0; 4], |t| {
+                    *self.texture_means.entry((Arc::as_ptr(t) as usize, srgb)).or_insert_with(|| t.mean(srgb))
+                })
+            };
+            let albedo_mean = mean(&mesh.albedo_texture, true);
+            let mr_mean = mean(&mesh.metallic_roughness_texture, false);
+            let factors = &mesh.material;
+            let albedo: [f32; 3] = std::array::from_fn(|c| factors.base_color[c] * albedo_mean[c]);
+            let metallic = factors.metallic * mr_mean[2];
+            let roughness = factors.roughness * mr_mean[1];
+
             let world_pos = |i: usize| -> [f32; 3] {
                 mesh.transform.transform_point3(Vec3::from(mesh.vertices[i].position)).into()
             };
@@ -148,7 +173,9 @@ impl Pass for BvhUploadPass {
                 let (i0, i1, i2) = (chunk[0] as usize, chunk[1] as usize, chunk[2] as usize);
                 if i0 >= verts.len() || i1 >= verts.len() || i2 >= verts.len() { continue; }
                 let (v0, v1, v2) = (world_pos(i0), world_pos(i1), world_pos(i2));
-                gpu_tris.push(GpuTriangle { v0, _pad0: 0, v1, _pad1: 0, v2, _pad2: 0 });
+                let color = |c: usize| (verts[i0].color[c] + verts[i1].color[c] + verts[i2].color[c]) / 3.0;
+                let albedo_metallic = pack_unorm4x8([albedo[0] * color(0), albedo[1] * color(1), albedo[2] * color(2), metallic]);
+                gpu_tris.push(GpuTriangle { v0, albedo_metallic, v1, roughness, v2, _pad: 0 });
             }
         }
 
