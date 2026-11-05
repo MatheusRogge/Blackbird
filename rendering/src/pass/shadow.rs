@@ -52,7 +52,7 @@ pub struct ShadowPass {
     masked_texture_layout: Option<wgpu::BindGroupLayout>,
     masked_sampler: Option<wgpu::Sampler>,
     /// Albedo textures of masked meshes, keyed by `TextureAsset` pointer; key 0 is opaque white.
-    masked_textures: HashMap<usize, (wgpu::Texture, wgpu::BindGroup)>,
+    masked_textures: HashMap<u64, (wgpu::Texture, wgpu::BindGroup)>,
     bgl: Option<wgpu::BindGroupLayout>,
     instance_layout: Option<wgpu::BindGroupLayout>,
     instance_bind_group: Option<(u64, wgpu::BindGroup)>,
@@ -98,9 +98,9 @@ impl Aabb {
     }
 }
 
-/// Key of a mesh's albedo texture in `ShadowPass::masked_textures`.
-fn albedo_key(mesh: &Mesh) -> usize {
-    mesh.albedo_texture.as_ref().map_or(0, |t| Arc::as_ptr(t) as usize)
+/// Key of a mesh's albedo texture in `ShadowPass::masked_textures`: its `TextureAsset::id`, 0 for none.
+fn albedo_key(mesh: &Mesh) -> u64 {
+    mesh.albedo_texture.as_ref().map_or(0, |t| t.id())
 }
 
 impl ShadowPass {
@@ -133,6 +133,9 @@ impl ShadowPass {
             });
             self.masked_textures.insert(key, (texture, bind_group));
         }
+
+        let live: HashSet<u64> = meshes.iter().filter(|h| h.entity.is_masked()).map(|h| albedo_key(h.entity)).collect();
+        self.masked_textures.retain(|key, _| *key == 0 || live.contains(key));
     }
 
     pub fn new(graph: &mut RenderGraph, shader: ShaderAsset) -> (Self, ShadowOutputs) {

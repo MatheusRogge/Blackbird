@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -37,8 +37,8 @@ pub struct BvhUploadPass {
     seen_transforms: Vec<Mat4>,
     settled_frames: u32,
     node_count: Arc<AtomicU32>,
-    /// `TextureAsset::mean` per (`Arc` pointer, sRGB).
-    texture_means: HashMap<(usize, bool), [f32; 4]>,
+    /// `TextureAsset::mean` per (`TextureAsset::id`, sRGB), pruned to live textures on each rebuild.
+    texture_means: HashMap<(u64, bool), [f32; 4]>,
 }
 
 fn pack_unorm4x8(v: [f32; 4]) -> u32 {
@@ -154,7 +154,7 @@ impl Pass for BvhUploadPass {
         for mesh in &meshes {
             let mut mean = |texture: &Option<Arc<TextureAsset>>, srgb: bool| {
                 texture.as_ref().map_or([1.0; 4], |t| {
-                    *self.texture_means.entry((Arc::as_ptr(t) as usize, srgb)).or_insert_with(|| t.mean(srgb))
+                    *self.texture_means.entry((t.id(), srgb)).or_insert_with(|| t.mean(srgb))
                 })
             };
             let albedo_mean = mean(&mesh.albedo_texture, true);
@@ -181,6 +181,13 @@ impl Pass for BvhUploadPass {
                 gpu_tris.push(GpuTriangle { v0, albedo_metallic, v1, roughness, v2, emissive });
             }
         }
+
+        let live: HashSet<u64> = meshes
+            .iter()
+            .flat_map(|m| [&m.albedo_texture, &m.metallic_roughness_texture, &m.emissive_texture])
+            .filter_map(|t| t.as_ref().map(|t| t.id()))
+            .collect();
+        self.texture_means.retain(|(id, _), _| live.contains(id));
 
         let tri_count = gpu_tris.len() as u64;
         if tri_count > MAX_BVH_TRIS {

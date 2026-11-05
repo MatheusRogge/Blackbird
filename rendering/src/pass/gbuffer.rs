@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use engine_core::world::World;
 
@@ -21,12 +24,11 @@ pub struct GBufferOutputs {
     pub depth_id: ResourceId,
 }
 
-/// Texture `Arc` pointers of a mesh's material (albedo, normal, metallic-roughness, emissive),
-/// 0 for none.
-type MaterialKey = (usize, usize, usize, usize);
+/// `TextureAsset::id`s of a mesh's material (albedo, normal, metallic-roughness, emissive), 0 for none.
+type MaterialKey = (u64, u64, u64, u64);
 
-fn texture_key(texture: &Option<Arc<TextureAsset>>) -> usize {
-    texture.as_ref().map_or(0, |t| Arc::as_ptr(t) as usize)
+fn texture_key(texture: &Option<Arc<TextureAsset>>) -> u64 {
+    texture.as_ref().map_or(0, |t| t.id())
 }
 
 fn material_key(mesh: &Mesh) -> MaterialKey {
@@ -39,8 +41,8 @@ fn material_key(mesh: &Mesh) -> MaterialKey {
 }
 
 fn cached_view<'a>(
-    cache: &'a HashMap<usize, (wgpu::Texture, wgpu::TextureView)>,
-    key: usize,
+    cache: &'a HashMap<u64, (wgpu::Texture, wgpu::TextureView)>,
+    key: u64,
     fallback: &'a Option<(wgpu::Texture, wgpu::TextureView)>,
 ) -> Option<&'a wgpu::TextureView> {
     cache.get(&key).or(fallback.as_ref()).map(|(_, v)| v)
@@ -59,7 +61,8 @@ pub struct GBufferPass {
     instance_bind_group: Option<(u64, wgpu::BindGroup)>,
 
     texture_sampler: Option<wgpu::Sampler>,
-    texture_cache: HashMap<usize, (wgpu::Texture, wgpu::TextureView)>,
+    /// Keyed by `TextureAsset::id`. Entries no mesh uses any more are dropped each frame.
+    texture_cache: HashMap<u64, (wgpu::Texture, wgpu::TextureView)>,
     texture_bind_groups: HashMap<MaterialKey, wgpu::BindGroup>,
     fallback_albedo: Option<(wgpu::Texture, wgpu::TextureView)>,
     fallback_normal: Option<(wgpu::Texture, wgpu::TextureView)>,
@@ -701,7 +704,7 @@ impl Pass for GBufferPass {
             for (texture, format) in textures {
                 if let Some(tex) = texture {
                     self.texture_cache
-                        .entry(Arc::as_ptr(tex) as usize)
+                        .entry(tex.id())
                         .or_insert_with(|| Self::upload_texture(device, queue, tex, format));
                 }
             }
@@ -709,7 +712,7 @@ impl Pass for GBufferPass {
             let bg_key = material_key(mesh);
             if !self.texture_bind_groups.contains_key(&bg_key) {
                 let cache = &self.texture_cache;
-                let view = |key: usize, fallback| cached_view(cache, key, fallback);
+                let view = |key: u64, fallback| cached_view(cache, key, fallback);
                 let (albedo_key, normal_key, mr_key, emissive_key) = bg_key;
 
                 if let (Some(av), Some(nv), Some(mv), Some(ev), Some(layout), Some(sampler)) = (
@@ -725,6 +728,17 @@ impl Pass for GBufferPass {
                 }
             }
         }
+
+        let live: HashSet<u64> = meshes
+            .iter()
+            .flat_map(|h| {
+                let (a, n, m, e) = material_key(h.entity);
+                [0, a, n, m, e]
+            })
+            .collect();
+        self.texture_cache.retain(|id, _| live.contains(id));
+        self.texture_bind_groups
+            .retain(|&(a, n, m, e), _| [a, n, m, e].iter().all(|id| live.contains(id)));
 
         // Group draws by pipeline, then by bind group key, so consecutive meshes
         // that share a material don't trigger a GPU state switch.

@@ -1,10 +1,15 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use assets::Asset;
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct TextureAsset {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>, // RGBA8, 4 bytes per pixel
+    id: u64,
 }
 
 impl TextureAsset {
@@ -13,7 +18,15 @@ impl TextureAsset {
             width,
             height,
             data,
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// Unique for the life of the process and never 0, so GPU caches can key by it. An `Arc`
+    /// address is not enough: after a hot reload the new scene's textures can reuse the old
+    /// ones' addresses.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 }
 

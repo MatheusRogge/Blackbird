@@ -9,6 +9,7 @@
 //!   --exposure E         linear exposure override
 //!   --no-specular --no-reflections --no-ssr --no-indirect --no-direct --no-shadows
 //!   --view lit|albedo|normal|material|emissive
+//!   --reloads N          unload and reload the scene N times first, like an editor hot reload
 //! ```
 
 use std::path::PathBuf;
@@ -22,7 +23,10 @@ use engine::rendering::debug_flags::{GBufferView, RenderDebugFlags};
 use engine::rendering::pbr::RenderGraphPBRBuilder;
 use engine::rendering::shader::ShaderAsset;
 use engine::rendering::renderer::Renderer;
+use engine::rendering::light::{AreaLight, PointLight, SkyLight, SpotLight};
+use engine::rendering::mesh::Mesh;
 use engine::world::World;
+use engine::{Entity, EntityKey};
 use ultraviolet::Vec3;
 
 struct Options {
@@ -34,6 +38,7 @@ struct Options {
     eye: Option<Vec3>,
     target: Option<Vec3>,
     exposure: Option<f32>,
+    reloads: u32,
     flags: RenderDebugFlags,
 }
 
@@ -58,6 +63,7 @@ fn parse_args() -> Result<Options> {
         eye: None,
         target: None,
         exposure: None,
+        reloads: 0,
         flags: RenderDebugFlags::default(),
     };
 
@@ -74,6 +80,7 @@ fn parse_args() -> Result<Options> {
             "--eye" => options.eye = Some(parse_vec3(&value()?)?),
             "--target" => options.target = Some(parse_vec3(&value()?)?),
             "--exposure" => options.exposure = Some(value()?.parse()?),
+            "--reloads" => options.reloads = value()?.parse()?,
             "--no-specular" => flags.specular = false,
             "--no-reflections" => flags.reflections = false,
             "--no-ssr" => flags.ssr = false,
@@ -96,19 +103,19 @@ fn parse_args() -> Result<Options> {
     Ok(options)
 }
 
-/// Loads the scene like the player does: lights, every mesh, and only the main camera.
-fn load_world(options: &Options) -> Result<World> {
+/// Loads the scene like the player does: lights, every mesh, and only the main camera. Each call
+/// reads the file again, so its textures are new allocations.
+fn load_scene(options: &Options, world: &mut World) -> Result<()> {
     let mut assets = AssetManager::default();
     assets.set_source(Arc::new(DirectorySource::new(&options.root)));
     engine::register_asset_resolvers(&mut assets);
     let asset: Arc<GLTFAsset> = assets.load_asset(&options.scene)?;
 
-    let mut world = World::default();
     for (_, light) in lights::read_lights(&asset.document)? {
-        light.spawn(&mut world);
+        light.spawn(world);
     }
     let mut scene = GltfScene::new(Arc::clone(&asset));
-    while scene.load_batch(&mut world, 1000) {}
+    while scene.load_batch(world, 1000) {}
     if let Some(main) = scene.main_camera() {
         for &key in scene.node_cameras().values().filter(|&&key| key != main) {
             world.remove_entity(key);
@@ -141,7 +148,23 @@ fn load_world(options: &Options) -> Result<World> {
         camera.exposure = exposure;
     }
     log::info!("camera eye {:?} target {:?} exposure {}", camera.eye, camera.target, camera.exposure);
-    Ok(world)
+    Ok(())
+}
+
+/// Removes everything `load_scene` spawned, keeping the world (and its entity key versions).
+fn clear_scene(world: &mut World) {
+    fn remove<E: Entity>(world: &mut World) {
+        let keys: Vec<EntityKey> = world.get_entity_handles::<E>().iter().map(|h| h.id).collect();
+        for key in keys {
+            world.remove_entity(key);
+        }
+    }
+    remove::<Mesh>(world);
+    remove::<Camera>(world);
+    remove::<PointLight>(world);
+    remove::<SpotLight>(world);
+    remove::<AreaLight>(world);
+    remove::<SkyLight>(world);
 }
 
 fn shader(name: &str) -> Result<ShaderAsset> {
@@ -153,7 +176,8 @@ fn shader(name: &str) -> Result<ShaderAsset> {
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let mut options = parse_args()?;
-    let world = load_world(&options)?;
+    let mut world = World::default();
+    load_scene(&options, &mut world)?;
 
     let flags = Arc::new(RwLock::new(std::mem::take(&mut options.flags)));
     let builder = RenderGraphPBRBuilder::new(
@@ -172,6 +196,13 @@ fn main() -> Result<()> {
 
     let (width, height) = options.size;
     let mut renderer = pollster::block_on(Renderer::new_headless(builder, width, height))?;
+    for _ in 0..options.reloads {
+        for _ in 0..3 {
+            renderer.render(&world, None);
+        }
+        clear_scene(&mut world);
+        load_scene(&options, &mut world)?;
+    }
     for _ in 0..options.frames {
         renderer.render(&world, None);
     }
