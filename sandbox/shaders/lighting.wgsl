@@ -4,6 +4,8 @@
 @group(0) @binding(2) var t_material: texture_2d<f32>;
 @group(0) @binding(3) var t_depth:    texture_depth_2d;
 @group(0) @binding(4) var s_linear:   sampler;
+// Emitted radiance (texture × factor × strength), not yet exposed.
+@group(0) @binding(5) var t_emissive: texture_2d<f32>;
 
 // Probe atlases + params
 const PROBES_PER_ROW: u32 = 30u;
@@ -41,7 +43,7 @@ struct DebugFlags {
     disable_indirect: u32,
     disable_direct:   u32,
     disable_shadows:  u32,
-    // 0 lit, 1 albedo, 2 normal, 3 material (rendering::debug_flags::GBufferView).
+    // 0 lit, 1 albedo, 2 normal, 3 material, 4 emissive (rendering::debug_flags::GBufferView).
     view:             u32,
     disable_specular: u32,
     disable_reflections: u32,
@@ -391,6 +393,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
         case 1u: { return unreflective(textureSample(t_albedo, s_linear, in.uv).rgb); }
         case 2u: { return unreflective(textureSample(t_normal, s_linear, in.uv).rgb); }
         case 3u: { return unreflective(textureSample(t_material, s_linear, in.uv).rgb); }
+        case 4u: { return unreflective(textureSample(t_emissive, s_linear, in.uv).rgb * cp.exposure); }
         default: {}
     }
 
@@ -400,6 +403,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
     let material   = textureSample(t_material, s_linear, in.uv);
     let roughness  = max(material.r, MIN_ROUGHNESS);
     let metallic   = material.g;
+    let emissive   = textureSample(t_emissive, s_linear, in.uv).rgb;
 
     // Reconstruct view-space depth from reversed-Z depth buffer value.
     // z_view_pos = z_near * z_far / (depth * (z_far - z_near) + z_near)
@@ -575,6 +579,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
         }
     }
 
+    color += emissive;
     out.lit = vec4<f32>(color * cp.exposure, 1.0);
     return out;
 }

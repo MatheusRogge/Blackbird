@@ -27,7 +27,42 @@ pub struct GpuTriangle {
     pub v1: [f32; 3],
     pub roughness: f32,
     pub v2: [f32; 3],
-    pub _pad: u32,
+    /// Emitted radiance: unorm8 RGB scaled by `2^(A − 128)` (see `pack_emissive`). 0 = none.
+    pub emissive: u32,
+}
+
+/// Packs linear RGB radiance as unorm8 mantissas with a shared exponent in the high byte.
+/// Decode with `unpack4x8unorm(e).rgb * exp2(unpack4x8unorm(e).a * 255 - 128)`.
+pub fn pack_emissive(rgb: [f32; 3]) -> u32 {
+    let max = rgb.iter().copied().fold(0.0f32, f32::max);
+    if max <= 0.0 || !max.is_finite() {
+        return 0;
+    }
+    let exponent = max.log2().ceil().clamp(-127.0, 127.0);
+    let scale = (-exponent).exp2();
+    let [r, g, b] = rgb.map(|c| ((c * scale).clamp(0.0, 1.0) * 255.0).round() as u32);
+    r | (g << 8) | (b << 16) | (((exponent + 128.0) as u32) << 24)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unpack(e: u32) -> [f32; 3] {
+        let scale = (((e >> 24) as f32) - 128.0).exp2();
+        [0, 8, 16].map(|shift| ((e >> shift) & 0xff) as f32 / 255.0 * scale)
+    }
+
+    #[test]
+    fn emissive_round_trips_hdr_values() {
+        let [r, g, b] = unpack(pack_emissive([6.0, 3.3, 1.2]));
+        assert!((r - 6.0).abs() < 0.05 && (g - 3.3).abs() < 0.05 && (b - 1.2).abs() < 0.05, "{r} {g} {b}");
+    }
+
+    #[test]
+    fn black_packs_to_zero() {
+        assert_eq!(pack_emissive([0.0; 3]), 0);
+    }
 }
 
 #[repr(C)]

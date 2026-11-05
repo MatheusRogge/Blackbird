@@ -9,6 +9,7 @@ struct Model {
     // x: alpha cutoff (0 = never discard), y: 1 if double-sided, z: metallic, w: roughness.
     material: vec4<f32>,
     base_color: vec4<f32>,
+    emissive: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> light: LightUniform;

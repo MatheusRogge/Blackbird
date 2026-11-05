@@ -8,7 +8,7 @@
 //!   --target x,y,z       point the camera looks at
 //!   --exposure E         linear exposure override
 //!   --no-specular --no-reflections --no-ssr --no-indirect --no-direct --no-shadows
-//!   --view lit|albedo|normal|material
+//!   --view lit|albedo|normal|material|emissive
 //! ```
 
 use std::path::PathBuf;
@@ -86,6 +86,7 @@ fn parse_args() -> Result<Options> {
                     "albedo" => GBufferView::Albedo,
                     "normal" => GBufferView::Normal,
                     "material" => GBufferView::Material,
+                    "emissive" => GBufferView::Emissive,
                     other => bail!("unknown view {other}"),
                 }
             }

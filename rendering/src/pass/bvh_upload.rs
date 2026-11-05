@@ -7,7 +7,7 @@ use engine_core::world::World;
 use ultraviolet::{Mat4, Vec3};
 
 use crate::{
-    bvh::{self, BvhInfo, BvhNode, GpuTriangle, MAX_BVH_NODES, MAX_BVH_TRIS},
+    bvh::{self, BvhInfo, BvhNode, GpuTriangle, MAX_BVH_NODES, MAX_BVH_TRIS, pack_emissive},
     graph::{NodeId, RenderGraph},
     mesh::Mesh,
     pass::{Pass, PassContext, PassDesc},
@@ -163,6 +163,9 @@ impl Pass for BvhUploadPass {
             let albedo: [f32; 3] = std::array::from_fn(|c| factors.base_color[c] * albedo_mean[c]);
             let metallic = factors.metallic * mr_mean[2];
             let roughness = factors.roughness * mr_mean[1];
+            let emissive_mean = mean(&mesh.emissive_texture, true);
+            let emissive =
+                pack_emissive(std::array::from_fn(|c| factors.emissive[c] * factors.emissive_strength * emissive_mean[c]));
 
             let world_pos = |i: usize| -> [f32; 3] {
                 mesh.transform.transform_point3(Vec3::from(mesh.vertices[i].position)).into()
@@ -175,7 +178,7 @@ impl Pass for BvhUploadPass {
                 let (v0, v1, v2) = (world_pos(i0), world_pos(i1), world_pos(i2));
                 let color = |c: usize| (verts[i0].color[c] + verts[i1].color[c] + verts[i2].color[c]) / 3.0;
                 let albedo_metallic = pack_unorm4x8([albedo[0] * color(0), albedo[1] * color(1), albedo[2] * color(2), metallic]);
-                gpu_tris.push(GpuTriangle { v0, albedo_metallic, v1, roughness, v2, _pad: 0 });
+                gpu_tris.push(GpuTriangle { v0, albedo_metallic, v1, roughness, v2, emissive });
             }
         }
 

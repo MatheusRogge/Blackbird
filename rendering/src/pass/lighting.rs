@@ -43,6 +43,7 @@ pub struct LightingPass {
     albedo_id: ResourceId,
     normal_id: ResourceId,
     material_id: ResourceId,
+    emissive_id: ResourceId,
     depth_id: ResourceId,
 
     cluster_params_id: ResourceId,
@@ -135,6 +136,7 @@ impl LightingPass {
                 albedo_id: gbuffer.albedo_id,
                 normal_id: gbuffer.normal_id,
                 material_id: gbuffer.material_id,
+                emissive_id: gbuffer.emissive_id,
                 depth_id: gbuffer.depth_id,
                 cluster_params_id: cluster.cluster_params_id,
                 point_buffer_id: light_buffers.point_buffer_id,
@@ -187,6 +189,7 @@ impl PassDesc for LightingPass {
             self.albedo_id,
             self.normal_id,
             self.material_id,
+            self.emissive_id,
             self.depth_id,
             self.cluster_params_id,
             self.point_buffer_id,
@@ -245,6 +248,10 @@ impl Pass for LightingPass {
         };
 
         let Some(&normal_view) = ctx.views.get(&self.normal_id) else {
+            return;
+        };
+
+        let Some(&emissive_view) = ctx.views.get(&self.emissive_id) else {
             return;
         };
 
@@ -365,6 +372,16 @@ impl Pass for LightingPass {
                         binding: 4,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
                         count: None,
                     },
                 ],
@@ -704,6 +721,10 @@ impl Pass for LightingPass {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(emissive_view),
                     },
                 ],
             }));

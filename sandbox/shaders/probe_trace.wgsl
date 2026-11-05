@@ -14,7 +14,7 @@ struct BvhNode {
 struct BvhTriangle {
     v0: vec3<f32>, albedo_metallic: u32,  // linear albedo rgb + metallic, unorm8
     v1: vec3<f32>, roughness: f32,
-    v2: vec3<f32>, _pad: u32,
+    v2: vec3<f32>, emissive: u32,          // unorm8 rgb × 2^(a·255 − 128), 0 = none
 }
 
 struct BvhInfo {
@@ -263,7 +263,8 @@ fn shade_hit(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>, tri: BvhTri
     let bias      = SHADOW_BIAS * probe_params.probe_spacing;
     let origin    = pos + normal * bias;
 
-    var radiance = vec3<f32>(0.0);
+    let packed_emissive = unpack4x8unorm(tri.emissive);
+    var radiance = packed_emissive.rgb * exp2(packed_emissive.a * 255.0 - 128.0);
     for (var i = 0u; i < light_counts.num_sky; i++) {
         let L = -(frame.inv_view * vec4<f32>(sky_lights[i].direction_vs, 0.0)).xyz;
         if L.y < 0.0 { continue; }

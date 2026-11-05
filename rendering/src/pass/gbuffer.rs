@@ -16,11 +16,14 @@ pub struct GBufferOutputs {
     pub albedo_id: ResourceId,
     pub normal_id: ResourceId,
     pub material_id: ResourceId,
+    /// Rgba16Float, linear emitted radiance (texture × factor × strength), not yet exposed.
+    pub emissive_id: ResourceId,
     pub depth_id: ResourceId,
 }
 
-/// Texture `Arc` pointers of a mesh's material (albedo, normal, metallic-roughness), 0 for none.
-type MaterialKey = (usize, usize, usize);
+/// Texture `Arc` pointers of a mesh's material (albedo, normal, metallic-roughness, emissive),
+/// 0 for none.
+type MaterialKey = (usize, usize, usize, usize);
 
 fn texture_key(texture: &Option<Arc<TextureAsset>>) -> usize {
     texture.as_ref().map_or(0, |t| Arc::as_ptr(t) as usize)
@@ -31,6 +34,7 @@ fn material_key(mesh: &Mesh) -> MaterialKey {
         texture_key(&mesh.albedo_texture),
         texture_key(&mesh.normal_texture),
         texture_key(&mesh.metallic_roughness_texture),
+        texture_key(&mesh.emissive_texture),
     )
 }
 
@@ -67,6 +71,7 @@ pub struct GBufferPass {
     albedo_id: ResourceId,
     normal_id: ResourceId,
     material_id: ResourceId,
+    emissive_id: ResourceId,
     depth_id: ResourceId,
 }
 
@@ -93,6 +98,11 @@ impl GBufferPass {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         });
 
+        let emissive_id = graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        });
+
         let depth_id = graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
             format: wgpu::TextureFormat::Depth32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
@@ -102,6 +112,7 @@ impl GBufferPass {
             albedo_id,
             normal_id,
             material_id,
+            emissive_id,
             depth_id,
         };
 
@@ -127,6 +138,7 @@ impl GBufferPass {
                 albedo_id,
                 normal_id,
                 material_id,
+                emissive_id,
                 depth_id,
             },
             outputs,
@@ -214,6 +226,7 @@ impl GBufferPass {
         albedo_view: &wgpu::TextureView,
         normal_view: &wgpu::TextureView,
         metallic_roughness_view: &wgpu::TextureView,
+        emissive_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -233,6 +246,10 @@ impl GBufferPass {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
+                    resource: wgpu::BindingResource::TextureView(emissive_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
@@ -254,6 +271,7 @@ impl PassDesc for GBufferPass {
             self.albedo_id,
             self.normal_id,
             self.material_id,
+            self.emissive_id,
             self.depth_id,
         ]
     }
@@ -380,6 +398,7 @@ impl Pass for GBufferPass {
         let albedo_view = ctx.views[&self.albedo_id];
         let normal_view = ctx.views[&self.normal_id];
         let material_view = ctx.views[&self.material_id];
+        let emissive_view = ctx.views[&self.emissive_id];
 
         if self.pipeline.is_none() {
             let shader_module = self
@@ -439,6 +458,16 @@ impl Pass for GBufferPass {
                             binding: 3,
                             count: None,
                             visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                multisampled: false,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            },
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            count: None,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         },
                     ],
@@ -481,6 +510,11 @@ impl Pass for GBufferPass {
                             }),
                             Some(wgpu::ColorTargetState {
                                 format: wgpu::TextureFormat::Rgba8Unorm,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                            Some(wgpu::ColorTargetState {
+                                format: wgpu::TextureFormat::Rgba16Float,
                                 blend: None,
                                 write_mask: wgpu::ColorWrites::ALL,
                             }),
@@ -550,6 +584,8 @@ impl Pass for GBufferPass {
                 &fallback_albedo_view,
                 &fallback_normal_view,
                 &fallback_mr_view,
+                // White: glTF emissive is factor × texture, so no texture means the factor alone.
+                &fallback_albedo_view,
             );
 
             self.pipeline = Some(pipeline);
@@ -591,6 +627,15 @@ impl Pass for GBufferPass {
                 }),
                 Some(wgpu::RenderPassColorAttachment {
                     view: material_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        store: wgpu::StoreOp::Store,
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: emissive_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -651,6 +696,7 @@ impl Pass for GBufferPass {
                 (&mesh.albedo_texture, wgpu::TextureFormat::Rgba8UnormSrgb),
                 (&mesh.normal_texture, wgpu::TextureFormat::Rgba8Unorm),
                 (&mesh.metallic_roughness_texture, wgpu::TextureFormat::Rgba8Unorm),
+                (&mesh.emissive_texture, wgpu::TextureFormat::Rgba8UnormSrgb),
             ];
             for (texture, format) in textures {
                 if let Some(tex) = texture {
@@ -664,16 +710,17 @@ impl Pass for GBufferPass {
             if !self.texture_bind_groups.contains_key(&bg_key) {
                 let cache = &self.texture_cache;
                 let view = |key: usize, fallback| cached_view(cache, key, fallback);
-                let (albedo_key, normal_key, mr_key) = bg_key;
+                let (albedo_key, normal_key, mr_key, emissive_key) = bg_key;
 
-                if let (Some(av), Some(nv), Some(mv), Some(layout), Some(sampler)) = (
+                if let (Some(av), Some(nv), Some(mv), Some(ev), Some(layout), Some(sampler)) = (
                     view(albedo_key, &self.fallback_albedo),
                     view(normal_key, &self.fallback_normal),
                     view(mr_key, &self.fallback_metallic_roughness),
+                    view(emissive_key, &self.fallback_albedo),
                     self.texture_bind_group_layout.as_ref(),
                     self.texture_sampler.as_ref(),
                 ) {
-                    let bg = Self::create_texture_bind_group(device, layout, sampler, av, nv, mv);
+                    let bg = Self::create_texture_bind_group(device, layout, sampler, av, nv, mv, ev);
                     self.texture_bind_groups.insert(bg_key, bg);
                 }
             }

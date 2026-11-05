@@ -22,10 +22,12 @@ pub enum GBufferView {
     Normal,
     /// R = roughness, G = metallic, B = ambient occlusion.
     Material,
+    /// Emitted radiance, exposed.
+    Emissive,
 }
 
 impl GBufferView {
-    pub const ALL: [Self; 4] = [Self::Lit, Self::Albedo, Self::Normal, Self::Material];
+    pub const ALL: [Self; 5] = [Self::Lit, Self::Albedo, Self::Normal, Self::Material, Self::Emissive];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -33,6 +35,7 @@ impl GBufferView {
             Self::Albedo => "Albedo",
             Self::Normal => "Normal",
             Self::Material => "Roughness / metallic / AO",
+            Self::Emissive => "Emissive",
         }
     }
 }

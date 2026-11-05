@@ -25,6 +25,8 @@ pub struct GpuModel {
     /// x: alpha cutoff (0 = never discard), y: 1 if double-sided, z: metallic, w: roughness.
     pub material: [f32; 4],
     pub base_color: [f32; 4],
+    /// rgb: emissive factor × strength, w: unused.
+    pub emissive: [f32; 4],
 }
 
 /// Where a mesh lives inside the shared geometry buffers. `instance` indexes
@@ -208,6 +210,10 @@ impl GeometryArena {
                         mesh.material.roughness,
                     ],
                     base_color: mesh.material.base_color,
+                    emissive: {
+                        let [r, g, b] = mesh.material.emissive.map(|c| c * mesh.material.emissive_strength);
+                        [r, g, b, 0.0]
+                    },
                 };
             }
         }
