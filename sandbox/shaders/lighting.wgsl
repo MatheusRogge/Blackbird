@@ -80,7 +80,7 @@ const POISSON: array<vec2<f32>, 12> = array<vec2<f32>, 12>(
 // The face is the dominant axis of the light-to-point direction, projected with that face's own
 // view-projection so the lookup matches what was rasterized. Area lights widen the PCF by their
 // size over the distance, a cheap stand-in for a penumbra.
-fn cube_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> f32 {
+fn cube_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
     let light = shadowed.lights[slot];
     let d = pos - light.xyz;
     let dist = length(d);
@@ -110,18 +110,23 @@ fn cube_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> f32
         let tap = clamp(uv + rot * POISSON[i] * radius, vec2f(0.0), vec2f(1.0));
         lit += textureSampleCompareLevel(t_local_shadow, s_shadow, tap, i32(layer), ndc.z);
     }
-    return lit / 12.0;
+    if lit == 0.0 {
+        return vec3f(0.0);
+    }
+    // One glass-tint texel of slack, so glass doesn't tint itself.
+    let tint_texel = 2.0 * dist / f32(textureDimensions(t_local_glass_tint).x);
+    return lit / 12.0 * glass_tint(t_local_glass_tint, uv, layer, clip.w - tint_texel);
 }
 
-// Visibility of a local light at this pixel: its cube shadow if it is one of the shadowed
-// lights, else 1.
-fn local_shadow_of(kind: u32, index: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> f32 {
-    if debug.disable_shadows != 0u { return 1.0; }
+// Visibility of a local light at this pixel, tinted by glass: its cube shadow if it is one of
+// the shadowed lights, else 1.
+fn local_shadow_of(kind: u32, index: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
+    if debug.disable_shadows != 0u { return vec3f(1.0); }
     let entry = kind << 16u | index;
     for (var slot = 0u; slot < min(shadowed.count, 4u); slot++) {
         if shadowed.entries[slot] == entry { return cube_shadow(slot, pos, N, pixel); }
     }
-    return 1.0;
+    return vec3f(1.0);
 }
 
 fn octahedral_encode(n: vec3<f32>) -> vec2<f32> {
@@ -392,6 +397,30 @@ struct LocalShadowParams {
 }
 
 @group(2) @binding(4) var<uniform> local_shadow: LocalShadowParams;
+// Glass tint maps, one layer per cascade / cube face (rendering::pass::shadow): rgb = transmittance
+// of all glass along the light ray, a = depth of the glass nearest the light (clip z for cascades,
+// clip w for cube faces).
+@group(2) @binding(5) var          t_glass_tint: texture_2d_array<f32>;
+@group(2) @binding(6) var          t_local_glass_tint: texture_2d_array<f32>;
+
+// Transmittance of the glass in front of a receiver at `depth` (same units as the map's alpha).
+// Each of the 4 bilinear taps is depth-tested before filtering, so glass behind the receiver never
+// tints it and edges stay soft.
+fn glass_tint(t: texture_2d_array<f32>, uv: vec2<f32>, layer: u32, depth: f32) -> vec3<f32> {
+    let size = vec2<i32>(textureDimensions(t));
+    let p = uv * vec2f(size) - 0.5;
+    let base = floor(p);
+    let f = p - base;
+    var tint = vec3f(0.0);
+    for (var i = 0u; i < 4u; i++) {
+        let o = vec2f(f32(i & 1u), f32(i >> 1u));
+        let texel = clamp(vec2<i32>(base + o), vec2<i32>(0), size - 1);
+        let s = textureLoad(t, texel, i32(layer), 0);
+        let w = mix(1.0 - f.x, f.x, o.x) * mix(1.0 - f.y, f.y, o.y);
+        tint += select(vec3f(1.0), s.rgb, s.a < depth) * w;
+    }
+    return tint;
+}
 
 fn select_cascade(depth_vs: f32) -> u32 {
     if depth_vs < sp.cascade_splits.x { return 0u; }
@@ -434,7 +463,7 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
 
         let L = to_light / dist;
         let vis = local_shadow_of(SHADOW_KIND_POINT, li, pos_ws, N, pixel);
-        color += brdf(surf_vs, L) * light.color * (light.intensity * vis * range_attenuation(dist, light.radius));
+        color += brdf(surf_vs, L) * light.color * vis * (light.intensity * range_attenuation(dist, light.radius));
     }
 
     for (var i = 0u; i < light_counts.num_spot; i++) {
@@ -450,7 +479,7 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let cd = dot(-L, normalize(light.direction_vs));
         let t  = clamp((cd - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
         let vis = local_shadow_of(SHADOW_KIND_SPOT, i, pos_ws, N, pixel);
-        color += brdf(surf_vs, L) * light.color * (light.intensity * vis * t * t * range_attenuation(dist, light.radius));
+        color += brdf(surf_vs, L) * light.color * vis * (light.intensity * t * t * range_attenuation(dist, light.radius));
     }
 
     // Representative-point approximation. Diffuse takes light from the closest point on the
@@ -516,7 +545,7 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let shadow_uv   = shadow_ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
         let ref_depth   = shadow_ndc.z - sp.bias;
 
-        var lit = 1.0;
+        var lit = vec3f(1.0);
         if debug.disable_shadows == 0u &&
             shadow_uv.x >= 0.0 && shadow_uv.x <= 1.0 &&
             shadow_uv.y >= 0.0 && shadow_uv.y <= 1.0 &&
@@ -530,7 +559,7 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
                     );
                 }
             }
-            lit = shadow_sum / 9.0;
+            lit = shadow_sum / 9.0 * glass_tint(t_glass_tint, shadow_uv, cascade, ref_depth);
         }
 
         color += brdf(surf_ws, L) * sky.color * (sky.intensity * lit);
@@ -648,7 +677,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
     if debug.view == 5u {
         var vis = vec3f(1.0);
         for (var slot = 0u; slot < min(shadowed.count, 3u); slot++) {
-            vis[slot] = cube_shadow(slot, pos_ws, N, in.pos.xy);
+            vis[slot] = dot(cube_shadow(slot, pos_ws, N, in.pos.xy), vec3f(1.0 / 3.0));
         }
         return unreflective(vis);
     }

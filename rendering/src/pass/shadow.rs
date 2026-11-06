@@ -1,7 +1,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use engine_core::world::{EntityHandle, World};
@@ -29,12 +28,45 @@ pub const SHADOW_MAP_SIZE: u32 = 2048;
 
 const CASCADE_LAMBDA: f32 = 0.75;
 const CASCADE_VP_STRIDE: u64 = 256;
-const VP_SIZE: u64 = std::mem::size_of::<[[f32; 4]; 4]>() as u64;
+const VP_SIZE: u64 = std::mem::size_of::<ShadowView>() as u64;
+
+/// One shadow view, at `CASCADE_VP_STRIDE` in the cascade / cube face uniform buffers. Mirrors
+/// `LightUniform` in `shadow.wgsl`.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct ShadowView {
+    view_proj: [[f32; 4]; 4],
+    /// w = 0: xyz is the direction light travels (cascades); w = 1: xyz is the light's origin
+    /// (cube faces).
+    light: [f32; 4],
+}
 
 /// Face size of each shadowed local light's cube map.
 pub const LOCAL_SHADOW_SIZE: u32 = 512;
 pub const LOCAL_SHADOW_FACES: usize = MAX_SHADOWED_LIGHTS * 6;
 const LOCAL_SHADOW_NEAR: f32 = 0.02;
+
+/// Glass tint maps (`fs_glass` in `shadow.wgsl`), one layer per cascade / cube face: rgb is the
+/// transmittance of every blended surface along the light ray, a the depth of the one nearest the
+/// light. 16-bit float so that depth keeps its precision. Glass shadows are soft, so they use a
+/// lower resolution than the depth maps.
+const GLASS_TINT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+pub const GLASS_TINT_SIZE: u32 = 1024;
+pub const LOCAL_GLASS_TINT_SIZE: u32 = 512;
+/// Clear value: no tint, and a depth beyond any receiver.
+const GLASS_TINT_CLEAR: wgpu::Color = wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0e4 };
+const GLASS_TINT_BLEND: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Dst,
+        dst_factor: wgpu::BlendFactor::Zero,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Min,
+    },
+};
 /// Cube faces in the order `lighting.wgsl` picks them by dominant axis: +X, −X, +Y, −Y, +Z, −Z.
 const CUBE_FACES: [(Vec3, Vec3); 6] = [
     (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, -1.0, 0.0)),
@@ -72,6 +104,97 @@ pub struct ShadowOutputs {
     pub local_shadow_map_id: ResourceId,
     /// Uniform `LocalShadowParams`.
     pub local_shadow_params_id: ResourceId,
+    /// `GLASS_TINT_FORMAT`, `NUM_CASCADES` layers of `GLASS_TINT_SIZE`².
+    pub glass_tint_id: ResourceId,
+    /// `GLASS_TINT_FORMAT`, `LOCAL_SHADOW_FACES` layers of `LOCAL_GLASS_TINT_SIZE`².
+    pub local_glass_tint_id: ResourceId,
+}
+
+type AlbedoCache = HashMap<u64, (wgpu::Texture, wgpu::BindGroup)>;
+
+/// Uploads mesh albedo textures (with mips) into bind groups for `shadow.wgsl`'s group 2.
+struct AlbedoUpload {
+    mips: MipGenerator,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+impl AlbedoUpload {
+    /// Uploads the albedo of every mesh in `meshes` that `cache` doesn't hold yet (plus the white
+    /// fallback at key 0) as `kind(mesh)`, and drops the ones no mesh uses any more.
+    fn sync<'m>(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        cache: &mut AlbedoCache,
+        meshes: impl Iterator<Item = &'m Mesh>,
+        kind: impl Fn(&Mesh) -> TextureKind,
+    ) {
+        let mut upload = |asset: &TextureAsset, kind| {
+            let (texture, view) = self.mips.upload(device, queue, encoder, asset, kind);
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shadow_albedo_texture"),
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            });
+            (texture, bind_group)
+        };
+        cache.entry(0).or_insert_with(|| {
+            let white = TextureAsset::new(1, 1, vec![255; 4]);
+            upload(&white, TextureKind::Linear { alpha_cutoff: None })
+        });
+        let mut live = HashSet::from([0]);
+        for mesh in meshes {
+            let Some(texture) = &mesh.albedo_texture else { continue };
+            live.insert(texture.id());
+            cache.entry(texture.id()).or_insert_with(|| upload(texture, kind(mesh)));
+        }
+        cache.retain(|key, _| live.contains(key));
+    }
+}
+
+/// Draws `glass` into one layer of a glass tint map, clearing it first.
+#[allow(clippy::too_many_arguments)]
+fn draw_glass(
+    encoder: &mut wgpu::CommandEncoder,
+    target: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    (vp_bg, vp_offset): (&wgpu::BindGroup, u32),
+    instance_bg: &wgpu::BindGroup,
+    textures: &AlbedoCache,
+    geometry: &GeometryArena,
+    glass: &[EntityHandle<'_, Mesh>],
+    view_proj: Mat4,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("shadow_glass_tint"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(GLASS_TINT_CLEAR), store: wgpu::StoreOp::Store },
+        })],
+        ..Default::default()
+    });
+    if glass.is_empty() {
+        return;
+    }
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, vp_bg, &[vp_offset]);
+    pass.set_bind_group(1, instance_bg, &[]);
+    pass.set_vertex_buffer(0, geometry.vertex_buffer().slice(..));
+    pass.set_index_buffer(geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
+    for (handle, draw) in visible(glass.iter(), geometry, view_proj) {
+        let Some((_, texture_bg)) = textures.get(&albedo_key(handle.entity)).or(textures.get(&0)) else {
+            continue;
+        };
+        pass.set_bind_group(2, texture_bg, &[]);
+        pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
+    }
 }
 
 pub struct ShadowPass {
@@ -80,11 +203,13 @@ pub struct ShadowPass {
     pipeline: Option<wgpu::RenderPipeline>,
     /// Unculled pipeline that discards cut-out texels, for `Mesh::is_masked` meshes.
     masked_pipeline: Option<wgpu::RenderPipeline>,
-    masked_texture_layout: Option<wgpu::BindGroupLayout>,
-    masked_sampler: Option<wgpu::Sampler>,
-    mips: Option<MipGenerator>,
-    /// Albedo textures of masked meshes, keyed by `TextureAsset` pointer; key 0 is opaque white.
-    masked_textures: HashMap<u64, (wgpu::Texture, wgpu::BindGroup)>,
+    albedo: Option<AlbedoUpload>,
+    /// Albedo textures of masked meshes (alpha only), keyed by `TextureAsset::id`; key 0 is white.
+    masked_textures: AlbedoCache,
+    /// Tints blended meshes into the glass tint maps, unculled, multiplying (see `GLASS_TINT_BLEND`).
+    glass_pipeline: Option<wgpu::RenderPipeline>,
+    /// Albedo textures of blended meshes (sRGB color), keyed like `masked_textures`.
+    glass_textures: AlbedoCache,
     bgl: Option<wgpu::BindGroupLayout>,
     instance_layout: Option<wgpu::BindGroupLayout>,
     instance_bind_group: Option<(u64, wgpu::BindGroup)>,
@@ -94,6 +219,8 @@ pub struct ShadowPass {
     cascade_vp_id: ResourceId,
 
     cascade_views: Vec<wgpu::TextureView>,
+    glass_tint_id: ResourceId,
+    glass_tint_views: Vec<wgpu::TextureView>,
     cascade_bind_group: Option<wgpu::BindGroup>,
 
     /// Read only to run after `light_upload`, which fills `casters` this frame.
@@ -103,6 +230,8 @@ pub struct ShadowPass {
     local_params_id: ResourceId,
     local_vp_id: ResourceId,
     local_views: Vec<wgpu::TextureView>,
+    local_glass_tint_id: ResourceId,
+    local_glass_tint_views: Vec<wgpu::TextureView>,
     local_bind_group: Option<wgpu::BindGroup>,
     /// Unculled, depth-biased variants of the two pipelines: cube faces see both sides of walls.
     local_pipeline: Option<wgpu::RenderPipeline>,
@@ -118,50 +247,6 @@ fn albedo_key(mesh: &Mesh) -> u64 {
 }
 
 impl ShadowPass {
-    /// Uploads the albedo texture of every masked mesh not seen before (plus the white
-    /// fallback), so the cascades can alpha-test against it.
-    fn upload_masked_textures(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        meshes: &[EntityHandle<'_, Mesh>],
-    ) {
-        let (Some(layout), Some(sampler), Some(mips)) = (&self.masked_texture_layout, &self.masked_sampler, &self.mips)
-        else {
-            return;
-        };
-        let white = Arc::new(TextureAsset::new(1, 1, vec![255; 4]));
-        let fallback = (!self.masked_textures.contains_key(&0)).then_some((0, &white));
-        let needed = meshes
-            .iter()
-            .filter(|h| h.entity.is_masked())
-            .filter_map(|h| {
-                let texture = h.entity.albedo_texture.as_ref()?;
-                Some((albedo_key(h.entity), texture, albedo_alpha_cutoff(h.entity)))
-            })
-            .chain(fallback.map(|(key, texture)| (key, texture, None)));
-
-        for (key, asset, alpha_cutoff) in needed {
-            if self.masked_textures.contains_key(&key) {
-                continue;
-            }
-            let (texture, view) = mips.upload(device, queue, encoder, asset, TextureKind::Linear { alpha_cutoff });
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("shadow_masked_texture"),
-                layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                ],
-            });
-            self.masked_textures.insert(key, (texture, bind_group));
-        }
-
-        let live: HashSet<u64> = meshes.iter().filter(|h| h.entity.is_masked()).map(|h| albedo_key(h.entity)).collect();
-        self.masked_textures.retain(|key, _| *key == 0 || live.contains(key));
-    }
-
     pub fn new(
         graph: &mut RenderGraph,
         shader: ShaderAsset,
@@ -208,11 +293,22 @@ impl ShadowPass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        let tint_map = |size, layers| ResourceDescriptor::FixedTexture {
+            size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: layers },
+            format: GLASS_TINT_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        };
+        let glass_tint_id = graph.alloc_resource_id(tint_map(GLASS_TINT_SIZE, NUM_CASCADES as u32));
+        let local_glass_tint_id =
+            graph.alloc_resource_id(tint_map(LOCAL_GLASS_TINT_SIZE, LOCAL_SHADOW_FACES as u32));
+
         let outputs = ShadowOutputs {
             shadow_map_id,
             shadow_params_id,
             local_shadow_map_id: local_map_id,
             local_shadow_params_id: local_params_id,
+            glass_tint_id,
+            local_glass_tint_id,
         };
 
         (
@@ -221,10 +317,10 @@ impl ShadowPass {
                 shader,
                 pipeline: None,
                 masked_pipeline: None,
-                masked_texture_layout: None,
-                masked_sampler: None,
-                mips: None,
+                albedo: None,
                 masked_textures: HashMap::new(),
+                glass_pipeline: None,
+                glass_textures: HashMap::new(),
                 bgl: None,
                 instance_layout: None,
                 instance_bind_group: None,
@@ -232,6 +328,8 @@ impl ShadowPass {
                 shadow_params_id,
                 cascade_vp_id,
                 cascade_views: Vec::new(),
+                glass_tint_id,
+                glass_tint_views: Vec::new(),
                 cascade_bind_group: None,
                 shadowed_buffer_id,
                 casters,
@@ -239,6 +337,8 @@ impl ShadowPass {
                 local_params_id,
                 local_vp_id,
                 local_views: Vec::new(),
+                local_glass_tint_id,
+                local_glass_tint_views: Vec::new(),
                 local_bind_group: None,
                 local_pipeline: None,
                 local_masked_pipeline: None,
@@ -260,26 +360,28 @@ impl ShadowPass {
         ctx: &PassContext<'_>,
         meshes: &[EntityHandle<'_, Mesh>],
         masked: &[&EntityHandle<'_, Mesh>],
+        glass: &[EntityHandle<'_, Mesh>],
     ) {
         let (Some(&vp_buf), Some(&params_buf)) = (ctx.buffers.get(&self.local_vp_id), ctx.buffers.get(&self.local_params_id))
         else {
             return;
         };
-        let (Some(pipeline), Some(masked_pipeline), Some(bind_group), Some((_, instance_bg))) = (
+        let (Some(pipeline), Some(masked_pipeline), Some(glass_pipeline), Some(bind_group), Some((_, instance_bg))) = (
             &self.local_pipeline,
             &self.local_masked_pipeline,
+            &self.glass_pipeline,
             &self.local_bind_group,
             &self.instance_bind_group,
         ) else {
             return;
         };
-        if self.local_views.len() != LOCAL_SHADOW_FACES {
+        if self.local_views.len() != LOCAL_SHADOW_FACES || self.local_glass_tint_views.len() != LOCAL_SHADOW_FACES {
             return;
         }
 
         let mut hasher = std::hash::DefaultHasher::new();
         ctx.geometry.generation().hash(&mut hasher);
-        for handle in meshes {
+        for handle in meshes.iter().chain(glass) {
             handle.id.hash(&mut hasher);
             for value in handle.entity.transform.as_array() {
                 value.to_bits().hash(&mut hasher);
@@ -311,8 +413,8 @@ impl ShadowPass {
                 let vp_raw: [[f32; 4]; 4] = [cols[0].into(), cols[1].into(), cols[2].into(), cols[3].into()];
                 self.local_params.face_vp[layer] = vp_raw;
                 let offset = CASCADE_VP_STRIDE * layer as u64;
-                vp_buf.write_at(queue, offset, bytemuck::bytes_of(&vp_raw));
-
+                let view = ShadowView { view_proj: vp_raw, light: [caster.origin.x, caster.origin.y, caster.origin.z, 1.0] };
+                vp_buf.write_at(queue, offset, bytemuck::bytes_of(&view));
 
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("shadow_local_face"),
@@ -349,6 +451,19 @@ impl ShadowPass {
                     }
                     pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
                 }
+                drop(pass);
+
+                draw_glass(
+                    encoder,
+                    &self.local_glass_tint_views[layer],
+                    glass_pipeline,
+                    (bind_group, offset as u32),
+                    instance_bg,
+                    &self.glass_textures,
+                    ctx.geometry,
+                    glass,
+                    vp,
+                );
             }
         }
 
@@ -467,6 +582,8 @@ impl PassDesc for ShadowPass {
             self.local_map_id,
             self.local_params_id,
             self.local_vp_id,
+            self.glass_tint_id,
+            self.local_glass_tint_id,
         ]
     }
 }
@@ -509,14 +626,12 @@ impl Pass for ShadowPass {
         };
         let light_view = Mat4::look_at(camera.eye - dir, camera.eye, up);
 
-        // Glass and other blended surfaces cast no shadow.
-        let meshes: Vec<_> = world
-            .get_entity_handles::<Mesh>()
-            .into_iter()
-            .filter(|h| !h.entity.is_blended())
-            .collect();
+        // Glass and other blended surfaces stay out of the depth maps; they tint the light that
+        // passes them through the glass tint maps instead.
+        let (glass, meshes): (Vec<_>, Vec<_>) =
+            world.get_entity_handles::<Mesh>().into_iter().partition(|h| h.entity.is_blended());
         let mut scene = Aabb::empty();
-        for handle in &meshes {
+        for handle in meshes.iter().chain(&glass) {
             if let Some(draw) = ctx.geometry.get(handle.id) {
                 let world_bounds = draw.bounds.transformed(handle.entity.transform);
                 if !world_bounds.is_empty() {
@@ -555,7 +670,7 @@ impl Pass for ShadowPass {
                 label: Some("shadow_bgl"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: true,
@@ -567,7 +682,10 @@ impl Pass for ShadowPass {
 
             let instance_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("shadow_instance_layout"),
-                entries: &[GeometryArena::instance_layout_entry(0)],
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ..GeometryArena::instance_layout_entry(0)
+                }],
             });
 
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -660,17 +778,45 @@ impl Pass for ShadowPass {
             self.local_masked_pipeline =
                 Some(depth_pipeline("shadow_local_masked_pipeline", &masked_pipeline_layout, true, None, local_bias));
 
-            self.masked_sampler = Some(device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("shadow_masked_sampler"),
-                address_mode_u: wgpu::AddressMode::Repeat,
-                address_mode_v: wgpu::AddressMode::Repeat,
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
-                mipmap_filter: wgpu::MipmapFilterMode::Linear,
-                ..Default::default()
+            self.glass_pipeline = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shadow_glass_pipeline"),
+                layout: Some(&masked_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_glass"),
+                    buffers: &[Some(crate::mesh::Vertex::buffer_descriptor())],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_glass"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: GLASS_TINT_FORMAT,
+                        blend: Some(GLASS_TINT_BLEND),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
             }));
-            self.mips = Some(MipGenerator::new(device));
-            self.masked_texture_layout = Some(masked_texture_layout);
+
+            self.albedo = Some(AlbedoUpload {
+                mips: MipGenerator::new(device),
+                layout: masked_texture_layout,
+                sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("shadow_albedo_sampler"),
+                    address_mode_u: wgpu::AddressMode::Repeat,
+                    address_mode_v: wgpu::AddressMode::Repeat,
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    mipmap_filter: wgpu::MipmapFilterMode::Linear,
+                    ..Default::default()
+                }),
+            });
             self.masked_pipeline = Some(masked_pipeline);
 
             self.cascade_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -704,10 +850,10 @@ impl Pass for ShadowPass {
             self.pipeline = Some(pipeline);
         }
 
-        if self.local_views.is_empty()
-            && let Some(&tex) = ctx.textures.get(&self.local_map_id)
-        {
-            self.local_views = (0..LOCAL_SHADOW_FACES as u32)
+        // Per-layer render attachment views, created once from the graph-allocated textures.
+        let layer_views = |id: &ResourceId, layers: usize| -> Vec<wgpu::TextureView> {
+            let Some(&tex) = ctx.textures.get(id) else { return Vec::new() };
+            (0..layers as u32)
                 .map(|layer| {
                     tex.create_view(&wgpu::TextureViewDescriptor {
                         dimension: Some(wgpu::TextureViewDimension::D2),
@@ -716,25 +862,22 @@ impl Pass for ShadowPass {
                         ..Default::default()
                     })
                 })
-                .collect();
+                .collect()
+        };
+        if self.local_views.is_empty() {
+            self.local_views = layer_views(&self.local_map_id, LOCAL_SHADOW_FACES);
         }
-
-        // Create per-layer render attachment views once, from the graph-allocated texture.
-        if self.cascade_views.is_empty()
-            && let Some(&tex) = ctx.textures.get(&self.shadow_map_id)
-        {
-            for i in 0..NUM_CASCADES {
-                let view = tex.create_view(&wgpu::TextureViewDescriptor {
-                    dimension: Some(wgpu::TextureViewDimension::D2),
-                    base_array_layer: i as u32,
-                    array_layer_count: Some(1),
-                    ..Default::default()
-                });
-                self.cascade_views.push(view);
-            }
+        if self.local_glass_tint_views.is_empty() {
+            self.local_glass_tint_views = layer_views(&self.local_glass_tint_id, LOCAL_SHADOW_FACES);
         }
-
         if self.cascade_views.is_empty() {
+            self.cascade_views = layer_views(&self.shadow_map_id, NUM_CASCADES);
+        }
+        if self.glass_tint_views.is_empty() {
+            self.glass_tint_views = layer_views(&self.glass_tint_id, NUM_CASCADES);
+        }
+
+        if self.cascade_views.is_empty() || self.glass_tint_views.is_empty() {
             return;
         }
 
@@ -752,13 +895,24 @@ impl Pass for ShadowPass {
             });
             self.instance_bind_group = Some((generation, bind_group));
         }
-        self.upload_masked_textures(device, queue, encoder, &meshes);
+        if let Some(albedo) = &self.albedo {
+            let masked = meshes.iter().map(|h| h.entity).filter(|m| m.is_masked());
+            albedo.sync(device, queue, encoder, &mut self.masked_textures, masked, |mesh| TextureKind::Linear {
+                alpha_cutoff: albedo_alpha_cutoff(mesh),
+            });
+            let blended = glass.iter().map(|h| h.entity);
+            albedo.sync(device, queue, encoder, &mut self.glass_textures, blended, |_| TextureKind::Color {
+                alpha_cutoff: None,
+            });
+        }
 
         let Some((_, instance_bg)) = self.instance_bind_group.as_ref() else {
             return;
         };
 
-        let (Some(pipeline), Some(masked_pipeline)) = (&self.pipeline, &self.masked_pipeline) else {
+        let (Some(pipeline), Some(masked_pipeline), Some(glass_pipeline)) =
+            (&self.pipeline, &self.masked_pipeline, &self.glass_pipeline)
+        else {
             return;
         };
         let mut masked: Vec<_> = meshes.iter().filter(|h| h.entity.is_masked()).collect();
@@ -783,7 +937,8 @@ impl Pass for ShadowPass {
                 lp_cols[0].into(), lp_cols[1].into(), lp_cols[2].into(), lp_cols[3].into(),
             ];
             let vp_offset = CASCADE_VP_STRIDE * i as u64;
-            cascade_vp_buf.write_at(queue, vp_offset, bytemuck::bytes_of(&vp_raw));
+            let view = ShadowView { view_proj: vp_raw, light: [dir.x, dir.y, dir.z, 0.0] };
+            cascade_vp_buf.write_at(queue, vp_offset, bytemuck::bytes_of(&view));
 
             let layer_view = &self.cascade_views[i];
             let bg = self.cascade_bind_group.as_ref().expect("shadow cascade bind group");
@@ -812,27 +967,40 @@ impl Pass for ShadowPass {
                 pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
             }
 
-            if masked.is_empty() {
-                continue;
-            }
-            pass.set_pipeline(masked_pipeline);
-            pass.set_bind_group(0, bg, &[vp_offset as u32]);
-            pass.set_bind_group(1, instance_bg, &[]);
-            let mut current_texture = None;
-            for (handle, draw) in visible(masked.iter().copied(), ctx.geometry, light_vp) {
-                let key = albedo_key(handle.entity);
-                if current_texture != Some(key) {
-                    let Some((_, texture_bg)) = self.masked_textures.get(&key).or(self.masked_textures.get(&0)) else {
-                        continue;
-                    };
-                    pass.set_bind_group(2, texture_bg, &[]);
-                    current_texture = Some(key);
+            if !masked.is_empty() {
+                pass.set_pipeline(masked_pipeline);
+                pass.set_bind_group(0, bg, &[vp_offset as u32]);
+                pass.set_bind_group(1, instance_bg, &[]);
+                let mut current_texture = None;
+                for (handle, draw) in visible(masked.iter().copied(), ctx.geometry, light_vp) {
+                    let key = albedo_key(handle.entity);
+                    if current_texture != Some(key) {
+                        let Some((_, texture_bg)) = self.masked_textures.get(&key).or(self.masked_textures.get(&0))
+                        else {
+                            continue;
+                        };
+                        pass.set_bind_group(2, texture_bg, &[]);
+                        current_texture = Some(key);
+                    }
+                    pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
                 }
-                pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
             }
+            drop(pass);
+
+            draw_glass(
+                encoder,
+                &self.glass_tint_views[i],
+                glass_pipeline,
+                (bg, vp_offset as u32),
+                instance_bg,
+                &self.glass_textures,
+                ctx.geometry,
+                &glass,
+                light_vp,
+            );
         }
 
-        self.render_local_shadows(encoder, queue, ctx, &meshes, &masked);
+        self.render_local_shadows(encoder, queue, ctx, &meshes, &masked, &glass);
 
         let params = ShadowParams {
             view_to_shadow: view_to_shadow_raw,
