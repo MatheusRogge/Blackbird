@@ -433,7 +433,7 @@ impl Pass for TransparentPass {
         meshes.sort_by(|a, b| b.0.total_cmp(&a.0));
 
         let Some(pipelines) = self.pipelines.as_mut() else { return };
-        pipelines.materials.prepare(device, queue, meshes.iter().map(|(_, h, _)| h.entity));
+        pipelines.materials.prepare(device, queue, encoder, meshes.iter().map(|(_, h, _)| h.entity));
 
         if self.behind.as_ref().is_none_or(|b| b.size != ctx.surface_size) {
             self.behind = Some(Behind::new(device, ctx.surface_size));

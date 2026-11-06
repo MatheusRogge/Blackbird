@@ -3,7 +3,11 @@ use std::{
     sync::Arc,
 };
 
-use crate::{mesh::Mesh, texture::TextureAsset};
+use crate::{
+    mesh::Mesh,
+    pass::mipmap::{MipGenerator, TextureKind},
+    texture::TextureAsset,
+};
 
 /// `TextureAsset::id`s of a mesh's material (albedo, normal, metallic-roughness, emissive), 0 for none.
 pub type MaterialKey = (u64, u64, u64, u64);
@@ -21,68 +25,16 @@ pub fn material_key(mesh: &Mesh) -> MaterialKey {
     )
 }
 
-pub(crate) fn upload_texture(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    asset: &TextureAsset,
-    format: wgpu::TextureFormat,
-) -> (wgpu::Texture, wgpu::TextureView) {
-    let size = wgpu::Extent3d {
-        width: asset.width,
-        height: asset.height,
-        depth_or_array_layers: 1,
-    };
-
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: None,
-        size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-
-    let unpadded = 4 * asset.width;
-    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    let bytes_per_row = unpadded.div_ceil(align) * align;
-
-    let padded: Vec<u8>;
-    let data = if bytes_per_row == unpadded {
-        &asset.data
-    } else {
-        let padding = (bytes_per_row - unpadded) as usize;
-        padded = asset
-            .data
-            .chunks_exact(unpadded as usize)
-            .flat_map(|row| row.iter().copied().chain(std::iter::repeat_n(0, padding)))
-            .collect();
-        &padded
-    };
-
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        data,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(bytes_per_row),
-            rows_per_image: None,
-        },
-        size,
-    );
-
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, view)
+/// The alpha test `mesh`'s albedo texture is sampled with: its cutoff divided by the base color
+/// factor's alpha, which multiplies the texture's.
+pub(crate) fn albedo_alpha_cutoff(mesh: &Mesh) -> Option<f32> {
+    mesh.alpha_cutoff().map(|cutoff| (cutoff / mesh.material.base_color[3].max(1e-3)).min(1.0))
 }
 
 /// GPU copies of mesh material textures and one bind group per material: albedo, normal,
-/// metallic-roughness and emissive textures at bindings 0–3 and a repeating linear sampler at 4.
+/// metallic-roughness and emissive textures at bindings 0–3 and a repeating trilinear, 16×
+/// anisotropic sampler at 4. Textures get full mip chains (see `MipGenerator`); albedo of
+/// alpha-tested meshes keeps its alpha coverage per mip.
 /// Missing textures use white / flat / white / white fallbacks (glTF emissive is factor × texture,
 /// so no texture means the factor alone).
 pub struct MaterialTextures {
@@ -94,6 +46,7 @@ pub struct MaterialTextures {
     fallback_white: (wgpu::Texture, wgpu::TextureView),
     fallback_normal: (wgpu::Texture, wgpu::TextureView),
     fallback_bind_group: wgpu::BindGroup,
+    mips: MipGenerator,
 }
 
 impl MaterialTextures {
@@ -131,14 +84,20 @@ impl MaterialTextures {
             address_mode_w: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp: 16,
             ..Default::default()
         });
 
+        let mips = MipGenerator::new(device);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
         let white = TextureAsset::new(1, 1, vec![255, 255, 255, 255]);
-        let fallback_white = upload_texture(device, queue, &white, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let fallback_white =
+            mips.upload(device, queue, &mut encoder, &white, TextureKind::Color { alpha_cutoff: None });
         // [128, 128, 255] decodes to (0, 0, 1) in tangent space — a flat normal map
         let flat = TextureAsset::new(1, 1, vec![128, 128, 255, 255]);
-        let fallback_normal = upload_texture(device, queue, &flat, wgpu::TextureFormat::Rgba8Unorm);
+        let fallback_normal = mips.upload(device, queue, &mut encoder, &flat, TextureKind::Normal);
+        queue.submit([encoder.finish()]);
 
         let fallback_bind_group = Self::create_bind_group(
             device,
@@ -155,6 +114,7 @@ impl MaterialTextures {
             fallback_white,
             fallback_normal,
             fallback_bind_group,
+            mips,
         }
     }
 
@@ -182,24 +142,32 @@ impl MaterialTextures {
         })
     }
 
-    /// Uploads the textures of `meshes` that aren't on the GPU yet and builds their bind groups,
-    /// then drops textures and bind groups none of them use. Call before opening the render pass.
-    pub fn prepare<'m>(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, meshes: impl IntoIterator<Item = &'m Mesh>) {
+    /// Uploads the textures of `meshes` that aren't on the GPU yet (their mip chains are recorded
+    /// into `encoder`) and builds their bind groups, then drops textures and bind groups none of
+    /// them use. Call before opening the render pass. A texture keeps the kind it was first
+    /// uploaded with, so an albedo shared by an alpha-tested and an opaque mesh keeps one cutoff.
+    pub fn prepare<'m>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        meshes: impl IntoIterator<Item = &'m Mesh>,
+    ) {
         let mut live: HashSet<u64> = HashSet::from([0]);
         let mut live_keys: HashSet<MaterialKey> = HashSet::new();
         for mesh in meshes {
             let textures = [
-                (&mesh.albedo_texture, wgpu::TextureFormat::Rgba8UnormSrgb),
-                (&mesh.normal_texture, wgpu::TextureFormat::Rgba8Unorm),
-                (&mesh.metallic_roughness_texture, wgpu::TextureFormat::Rgba8Unorm),
-                (&mesh.emissive_texture, wgpu::TextureFormat::Rgba8UnormSrgb),
+                (&mesh.albedo_texture, TextureKind::Color { alpha_cutoff: albedo_alpha_cutoff(mesh) }),
+                (&mesh.normal_texture, TextureKind::Normal),
+                (&mesh.metallic_roughness_texture, TextureKind::Linear { alpha_cutoff: None }),
+                (&mesh.emissive_texture, TextureKind::Color { alpha_cutoff: None }),
             ];
-            for (texture, format) in textures {
+            for (texture, kind) in textures {
                 if let Some(tex) = texture {
                     live.insert(tex.id());
                     self.textures
                         .entry(tex.id())
-                        .or_insert_with(|| upload_texture(device, queue, tex, format));
+                        .or_insert_with(|| self.mips.upload(device, queue, encoder, tex, kind));
                 }
             }
 

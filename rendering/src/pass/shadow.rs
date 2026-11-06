@@ -14,7 +14,11 @@ use crate::{
     graph::{NodeId, RenderGraph},
     light::{MAX_SHADOWED_LIGHTS, ShadowCaster, SharedShadowCasters, SkyLight},
     mesh::Mesh,
-    pass::{Pass, PassContext, PassDesc, material::upload_texture},
+    pass::{
+        Pass, PassContext, PassDesc,
+        material::albedo_alpha_cutoff,
+        mipmap::{MipGenerator, TextureKind},
+    },
     resource::{ResourceDescriptor, ResourceId},
     shader::ShaderAsset,
     texture::TextureAsset,
@@ -78,6 +82,7 @@ pub struct ShadowPass {
     masked_pipeline: Option<wgpu::RenderPipeline>,
     masked_texture_layout: Option<wgpu::BindGroupLayout>,
     masked_sampler: Option<wgpu::Sampler>,
+    mips: Option<MipGenerator>,
     /// Albedo textures of masked meshes, keyed by `TextureAsset` pointer; key 0 is opaque white.
     masked_textures: HashMap<u64, (wgpu::Texture, wgpu::BindGroup)>,
     bgl: Option<wgpu::BindGroupLayout>,
@@ -115,8 +120,15 @@ fn albedo_key(mesh: &Mesh) -> u64 {
 impl ShadowPass {
     /// Uploads the albedo texture of every masked mesh not seen before (plus the white
     /// fallback), so the cascades can alpha-test against it.
-    fn upload_masked_textures(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, meshes: &[EntityHandle<'_, Mesh>]) {
-        let (Some(layout), Some(sampler)) = (&self.masked_texture_layout, &self.masked_sampler) else {
+    fn upload_masked_textures(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        meshes: &[EntityHandle<'_, Mesh>],
+    ) {
+        let (Some(layout), Some(sampler), Some(mips)) = (&self.masked_texture_layout, &self.masked_sampler, &self.mips)
+        else {
             return;
         };
         let white = Arc::new(TextureAsset::new(1, 1, vec![255; 4]));
@@ -124,14 +136,17 @@ impl ShadowPass {
         let needed = meshes
             .iter()
             .filter(|h| h.entity.is_masked())
-            .filter_map(|h| h.entity.albedo_texture.as_ref().map(|t| (albedo_key(h.entity), t)))
-            .chain(fallback);
+            .filter_map(|h| {
+                let texture = h.entity.albedo_texture.as_ref()?;
+                Some((albedo_key(h.entity), texture, albedo_alpha_cutoff(h.entity)))
+            })
+            .chain(fallback.map(|(key, texture)| (key, texture, None)));
 
-        for (key, asset) in needed {
+        for (key, asset, alpha_cutoff) in needed {
             if self.masked_textures.contains_key(&key) {
                 continue;
             }
-            let (texture, view) = upload_texture(device, queue, asset, wgpu::TextureFormat::Rgba8Unorm);
+            let (texture, view) = mips.upload(device, queue, encoder, asset, TextureKind::Linear { alpha_cutoff });
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("shadow_masked_texture"),
                 layout,
@@ -208,6 +223,7 @@ impl ShadowPass {
                 masked_pipeline: None,
                 masked_texture_layout: None,
                 masked_sampler: None,
+                mips: None,
                 masked_textures: HashMap::new(),
                 bgl: None,
                 instance_layout: None,
@@ -650,8 +666,10 @@ impl Pass for ShadowPass {
                 address_mode_v: wgpu::AddressMode::Repeat,
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
                 ..Default::default()
             }));
+            self.mips = Some(MipGenerator::new(device));
             self.masked_texture_layout = Some(masked_texture_layout);
             self.masked_pipeline = Some(masked_pipeline);
 
@@ -734,7 +752,7 @@ impl Pass for ShadowPass {
             });
             self.instance_bind_group = Some((generation, bind_group));
         }
-        self.upload_masked_textures(device, queue, &meshes);
+        self.upload_masked_textures(device, queue, encoder, &meshes);
 
         let Some((_, instance_bg)) = self.instance_bind_group.as_ref() else {
             return;

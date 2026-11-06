@@ -361,7 +361,7 @@ impl Pass for GBufferPass {
             return;
         };
         // Before the render pass opens, so no resource creation happens during command recording.
-        materials.prepare(device, queue, meshes.iter().map(|h| h.entity));
+        materials.prepare(device, queue, encoder, meshes.iter().map(|h| h.entity));
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("gbuffer"),
