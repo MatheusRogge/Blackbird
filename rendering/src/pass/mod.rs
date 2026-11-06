@@ -13,6 +13,7 @@ pub mod probe_atlas;
 pub mod probe_trace;
 pub mod probe_update;
 pub mod reflection_probe;
+pub mod prev_frame;
 pub mod ssr;
 pub mod ssr_temporal;
 pub mod shadow;
@@ -53,6 +54,12 @@ pub trait PassDesc {
 
     fn samplers(&self) -> Vec<(u32, wgpu::SamplerDescriptor<'static>)> {
         vec![]
+    }
+
+    /// Run even though the frame output doesn't depend on this pass's writes (e.g. it only fills
+    /// a texture a pass reads next frame). Otherwise the graph culls it.
+    fn has_side_effects(&self) -> bool {
+        false
     }
 }
 

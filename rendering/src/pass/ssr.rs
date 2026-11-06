@@ -1,6 +1,7 @@
 //! Screen-space reflections: builds a Hi-Z pyramid of the G-buffer depth (`hiz.wgsl`, embedded),
 //! then traces each reflection ray through it (`ssr.wgsl`). Writes premultiplied hit colour with
-//! confidence in alpha, which `ssr_temporal` accumulates and `composite` blends.
+//! confidence in alpha, which `ssr_temporal` accumulates and `composite` blends. Hits read last
+//! frame's `composite` output (`prev_frame`), reprojected, so reflections show reflections.
 
 use engine_core::world::World;
 
@@ -8,6 +9,7 @@ use crate::{
     graph::{NodeId, RenderGraph},
     pass::{Pass, PassContext, PassDesc},
     resource::{ResourceDescriptor, ResourceId},
+    pass::prev_frame::FrameHistory,
     shader::ShaderAsset,
 };
 
@@ -23,6 +25,8 @@ pub struct SsrInputs {
     pub camera_buffer_id: ResourceId,
     /// `lighting`'s debug flags uniform (`disable_ssr`).
     pub debug_flags_id: ResourceId,
+    /// Last frame's `composite` output. `lit` stands in until the first copy exists.
+    pub prev_frame: FrameHistory,
 }
 
 struct Pipelines {
@@ -148,6 +152,7 @@ impl SsrPass {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                texture(7, float),
             ],
         });
 
@@ -305,7 +310,10 @@ impl Pass for SsrPass {
             fullscreen(encoder, "hiz_reduce", &hiz.levels[level + 1], &pipelines.hiz_reduce, bind_group);
         }
 
-        let key: Vec<usize> = [normal, lit, weight].iter().map(|v| std::ptr::from_ref(*v) as usize).collect();
+        let prev_frame = i.prev_frame.get();
+        let mut key: Vec<usize> = [normal, lit, weight].iter().map(|v| std::ptr::from_ref(*v) as usize).collect();
+        key.push(prev_frame.as_ref().map_or(0, |(generation, _)| *generation as usize));
+        let prev_view = prev_frame.as_ref().map_or(lit, |(_, view)| view);
         if self.trace_bg.as_ref().is_none_or(|(k, _)| *k != key) {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ssr"),
@@ -318,6 +326,7 @@ impl Pass for SsrPass {
                     wgpu::BindGroupEntry { binding: 4, resource: camera.binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: flags.binding() },
                     wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&pipelines.sampler) },
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(prev_view) },
                 ],
             });
             self.trace_bg = Some((key, bind_group));

@@ -420,9 +420,15 @@ impl RenderGraph {
             })
             .collect();
 
-        // Backwards reachability from the output resource
+        // Backwards reachability from the output resource and from passes with side effects
         let mut stack = vec![output];
         let mut needed = HashSet::new();
+        for id in self.flat_node_ids() {
+            let pass = &self.ctx.passes[&id];
+            if pass.has_side_effects() && needed.insert(id) {
+                stack.extend(pass.reads());
+            }
+        }
 
         while let Some(res) = stack.pop() {
             let Some(&writer) = writer_of.get(&res) else {

@@ -18,6 +18,7 @@ use crate::{
         probe_trace::ProbeTracePass,
         probe_update::ProbeUpdatePass,
         reflection_probe::ReflectionProbePass,
+        prev_frame::{FrameHistory, PrevFramePass},
         ssr::{SsrInputs, SsrPass},
         ssr_temporal::SsrTemporalPass,
         shadow::ShadowPass,
@@ -171,6 +172,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         );
         graph.add_pass(device, lighting_pass);
 
+        let prev_frame = FrameHistory::default();
         let (ssr_pass, ssr_id) = SsrPass::new(
             &mut graph,
             SsrInputs {
@@ -180,6 +182,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
                 specular_weight_id: lighting_outputs.specular_weight_id,
                 camera_buffer_id,
                 debug_flags_id: lighting_outputs.debug_flags_id,
+                prev_frame: prev_frame.clone(),
             },
             self.ssr_shader,
         );
@@ -210,6 +213,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             self.composite_shader,
         );
         graph.add_pass(device, composite_pass);
+        graph.add_pass(device, PrevFramePass::new(composite_id, wgpu::TextureFormat::Rgba16Float, prev_frame));
 
         let (transparent_pass, transparent_id) = TransparentPass::new(
             &mut graph,

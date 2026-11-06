@@ -1,6 +1,8 @@
 // Screen-space reflections. Traces the reflection ray through a Hi-Z depth pyramid (built by the
-// `ssr` pass, rendering/src/pass/hiz.wgsl) and writes the lit color it hits, premultiplied by a
-// confidence the composite pass blends with. `ssr_temporal` accumulates it over frames.
+// `ssr` pass, rendering/src/pass/hiz.wgsl) and writes the color it hits, premultiplied by a
+// confidence the composite pass blends with. `ssr_temporal` accumulates it over frames. The color
+// comes from last frame's composite output where the hit was on screen then, so reflected surfaces
+// show their own reflections (each frame adds a bounce); otherwise from this frame's `lit`.
 
 // Hi-Z pyramid: level 0 is the G-buffer depth (reversed-Z), each further level the max (nearest)
 // of the texels it covers.
@@ -12,6 +14,8 @@
 @group(0) @binding(4) var<uniform> camera:   CameraUniform;
 @group(0) @binding(5) var<uniform> debug:    DebugFlags;
 @group(0) @binding(6) var s_linear:          sampler;
+// Last frame's composite output (rendering::pass::prev_frame); `lit` on the first frame.
+@group(0) @binding(7) var t_prev:            texture_2d<f32>;
 
 // Mirrors rendering::debug_flags::DebugFlagsGpu.
 struct DebugFlags {
@@ -26,11 +30,12 @@ struct DebugFlags {
 }
 
 struct CameraUniform {
-    view_proj:     mat4x4<f32>,
-    inv_view_proj: mat4x4<f32>,
-    inv_view:      mat4x4<f32>,
+    view_proj:      mat4x4<f32>,
+    inv_view_proj:  mat4x4<f32>,
+    inv_view:       mat4x4<f32>,
     // near, far, frame index
-    depth_params:  vec4<f32>,
+    depth_params:   vec4<f32>,
+    prev_view_proj: mat4x4<f32>,
 }
 
 // Rougher surfaces get only the probe fallback; SSR fades out from FADE_ROUGHNESS.
@@ -117,6 +122,19 @@ fn trace_hiz(p0: vec3<f32>, dir: vec3<f32>, t_end: f32, t_start: f32) -> f32 {
     return -1.0;
 }
 
+fn hit_color(hit_px: vec2<f32>, hit_uv: vec2<f32>) -> vec3<f32> {
+    let hit_depth = textureLoad(t_hiz, vec2<i32>(hit_px), 0).r;
+    let world4 = camera.inv_view_proj * vec4f(hit_uv.x * 2.0 - 1.0, 1.0 - hit_uv.y * 2.0, hit_depth, 1.0);
+    let prev = camera.prev_view_proj * vec4f(world4.xyz / world4.w, 1.0);
+    if prev.w > 0.0 {
+        let prev_uv = (prev.xy / prev.w) * vec2f(0.5, -0.5) + 0.5;
+        if all(prev_uv >= vec2f(0.0)) && all(prev_uv <= vec2f(1.0)) {
+            return textureSampleLevel(t_prev, s_linear, prev_uv, 0.0).rgb;
+        }
+    }
+    return textureSampleLevel(t_lit, s_linear, hit_uv, 0.0).rgb;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let px = vec2<i32>(in.pos.xy);
@@ -181,7 +199,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4f(0.0);
     }
     let hit_uv = hit_px / dims;
-    let color = textureSampleLevel(t_lit, s_linear, hit_uv, 0.0).rgb;
+    let color = hit_color(hit_px, hit_uv);
 
     let edge = min(hit_uv, 1.0 - hit_uv);
     let confidence = smoothstep(0.0, 0.08, min(edge.x, edge.y))
