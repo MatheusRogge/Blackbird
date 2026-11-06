@@ -151,7 +151,8 @@ impl Pass for BvhUploadPass {
         // Collect triangles from all meshes. Probe rays can't sample textures, so each triangle
         // carries its material factors times the average of its textures.
         let mut gpu_tris: Vec<GpuTriangle> = Vec::new();
-        for mesh in &meshes {
+        // Blended surfaces would block GI rays as if they were solid.
+        for mesh in meshes.iter().filter(|m| !m.is_blended()) {
             let mut mean = |texture: &Option<Arc<TextureAsset>>, srgb: bool| {
                 texture.as_ref().map_or([1.0; 4], |t| {
                     *self.texture_means.entry((t.id(), srgb)).or_insert_with(|| t.mean(srgb))

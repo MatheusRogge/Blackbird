@@ -17,8 +17,8 @@ const INITIAL_VERTICES: u32 = 256 * 1024;
 const INITIAL_INDICES: u32 = 1024 * 1024;
 const INITIAL_INSTANCES: u32 = 1024;
 
-/// Per-mesh entry of the instance buffer. Mirrors `Model` in `gbuffer.wgsl`
-/// and `shadow.wgsl`.
+/// Per-mesh entry of the instance buffer. Mirrors `Model` in `gbuffer.wgsl`,
+/// `shadow.wgsl` and `lighting.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuModel {
@@ -30,6 +30,11 @@ pub struct GpuModel {
     pub base_color: [f32; 4],
     /// rgb: emissive factor × strength, w: unused.
     pub emissive: [f32; 4],
+    /// x: transmission factor, y: index of refraction, z: volume thickness (mesh-local),
+    /// w: attenuation distance (0 = no absorption).
+    pub transmission: [f32; 4],
+    /// rgb: volume attenuation color, w: unused.
+    pub attenuation: [f32; 4],
 }
 
 /// Where a mesh lives inside the shared geometry buffers. `instance` indexes
@@ -209,7 +214,7 @@ impl GeometryArena {
                     model: transform.into(),
                     normal: transform.inversed().transposed().into(),
                     material: [
-                        mesh.alpha_cutoff.unwrap_or(0.0),
+                        mesh.alpha_cutoff().unwrap_or(0.0),
                         if mesh.double_sided { 1.0 } else { 0.0 },
                         mesh.material.metallic,
                         mesh.material.roughness,
@@ -217,6 +222,15 @@ impl GeometryArena {
                     base_color: mesh.material.base_color,
                     emissive: {
                         let [r, g, b] = mesh.material.emissive.map(|c| c * mesh.material.emissive_strength);
+                        [r, g, b, 0.0]
+                    },
+                    transmission: {
+                        let m = &mesh.material;
+                        let distance = if m.attenuation_distance.is_finite() { m.attenuation_distance } else { 0.0 };
+                        [m.transmission, m.ior, m.thickness, distance]
+                    },
+                    attenuation: {
+                        let [r, g, b] = mesh.material.attenuation_color;
                         [r, g, b, 0.0]
                     },
                 };

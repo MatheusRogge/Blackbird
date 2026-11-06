@@ -7,7 +7,7 @@ use gltf::{Gltf, buffer, image, image::Format, mesh::util::ReadIndices};
 use rendering::{
     TextureAsset,
     camera::Camera,
-    mesh::{Mat4, MaterialFactors, Mesh, Vertex},
+    mesh::{AlphaMode, Mat4, MaterialFactors, Mesh, Vertex},
 };
 use std::{
     borrow::Cow,
@@ -248,22 +248,29 @@ fn build_mesh_primitives(
             .emissive_texture()
             .and_then(|info| textures.get(images, info.texture()));
 
+        let volume = material.volume();
         let factors = MaterialFactors {
             base_color: pbr.base_color_factor(),
             metallic: pbr.metallic_factor(),
             roughness: pbr.roughness_factor(),
             emissive: material.emissive_factor(),
             emissive_strength: material.emissive_strength().unwrap_or(1.0),
+            transmission: material.transmission().map_or(0.0, |t| t.transmission_factor()),
+            ior: material.ior().unwrap_or(1.5),
+            thickness: volume.as_ref().map_or(0.0, |v| v.thickness_factor()),
+            attenuation_color: volume.as_ref().map_or([1.0; 3], |v| v.attenuation_color()),
+            attenuation_distance: volume.as_ref().map_or(f32::INFINITY, |v| v.attenuation_distance()),
         };
 
-        let alpha_cutoff = match material.alpha_mode() {
-            gltf::material::AlphaMode::Mask => Some(material.alpha_cutoff().unwrap_or(0.5)),
-            gltf::material::AlphaMode::Opaque | gltf::material::AlphaMode::Blend => None,
+        let alpha_mode = match material.alpha_mode() {
+            gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
+            gltf::material::AlphaMode::Mask => AlphaMode::Mask(material.alpha_cutoff().unwrap_or(0.5)),
+            gltf::material::AlphaMode::Blend => AlphaMode::Blend,
         };
         out.push(
             Mesh::new(vertices, indices, albedo_texture, normal_texture)
                 .with_material(factors, metallic_roughness_texture, emissive_texture)
-                .with_alpha_cutoff(alpha_cutoff)
+                .with_alpha_mode(alpha_mode)
                 .with_double_sided(material.double_sided()),
         );
     }

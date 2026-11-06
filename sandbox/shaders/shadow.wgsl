@@ -10,6 +10,10 @@ struct Model {
     material: vec4<f32>,
     base_color: vec4<f32>,
     emissive: vec4<f32>,
+    // x: transmission, y: IOR, z: volume thickness (mesh-local), w: attenuation distance (0 = none).
+    transmission: vec4<f32>,
+    // rgb: volume attenuation color.
+    attenuation: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> light: LightUniform;

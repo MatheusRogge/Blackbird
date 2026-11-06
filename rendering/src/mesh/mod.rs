@@ -39,6 +39,18 @@ pub struct MaterialFactors {
     pub emissive: [f32; 3],
     /// `KHR_materials_emissive_strength`, a multiplier on `emissive`.
     pub emissive_strength: f32,
+    /// `KHR_materials_transmission`: the fraction of light passing through a `Blend` surface
+    /// instead of being diffusely reflected.
+    pub transmission: f32,
+    /// `KHR_materials_ior`: the dielectric reflectance and, with `thickness`, the refraction of
+    /// transmissive surfaces.
+    pub ior: f32,
+    /// `KHR_materials_volume` thickness in mesh-local units. 0 is thin-walled: no refraction offset.
+    pub thickness: f32,
+    /// `KHR_materials_volume`: transmitted light reaches `attenuation_color` after travelling
+    /// `attenuation_distance` (world units) inside the volume. Infinite means no absorption.
+    pub attenuation_color: [f32; 3],
+    pub attenuation_distance: f32,
 }
 
 impl Default for MaterialFactors {
@@ -49,8 +61,26 @@ impl Default for MaterialFactors {
             roughness: 0.5,
             emissive: [0.0; 3],
             emissive_strength: 1.0,
+            transmission: 0.0,
+            ior: 1.5,
+            thickness: 0.0,
+            attenuation_color: [1.0; 3],
+            attenuation_distance: f32::INFINITY,
         }
     }
+}
+
+/// glTF `alphaMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum AlphaMode {
+    #[default]
+    Opaque,
+    /// Alpha-tested ("cutout"): fragments with albedo alpha below the cutoff are discarded, in the
+    /// G-buffer and in shadow maps.
+    Mask(f32),
+    /// Drawn after the opaque scene by the `transparent` pass, blended back to front. Casts no
+    /// shadows and doesn't block GI rays.
+    Blend,
 }
 
 #[derive(Debug, Clone)]
@@ -64,9 +94,7 @@ pub struct Mesh {
     /// sRGB.
     pub emissive_texture: Option<Arc<TextureAsset>>,
     pub material: MaterialFactors,
-    /// Alpha-tested ("cutout") material: fragments with albedo alpha below this are discarded,
-    /// in the G-buffer and in shadow maps. `None` is opaque.
-    pub alpha_cutoff: Option<f32>,
+    pub alpha_mode: AlphaMode,
     /// Rendered without back-face culling, with normals flipped on back faces.
     pub double_sided: bool,
     /// Local-to-world transform, read every frame. Vertices stay in local space.
@@ -83,7 +111,7 @@ impl Default for Mesh {
             metallic_roughness_texture: None,
             emissive_texture: None,
             material: MaterialFactors::default(),
-            alpha_cutoff: None,
+            alpha_mode: AlphaMode::Opaque,
             double_sided: false,
             transform: Mat4::identity(),
         }
@@ -105,7 +133,7 @@ impl Mesh {
             metallic_roughness_texture: None,
             emissive_texture: None,
             material: MaterialFactors::default(),
-            alpha_cutoff: None,
+            alpha_mode: AlphaMode::Opaque,
             double_sided: false,
             transform: Mat4::identity(),
         }
@@ -123,9 +151,20 @@ impl Mesh {
         self
     }
 
-    pub fn with_alpha_cutoff(mut self, cutoff: Option<f32>) -> Self {
-        self.alpha_cutoff = cutoff;
+    pub fn with_alpha_mode(mut self, alpha_mode: AlphaMode) -> Self {
+        self.alpha_mode = alpha_mode;
         self
+    }
+
+    pub fn alpha_cutoff(&self) -> Option<f32> {
+        match self.alpha_mode {
+            AlphaMode::Mask(cutoff) => Some(cutoff),
+            AlphaMode::Opaque | AlphaMode::Blend => None,
+        }
+    }
+
+    pub fn is_blended(&self) -> bool {
+        self.alpha_mode == AlphaMode::Blend
     }
 
     pub fn with_double_sided(mut self, double_sided: bool) -> Self {
@@ -135,7 +174,7 @@ impl Mesh {
 
     /// Needs the alpha-tested / double-sided path rather than the plain opaque one.
     pub fn is_masked(&self) -> bool {
-        self.alpha_cutoff.is_some() || self.double_sided
+        self.alpha_cutoff().is_some() || self.double_sided
     }
 
     pub fn with_transform(mut self, transform: Mat4) -> Self {

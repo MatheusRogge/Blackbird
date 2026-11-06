@@ -26,6 +26,10 @@ struct Model {
     base_color: vec4<f32>,
     // rgb: emissive factor × strength.
     emissive: vec4<f32>,
+    // x: transmission, y: IOR, z: volume thickness (mesh-local), w: attenuation distance (0 = none).
+    transmission: vec4<f32>,
+    // rgb: volume attenuation color.
+    attenuation: vec4<f32>,
 };
 
 @group(2) @binding(0)

@@ -18,6 +18,7 @@ Embedded at compile time with `include_str!` and passed to `RenderGraphPBRBuilde
 `editor` and `player` also `include_str!` these same files through `../../sandbox/shaders/…`, and `capture` reads them at runtime, so renaming or moving a shader breaks all of them.
 
 - There is **no include/preprocessor system**. Shared code (octahedral encoding, `ProbeGridParams`, `CameraUniform`, …) is copy-pasted into every shader that needs it. `probe_helpers.wgsl` is not referenced by anything.
+- `lighting.wgsl` is also the forward shader for blended meshes: the `transparent` pass reuses the same `ShaderAsset` with its `vs_forward` / `fs_forward` / `fs_background` / `fs_scene_copy` / `fs_scene_downsample` entry points, so there is no separate transparent shader.
 - `sdf_voxelize.wgsl` belongs to the unused `SdfVoxelizePass` (see `rendering/AGENTS.md`).
 - Struct layouts and constants in WGSL must match the Rust `#[repr(C)]` structs and `const`s in `rendering/src/pass/*` (e.g. `PROBES_PER_ROW = 30`, `PROBES_PER_COL = 29`, `ProbeGridParams`, `ClusterParams`, `ShadowParams`, `DebugFlagsGpu`). Change both sides together.
 - Bind group/binding indices are defined in the Rust pass that owns the pipeline. Look there before you renumber anything.

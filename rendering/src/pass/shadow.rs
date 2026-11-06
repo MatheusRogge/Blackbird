@@ -14,7 +14,7 @@ use crate::{
     graph::{NodeId, RenderGraph},
     light::{MAX_SHADOWED_LIGHTS, ShadowCaster, SharedShadowCasters, SkyLight},
     mesh::Mesh,
-    pass::{Pass, PassContext, PassDesc, gbuffer::GBufferPass},
+    pass::{Pass, PassContext, PassDesc, material::upload_texture},
     resource::{ResourceDescriptor, ResourceId},
     shader::ShaderAsset,
     texture::TextureAsset,
@@ -131,7 +131,7 @@ impl ShadowPass {
             if self.masked_textures.contains_key(&key) {
                 continue;
             }
-            let (texture, view) = GBufferPass::upload_texture(device, queue, asset, wgpu::TextureFormat::Rgba8Unorm);
+            let (texture, view) = upload_texture(device, queue, asset, wgpu::TextureFormat::Rgba8Unorm);
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("shadow_masked_texture"),
                 layout,
@@ -493,7 +493,12 @@ impl Pass for ShadowPass {
         };
         let light_view = Mat4::look_at(camera.eye - dir, camera.eye, up);
 
-        let meshes = world.get_entity_handles::<Mesh>();
+        // Glass and other blended surfaces cast no shadow.
+        let meshes: Vec<_> = world
+            .get_entity_handles::<Mesh>()
+            .into_iter()
+            .filter(|h| !h.entity.is_blended())
+            .collect();
         let mut scene = Aabb::empty();
         for handle in &meshes {
             if let Some(draw) = ctx.geometry.get(handle.id) {

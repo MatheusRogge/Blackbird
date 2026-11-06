@@ -18,6 +18,7 @@ use crate::{
         probe_trace::ProbeTracePass,
         probe_update::ProbeUpdatePass,
         shadow::ShadowPass,
+        transparent::TransparentPass,
     },
     renderer::RenderGraphBuilder,
     resource::ResourceId,
@@ -146,7 +147,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             &probe_atlas_outputs,
             camera_buffer_id,
             surface_config,
-            self.lighting_shader,
+            self.lighting_shader.clone(),
             std::sync::Arc::clone(&debug_flags),
         );
         graph.add_pass(device, lighting_pass);
@@ -181,6 +182,21 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         );
         graph.add_pass(device, composite_pass);
 
+        let (transparent_pass, transparent_id) = TransparentPass::new(
+            &mut graph,
+            composite_id,
+            &gbuffer_outputs,
+            &lighting_outputs,
+            &cluster_outputs,
+            &light_buffers,
+            &shadow_outputs,
+            &probe_atlas_outputs,
+            camera_buffer_id,
+            self.lighting_shader,
+            Arc::clone(&debug_flags),
+        );
+        graph.add_pass(device, transparent_pass);
+
         let (debug_overlay_pass, debug_overlay_outputs) = DebugOverlayPass::new(
             &mut graph,
             bvh_outputs.nodes_id,
@@ -194,7 +210,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         graph.add_pass(device, debug_overlay_pass);
 
         let present_pass = PresentPass::new(
-            composite_id,
+            transparent_id,
             debug_overlay_outputs.debug_overlay_id,
             surface_view_id,
             surface_config.format,

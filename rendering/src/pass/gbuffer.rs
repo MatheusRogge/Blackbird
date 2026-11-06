@@ -1,8 +1,3 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
-
 use engine_core::world::World;
 
 use crate::{
@@ -10,10 +5,10 @@ use crate::{
     graph::{NodeId, RenderGraph},
     mesh::{Mesh, Vertex},
     arena::GeometryArena,
+    pass::material::{MaterialKey, MaterialTextures, material_key},
     pass::{Pass, PassContext, PassDesc},
     resource::{BindingResource, ResourceDescriptor, ResourceId},
     shader::ShaderAsset,
-    texture::TextureAsset,
 };
 
 pub struct GBufferOutputs {
@@ -25,30 +20,6 @@ pub struct GBufferOutputs {
     pub depth_id: ResourceId,
 }
 
-/// `TextureAsset::id`s of a mesh's material (albedo, normal, metallic-roughness, emissive), 0 for none.
-type MaterialKey = (u64, u64, u64, u64);
-
-fn texture_key(texture: &Option<Arc<TextureAsset>>) -> u64 {
-    texture.as_ref().map_or(0, |t| t.id())
-}
-
-fn material_key(mesh: &Mesh) -> MaterialKey {
-    (
-        texture_key(&mesh.albedo_texture),
-        texture_key(&mesh.normal_texture),
-        texture_key(&mesh.metallic_roughness_texture),
-        texture_key(&mesh.emissive_texture),
-    )
-}
-
-fn cached_view<'a>(
-    cache: &'a HashMap<u64, (wgpu::Texture, wgpu::TextureView)>,
-    key: u64,
-    fallback: &'a Option<(wgpu::Texture, wgpu::TextureView)>,
-) -> Option<&'a wgpu::TextureView> {
-    cache.get(&key).or(fallback.as_ref()).map(|(_, v)| v)
-}
-
 pub struct GBufferPass {
     node_id: Option<NodeId>,
 
@@ -57,18 +28,9 @@ pub struct GBufferPass {
     /// Same as `pipeline` without back-face culling, for `Mesh::double_sided`.
     double_sided_pipeline: Option<wgpu::RenderPipeline>,
     camera_bind_group_layout: Option<wgpu::BindGroupLayout>,
-    texture_bind_group_layout: Option<wgpu::BindGroupLayout>,
     instance_layout: Option<wgpu::BindGroupLayout>,
     instance_bind_group: Option<(u64, wgpu::BindGroup)>,
-
-    texture_sampler: Option<wgpu::Sampler>,
-    /// Keyed by `TextureAsset::id`. Entries no mesh uses any more are dropped each frame.
-    texture_cache: HashMap<u64, (wgpu::Texture, wgpu::TextureView)>,
-    texture_bind_groups: HashMap<MaterialKey, wgpu::BindGroup>,
-    fallback_albedo: Option<(wgpu::Texture, wgpu::TextureView)>,
-    fallback_normal: Option<(wgpu::Texture, wgpu::TextureView)>,
-    fallback_metallic_roughness: Option<(wgpu::Texture, wgpu::TextureView)>,
-    fallback_bind_group: Option<wgpu::BindGroup>,
+    materials: Option<MaterialTextures>,
     camera_bind_group: Option<wgpu::BindGroup>,
 
     camera_buffer_id: ResourceId,
@@ -127,16 +89,9 @@ impl GBufferPass {
                 pipeline: None,
                 double_sided_pipeline: None,
                 camera_bind_group_layout: None,
-                texture_bind_group_layout: None,
                 instance_layout: None,
                 instance_bind_group: None,
-                texture_sampler: None,
-                texture_cache: HashMap::new(),
-                texture_bind_groups: HashMap::new(),
-                fallback_albedo: None,
-                fallback_normal: None,
-                fallback_metallic_roughness: None,
-                fallback_bind_group: None,
+                materials: None,
                 camera_bind_group: None,
                 camera_buffer_id,
                 albedo_id,
@@ -147,117 +102,6 @@ impl GBufferPass {
             },
             outputs,
         )
-    }
-
-    pub(crate) fn upload_texture(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        asset: &TextureAsset,
-        format: wgpu::TextureFormat,
-    ) -> (wgpu::Texture, wgpu::TextureView) {
-        let size = wgpu::Extent3d {
-            width: asset.width,
-            height: asset.height,
-            depth_or_array_layers: 1,
-        };
-
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        let unpadded = 4 * asset.width;
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let bytes_per_row = unpadded.div_ceil(align) * align;
-
-        if bytes_per_row == unpadded {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &asset.data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: None,
-                },
-                size,
-            );
-        } else {
-            let padded: Vec<u8> = asset
-                .data
-                .chunks_exact(unpadded as usize)
-                .flat_map(|row| {
-                    let padding = bytes_per_row as usize - unpadded as usize;
-                    row.iter().copied().chain(std::iter::repeat_n(0, padding))
-                })
-                .collect();
-
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &padded,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: None,
-                },
-                size,
-            );
-        }
-
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        (texture, view)
-    }
-
-    fn create_texture_bind_group(
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
-        albedo_view: &wgpu::TextureView,
-        normal_view: &wgpu::TextureView,
-        metallic_roughness_view: &wgpu::TextureView,
-        emissive_view: &wgpu::TextureView,
-    ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(albedo_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(normal_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(metallic_roughness_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(emissive_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(sampler),
-                },
-            ],
-        })
     }
 }
 
@@ -424,58 +268,7 @@ impl Pass for GBufferPass {
                 }],
             });
 
-            let texture_layout =
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("gbuffer_texture_layout"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            count: None,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                multisampled: false,
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            },
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            count: None,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                multisampled: false,
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            },
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            count: None,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                multisampled: false,
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            },
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            count: None,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                multisampled: false,
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            },
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 4,
-                            count: None,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        },
-                    ],
-                });
+            let materials = MaterialTextures::new(device, queue, "gbuffer_materials");
 
             let instance_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("gbuffer_instance_layout"),
@@ -484,7 +277,7 @@ impl Pass for GBufferPass {
 
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("gbuffer_pipeline_layout"),
-                bind_group_layouts: &[Some(&camera_layout), Some(&texture_layout), Some(&instance_layout)],
+                bind_group_layouts: &[Some(&camera_layout), Some(materials.layout()), Some(&instance_layout)],
                 immediate_size: 0,
             });
 
@@ -549,64 +342,26 @@ impl Pass for GBufferPass {
             let pipeline = create_pipeline("gbuffer_pipeline", Some(wgpu::Face::Back));
             let double_sided_pipeline = create_pipeline("gbuffer_double_sided_pipeline", None);
 
-            let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("gbuffer_texture_sampler"),
-                address_mode_u: wgpu::AddressMode::Repeat,
-                address_mode_v: wgpu::AddressMode::Repeat,
-                address_mode_w: wgpu::AddressMode::Repeat,
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
-                ..Default::default()
-            });
-
-            let fallback_albedo_asset = TextureAsset::new(1, 1, vec![255, 255, 255, 255]);
-            let (fallback_albedo_tex, fallback_albedo_view) = Self::upload_texture(
-                device,
-                queue,
-                &fallback_albedo_asset,
-                wgpu::TextureFormat::Rgba8UnormSrgb,
-            );
-
-            // [128, 128, 255] decodes to (0, 0, 1) in tangent space — a flat normal map
-            let fallback_normal_asset = TextureAsset::new(1, 1, vec![128, 128, 255, 255]);
-            let (fallback_normal_tex, fallback_normal_view) = Self::upload_texture(
-                device,
-                queue,
-                &fallback_normal_asset,
-                wgpu::TextureFormat::Rgba8Unorm,
-            );
-
-            // White leaves the factors unscaled.
-            let fallback_mr_asset = TextureAsset::new(1, 1, vec![255, 255, 255, 255]);
-            let (fallback_mr_tex, fallback_mr_view) =
-                Self::upload_texture(device, queue, &fallback_mr_asset, wgpu::TextureFormat::Rgba8Unorm);
-
-            let fallback_bg = Self::create_texture_bind_group(
-                device,
-                &texture_layout,
-                &sampler,
-                &fallback_albedo_view,
-                &fallback_normal_view,
-                &fallback_mr_view,
-                // White: glTF emissive is factor × texture, so no texture means the factor alone.
-                &fallback_albedo_view,
-            );
-
             self.pipeline = Some(pipeline);
             self.double_sided_pipeline = Some(double_sided_pipeline);
             self.camera_bind_group_layout = Some(camera_layout);
-            self.texture_bind_group_layout = Some(texture_layout);
             self.instance_layout = Some(instance_layout);
-            self.texture_sampler = Some(sampler);
-            self.fallback_albedo = Some((fallback_albedo_tex, fallback_albedo_view));
-            self.fallback_normal = Some((fallback_normal_tex, fallback_normal_view));
-            self.fallback_metallic_roughness = Some((fallback_mr_tex, fallback_mr_view));
-            self.fallback_bind_group = Some(fallback_bg);
+            self.materials = Some(materials);
         }
 
-        let (Some(pipeline), Some(double_sided_pipeline)) = (&self.pipeline, &self.double_sided_pipeline) else {
+        let meshes: Vec<_> = world
+            .get_entity_handles::<Mesh>()
+            .into_iter()
+            .filter(|h| !h.entity.is_blended())
+            .collect();
+
+        let (Some(pipeline), Some(double_sided_pipeline), Some(materials)) =
+            (&self.pipeline, &self.double_sided_pipeline, &mut self.materials)
+        else {
             return;
         };
+        // Before the render pass opens, so no resource creation happens during command recording.
+        materials.prepare(device, queue, meshes.iter().map(|h| h.entity));
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("gbuffer"),
@@ -675,8 +430,6 @@ impl Pass for GBufferPass {
             }));
         }
 
-        let meshes = world.get_entity_handles::<Mesh>();
-
         let generation = ctx.geometry.generation();
         if self.instance_bind_group.as_ref().is_none_or(|(g, _)| *g != generation)
             && let Some(layout) = self.instance_layout.as_ref()
@@ -691,55 +444,6 @@ impl Pass for GBufferPass {
             });
             self.instance_bind_group = Some((generation, bind_group));
         }
-
-        // Upload any new textures and build missing bind groups before the render
-        // pass opens, so no resource creation happens during command recording.
-        for handle in meshes.iter() {
-            let mesh = handle.entity;
-            let textures = [
-                (&mesh.albedo_texture, wgpu::TextureFormat::Rgba8UnormSrgb),
-                (&mesh.normal_texture, wgpu::TextureFormat::Rgba8Unorm),
-                (&mesh.metallic_roughness_texture, wgpu::TextureFormat::Rgba8Unorm),
-                (&mesh.emissive_texture, wgpu::TextureFormat::Rgba8UnormSrgb),
-            ];
-            for (texture, format) in textures {
-                if let Some(tex) = texture {
-                    self.texture_cache
-                        .entry(tex.id())
-                        .or_insert_with(|| Self::upload_texture(device, queue, tex, format));
-                }
-            }
-
-            let bg_key = material_key(mesh);
-            if !self.texture_bind_groups.contains_key(&bg_key) {
-                let cache = &self.texture_cache;
-                let view = |key: u64, fallback| cached_view(cache, key, fallback);
-                let (albedo_key, normal_key, mr_key, emissive_key) = bg_key;
-
-                if let (Some(av), Some(nv), Some(mv), Some(ev), Some(layout), Some(sampler)) = (
-                    view(albedo_key, &self.fallback_albedo),
-                    view(normal_key, &self.fallback_normal),
-                    view(mr_key, &self.fallback_metallic_roughness),
-                    view(emissive_key, &self.fallback_albedo),
-                    self.texture_bind_group_layout.as_ref(),
-                    self.texture_sampler.as_ref(),
-                ) {
-                    let bg = Self::create_texture_bind_group(device, layout, sampler, av, nv, mv, ev);
-                    self.texture_bind_groups.insert(bg_key, bg);
-                }
-            }
-        }
-
-        let live: HashSet<u64> = meshes
-            .iter()
-            .flat_map(|h| {
-                let (a, n, m, e) = material_key(h.entity);
-                [0, a, n, m, e]
-            })
-            .collect();
-        self.texture_cache.retain(|id, _| live.contains(id));
-        self.texture_bind_groups
-            .retain(|&(a, n, m, e), _| [a, n, m, e].iter().all(|id| live.contains(id)));
 
         // Group draws by pipeline, then by bind group key, so consecutive meshes
         // that share a material don't trigger a GPU state switch.
@@ -785,15 +489,8 @@ impl Pass for GBufferPass {
             }
 
             if current_bg_key != Some(bg_key) {
-                let texture_bg = self
-                    .texture_bind_groups
-                    .get(&bg_key)
-                    .or(self.fallback_bind_group.as_ref());
-
-                if let Some(bg) = texture_bg {
-                    pass.set_bind_group(1, bg, &[]);
-                    current_bg_key = Some(bg_key);
-                }
+                pass.set_bind_group(1, materials.bind_group(bg_key), &[]);
+                current_bg_key = Some(bg_key);
             }
 
             pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
