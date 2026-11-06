@@ -7,12 +7,16 @@
 @group(0) @binding(2) var t_specular_fallback: texture_2d<f32>;
 // Premultiplied SSR color, a: confidence. Written by ssr.wgsl.
 @group(0) @binding(3) var t_ssr:               texture_2d<f32>;
-@group(0) @binding(4) var s_linear:            sampler;
+// G-buffer depth, reversed-Z.
+@group(0) @binding(4) var t_depth:             texture_depth_2d;
+@group(0) @binding(5) var s_linear:            sampler;
 
 // Blur radius at roughness 1; SSR stops at 0.4, so the widest blur is 40% of this.
 const BLUR_RADIUS_PX: f32 = 32.0;
 const GOLDEN_ANGLE:   f32 = 2.39996323;
 const BLUR_TAPS:      u32 = 8u;
+// A tap off the centre pixel's plane by more than this fraction of its depth gets no weight.
+const PLANE_TOLERANCE: f32 = 0.02;
 
 struct VertexOutput {
     @builtin(position) pos: vec4<f32>,
@@ -28,6 +32,20 @@ fn interleaved_gradient_noise(p: vec2<f32>) -> f32 {
     return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715))));
 }
 
+fn load_depth(p: vec2<i32>) -> f32 {
+    return textureLoad(t_depth, clamp(p, vec2<i32>(0), vec2<i32>(textureDimensions(t_depth)) - 1), 0);
+}
+
+// Screen-space depth gradient at `px`. Each axis takes the smaller one-sided difference, so a
+// neighbour across an edge doesn't skew it.
+fn depth_gradient(px: vec2<i32>, d: f32) -> vec2<f32> {
+    let l = d - load_depth(px - vec2<i32>(1, 0));
+    let r = load_depth(px + vec2<i32>(1, 0)) - d;
+    let u = d - load_depth(px - vec2<i32>(0, 1));
+    let b = load_depth(px + vec2<i32>(0, 1)) - d;
+    return vec2f(select(r, l, abs(l) < abs(r)), select(b, u, abs(u) < abs(b)));
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let px = vec2<i32>(in.pos.xy);
@@ -37,18 +55,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return lit;
     }
 
-    // Vogel disc, rotated per pixel.
+    // Vogel disc, rotated per pixel. Reversed-Z depth is affine in screen space across a plane, so
+    // taps are kept only where the depth matches the centre's plane: reflections don't bleed across
+    // object borders or creases, while grazing floors still blur.
     let dims = vec2<f32>(textureDimensions(t_ssr));
     let radius = weight.a * BLUR_RADIUS_PX;
     let rotation = interleaved_gradient_noise(in.pos.xy) * 6.28318531;
+    let depth = load_depth(px);
+    let gradient = depth_gradient(px, depth);
     var ssr = textureLoad(t_ssr, px, 0);
+    var total = 1.0;
     for (var i = 0u; i < BLUR_TAPS; i++) {
         let r = radius * sqrt((f32(i) + 0.5) / f32(BLUR_TAPS));
         let angle = f32(i) * GOLDEN_ANGLE + rotation;
         let offset = vec2f(cos(angle), sin(angle)) * r;
-        ssr += textureSampleLevel(t_ssr, s_linear, (in.pos.xy + offset) / dims, 0.0);
+        let tap_depth = load_depth(vec2<i32>(in.pos.xy + offset));
+        let error = abs(tap_depth - (depth + dot(gradient, offset))) / depth;
+        let w = 1.0 - smoothstep(0.5 * PLANE_TOLERANCE, PLANE_TOLERANCE, error);
+        ssr += w * textureSampleLevel(t_ssr, s_linear, (in.pos.xy + offset) / dims, 0.0);
+        total += w;
     }
-    ssr /= f32(BLUR_TAPS + 1u);
+    ssr /= total;
 
     let confidence = ssr.a;
     let reflection = ssr.rgb / max(confidence, 1e-4) * weight.rgb;
