@@ -42,6 +42,7 @@ fn main() -> anyhow::Result<()> {
     let debug_overlay    = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/debug_overlay.wgsl"));
     let ssr              = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/ssr.wgsl"));
     let composite        = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/composite.wgsl"));
+    let ssr_temporal     = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/ssr_temporal.wgsl"));
 
     let debug_flags = Arc::new(RwLock::new(RenderDebugFlags {
         show_grid: true,
@@ -59,6 +60,7 @@ fn main() -> anyhow::Result<()> {
         debug_overlay,
         ssr,
         composite,
+        ssr_temporal,
     ).with_debug_flags(debug_flags.clone());
 
     WindowedApplication::new(render_graph)

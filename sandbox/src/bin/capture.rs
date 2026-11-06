@@ -213,6 +213,7 @@ fn main() -> Result<()> {
         shader("debug_overlay.wgsl")?,
         shader("ssr.wgsl")?,
         shader("composite.wgsl")?,
+        shader("ssr_temporal.wgsl")?,
     )
     .with_debug_flags(flags);
 

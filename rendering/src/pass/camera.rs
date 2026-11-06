@@ -12,18 +12,25 @@ struct CameraUniform {
     pub view_proj: [[f32; 4]; 4],
     pub inv_view_proj: [[f32; 4]; 4],
     pub inv_view: [[f32; 4]; 4],
-    /// near, far, 0, 0. For linearizing reversed-Z depth.
+    /// near, far, frame index (mod `FRAME_PERIOD`, for temporal jitter), 0. Near and far are for
+    /// linearizing reversed-Z depth.
     pub depth_params: [f32; 4],
+    /// Last frame's `view_proj`, for reprojecting history (`ssr_temporal`).
+    pub prev_view_proj: [[f32; 4]; 4],
 }
 
+/// The frame index in `depth_params.z` wraps here, keeping it exact in f32.
+const FRAME_PERIOD: u32 = 1024;
+
 impl CameraUniform {
-    pub fn from_camera(camera: &Camera, viewport_aspect: f32) -> Self {
+    fn from_camera(camera: &Camera, viewport_aspect: f32, prev_view_proj: Option<[[f32; 4]; 4]>, frame: u32) -> Self {
         let view_proj = camera.view_proj_matrix(viewport_aspect);
         Self {
             view_proj: view_proj.into(),
             inv_view_proj: view_proj.inversed().into(),
             inv_view: camera.view_matrix().inversed().into(),
-            depth_params: [camera.near, camera.far, 0.0, 0.0],
+            depth_params: [camera.near, camera.far, (frame % FRAME_PERIOD) as f32, 0.0],
+            prev_view_proj: prev_view_proj.unwrap_or(view_proj.into()),
         }
     }
 }
@@ -31,6 +38,8 @@ impl CameraUniform {
 pub struct CameraPass {
     node_id: Option<NodeId>,
     pub camera_buffer_id: ResourceId,
+    prev_view_proj: Option<[[f32; 4]; 4]>,
+    frame: u32,
 }
 
 impl CameraPass {
@@ -44,6 +53,8 @@ impl CameraPass {
             Self {
                 node_id: None,
                 camera_buffer_id,
+                prev_view_proj: None,
+                frame: 0,
             },
             camera_buffer_id,
         )
@@ -107,7 +118,9 @@ impl Pass for CameraPass {
         };
 
         let (w, h) = ctx.surface_size;
-        let uniform = CameraUniform::from_camera(main_camera, w as f32 / h as f32);
+        let uniform = CameraUniform::from_camera(main_camera, w as f32 / h as f32, self.prev_view_proj, self.frame);
+        self.prev_view_proj = Some(uniform.view_proj);
+        self.frame = self.frame.wrapping_add(1);
         let data = bytemuck::bytes_of(&uniform);
 
         ctx.buffers[&self.camera_buffer_id].write(queue, data);

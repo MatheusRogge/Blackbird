@@ -27,6 +27,7 @@ struct CameraUniform {
     inv_view_proj: mat4x4<f32>,
     inv_view:      mat4x4<f32>,
     // near, far
+    // near, far, frame index
     depth_params:  vec4<f32>,
 }
 
@@ -108,7 +109,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let p0 = clip_to_pixel(h0, dims);
     let delta = clip_to_pixel(h1, dims) - p0;
     let steps = u32(clamp(length(delta) / STEP_PIXELS, 1.0, f32(MAX_STEPS)));
-    let jitter = interleaved_gradient_noise(in.pos.xy);
+    // Varies per frame so `ssr_temporal` averages it out.
+    let jitter = interleaved_gradient_noise(in.pos.xy + 5.588238 * camera.depth_params.z);
 
     var lo = 0.0;
     var hi = -1.0;

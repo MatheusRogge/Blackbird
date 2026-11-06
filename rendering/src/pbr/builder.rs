@@ -18,6 +18,7 @@ use crate::{
         probe_trace::ProbeTracePass,
         probe_update::ProbeUpdatePass,
         reflection_probe::ReflectionProbePass,
+        ssr_temporal::SsrTemporalPass,
         shadow::ShadowPass,
         transparent::TransparentPass,
     },
@@ -37,6 +38,7 @@ pub struct RenderGraphPBRBuilder {
     debug_overlay_shader:  ShaderAsset,
     ssr_shader:            ShaderAsset,
     composite_shader:      ShaderAsset,
+    ssr_temporal_shader:   ShaderAsset,
     debug_flags:           Option<Arc<RwLock<RenderDebugFlags>>>,
 }
 
@@ -53,6 +55,7 @@ impl RenderGraphPBRBuilder {
         debug_overlay_shader: ShaderAsset,
         ssr_shader:           ShaderAsset,
         composite_shader:     ShaderAsset,
+        ssr_temporal_shader:  ShaderAsset,
     ) -> Self {
         Self {
             gbuffer_shader,
@@ -65,6 +68,7 @@ impl RenderGraphPBRBuilder {
             debug_overlay_shader,
             ssr_shader,
             composite_shader,
+            ssr_temporal_shader,
             debug_flags: None,
         }
     }
@@ -181,6 +185,16 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         );
         graph.add_pass(device, ssr_pass);
 
+        let (ssr_temporal_pass, ssr_resolved_id) = SsrTemporalPass::new(
+            &mut graph,
+            ssr_id,
+            gbuffer_outputs.depth_id,
+            lighting_outputs.specular_weight_id,
+            camera_buffer_id,
+            self.ssr_temporal_shader,
+        );
+        graph.add_pass(device, ssr_temporal_pass);
+
         let (composite_pass, composite_id) = FullscreenPass::new(
             &mut graph,
             "composite",
@@ -188,7 +202,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
                 FullscreenInput::Color(lighting_outputs.lit_id),
                 FullscreenInput::Color(lighting_outputs.specular_weight_id),
                 FullscreenInput::Color(lighting_outputs.specular_fallback_id),
-                FullscreenInput::Color(ssr_id),
+                FullscreenInput::Color(ssr_resolved_id),
             ],
             vec![],
             wgpu::TextureFormat::Rgba16Float,
