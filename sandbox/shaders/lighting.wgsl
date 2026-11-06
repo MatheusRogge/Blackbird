@@ -281,8 +281,10 @@ struct Surface {
     alpha: f32,
 }
 
+// `v_dot_h` can round to just above 1 when L is tiny (a point on an area light's rectangle), and
+// pow of a negative base is NaN.
 fn fresnel_schlick(f0: vec3<f32>, v_dot_h: f32) -> vec3<f32> {
-    return f0 + (1.0 - f0) * pow(1.0 - v_dot_h, 5.0);
+    return f0 + (1.0 - f0) * pow(saturate(1.0 - v_dot_h), 5.0);
 }
 
 fn d_ggx(n_dot_h: f32, alpha: f32) -> f32 {

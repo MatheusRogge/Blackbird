@@ -125,7 +125,7 @@ fn fs_glass(in: GlassOutput) -> @location(0) vec4<f32> {
     }
     let L = select(light.light.xyz, in.world_pos - light.light.xyz, light.light.w > 0.5);
     let cos_i = abs(dot(normalize(in.world_normal), normalize(L)));
-    let fresnel = f0 + (1.0 - f0) * pow(1.0 - cos_i, 5.0);
+    let fresnel = f0 + (1.0 - f0) * pow(saturate(1.0 - cos_i), 5.0);
     let interfaces = select(1.0, 2.0, thickness <= 0.0);
     let through = (1.0 - base.a) + base.a * transmission * pow(1.0 - fresnel, interfaces) * tint;
     return vec4f(through, in.depth);
