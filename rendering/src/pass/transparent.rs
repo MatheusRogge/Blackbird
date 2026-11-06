@@ -89,14 +89,15 @@ pub struct TransparentPass {
     node_id: Option<NodeId>,
     shader: ShaderAsset,
     pipelines: Option<Pipelines>,
-    /// Keyed by the scene view address and the geometry generation.
-    scene_bg: Option<((usize, usize, u64), wgpu::BindGroup)>,
+    /// Keyed by the scene, depth and normal view addresses and the geometry generation.
+    scene_bg: Option<((usize, usize, usize, u64), wgpu::BindGroup)>,
     behind: Option<Behind>,
     bindings: LightingBindings,
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
 
     scene_id: ResourceId,
     depth_id: ResourceId,
+    normal_id: ResourceId,
     debug_flags_id: ResourceId,
     output_id: ResourceId,
 }
@@ -137,6 +138,7 @@ impl TransparentPass {
             debug_flags,
             scene_id,
             depth_id: gbuffer.depth_id,
+            normal_id: gbuffer.normal_id,
             debug_flags_id: lighting.debug_flags_id,
             output_id,
         };
@@ -149,6 +151,7 @@ impl TransparentPass {
         let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("transparent_scene_bgl"),
             entries: &[
+                color_entry(1),
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -372,7 +375,7 @@ impl PassDesc for TransparentPass {
     }
 
     fn reads(&self) -> Vec<ResourceId> {
-        let mut reads = vec![self.scene_id, self.depth_id, self.debug_flags_id];
+        let mut reads = vec![self.scene_id, self.depth_id, self.normal_id, self.debug_flags_id];
         reads.extend(self.bindings.reads());
         reads
     }
@@ -400,10 +403,11 @@ impl Pass for TransparentPass {
         ctx: &PassContext<'_>,
         world: &World,
     ) {
-        let (Some(&output_view), Some(&scene_view), Some(&depth_view)) = (
+        let (Some(&output_view), Some(&scene_view), Some(&depth_view), Some(&normal_view)) = (
             ctx.views.get(&self.output_id),
             ctx.views.get(&self.scene_id),
             ctx.views.get(&self.depth_id),
+            ctx.views.get(&self.normal_id),
         ) else {
             return;
         };
@@ -412,7 +416,13 @@ impl Pass for TransparentPass {
             self.pipelines = Some(self.create_pipelines(device, queue));
         }
 
-        let lit_view = self.debug_flags.read().expect("debug_flags poisoned").view == GBufferView::Lit;
+        let (lit_view, screen_reflections) = {
+            let flags = self.debug_flags.read().expect("debug_flags poisoned");
+            (
+                flags.view == GBufferView::Lit,
+                flags.specular && flags.indirect && flags.reflections && flags.ssr,
+            )
+        };
         let (w, h) = ctx.surface_size;
         let camera = world.get_entities::<Camera>().first().map(|c| (c.eye, c.view_proj_matrix(w as f32 / h as f32)));
         let mut meshes: Vec<_> = world
@@ -440,13 +450,17 @@ impl Pass for TransparentPass {
             self.scene_bg = None;
         }
         let Some(behind) = self.behind.as_mut() else { return };
-        if meshes.iter().any(|(_, h, _)| h.entity.material.transmission > 0.0) {
+        // Every blended surface reflects, so with SSR on the chain is needed for any of them.
+        if screen_reflections && !meshes.is_empty()
+            || meshes.iter().any(|(_, h, _)| h.entity.material.transmission > 0.0)
+        {
             build_behind_chain(device, encoder, pipelines, behind, scene_view);
         }
 
         let key = (
             scene_view as *const wgpu::TextureView as usize,
             depth_view as *const wgpu::TextureView as usize,
+            normal_view as *const wgpu::TextureView as usize,
             ctx.geometry.generation(),
         );
         if self.scene_bg.as_ref().is_none_or(|(k, _)| *k != key) {
@@ -454,6 +468,7 @@ impl Pass for TransparentPass {
                 label: Some("transparent_scene_bg"),
                 layout: &pipelines.scene_layout,
                 entries: &[
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(normal_view) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&pipelines.sampler) },
                     wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(scene_view) },

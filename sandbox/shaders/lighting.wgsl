@@ -30,6 +30,8 @@ struct CameraUniform {
     view_proj:     mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
     inv_view:      mat4x4<f32>,
+    // near, far
+    depth_params:  vec4<f32>,
 }
 
 @group(3) @binding(0) var irradiance_atlas: texture_2d<f32>;
@@ -782,6 +784,107 @@ fn refracted_uv(m: Model, frag: vec4<f32>, pos_ws: vec3<f32>, N: vec3<f32>, view
     return uv;
 }
 
+// Screen-space reflections for blended surfaces, ported from ssr.wgsl with fewer steps: blended
+// surfaces aren't in the G-buffer, so the opaque `ssr` pass can't cover them.
+const GLASS_SSR_MAX_ROUGHNESS:  f32 = 0.4;
+const GLASS_SSR_FADE_ROUGHNESS: f32 = 0.25;
+const GLASS_SSR_MAX_DISTANCE:   f32 = 50.0;
+const GLASS_SSR_MAX_STEPS:      u32 = 32u;
+const GLASS_SSR_STEP_PIXELS:    f32 = 3.0;
+const GLASS_SSR_REFINE_STEPS:   u32 = 5u;
+const GLASS_SSR_THICKNESS:      f32 = 0.03;
+
+fn linear_depth(d: f32) -> f32 {
+    let n = camera.depth_params.x;
+    let f = camera.depth_params.y;
+    return n * f / (d * (f - n) + n);
+}
+
+fn clip_to_pixel(h: vec4<f32>, dims: vec2<f32>) -> vec2<f32> {
+    let ndc = h.xy / h.w;
+    return vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * dims;
+}
+
+// Marches the reflection ray `R` from `pos_ws` against the G-buffer depth. Returns the opaque
+// scene where it lands (exposed, from `t_behind` blurred by roughness) and the confidence in a.
+fn glass_ssr(pos_ws: vec3<f32>, R: vec3<f32>, frag: vec2<f32>, roughness: f32) -> vec4<f32> {
+    let dims = vec2f(textureDimensions(t_depth));
+    let cam_pos = camera.inv_view[3].xyz;
+    let to_view = mat3x3<f32>(camera.inv_view[0].xyz, camera.inv_view[1].xyz, camera.inv_view[2].xyz);
+    let R_vs = R * to_view;
+    let pos_vs = (pos_ws - cam_pos) * to_view;
+
+    var dist = GLASS_SSR_MAX_DISTANCE;
+    if R_vs.z > 0.0 {
+        dist = min(dist, (-1.01 * camera.depth_params.x - pos_vs.z) / R_vs.z);
+    }
+    if dist <= 0.0 {
+        return vec4f(0.0);
+    }
+
+    let h0 = camera.view_proj * vec4f(pos_ws, 1.0);
+    let h1 = camera.view_proj * vec4f(pos_ws + R * dist, 1.0);
+    let k0 = 1.0 / h0.w;
+    let k1 = 1.0 / h1.w;
+    let p0 = clip_to_pixel(h0, dims);
+    let delta = clip_to_pixel(h1, dims) - p0;
+    let steps = u32(clamp(length(delta) / GLASS_SSR_STEP_PIXELS, 1.0, f32(GLASS_SSR_MAX_STEPS)));
+    let jitter = fract(52.9829189 * fract(dot(frag, vec2f(0.06711056, 0.00583715))));
+
+    var lo = 0.0;
+    var hi = -1.0;
+    for (var i = 1u; i <= steps; i++) {
+        let s = (f32(i) - jitter) / f32(steps);
+        let p = p0 + delta * s;
+        if any(p < vec2f(0.0)) || any(p >= dims) {
+            break;
+        }
+        let scene_d = textureLoad(t_depth, vec2<i32>(p), 0);
+        if scene_d > 0.0 && 1.0 / mix(k0, k1, s) > linear_depth(scene_d) {
+            hi = s;
+            break;
+        }
+        lo = s;
+    }
+    if hi < 0.0 {
+        return vec4f(0.0);
+    }
+
+    // Unlike ssr.wgsl, the thickness test runs after refining the first crossing: with few steps a
+    // step can jump past a surface's whole thickness window. A crossing that is still far behind
+    // after refining went behind a depth discontinuity, not into a surface.
+    for (var i = 0u; i < GLASS_SSR_REFINE_STEPS; i++) {
+        let mid = 0.5 * (lo + hi);
+        let scene_d = textureLoad(t_depth, vec2<i32>(p0 + delta * mid), 0);
+        if scene_d > 0.0 && 1.0 / mix(k0, k1, mid) > linear_depth(scene_d) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+
+    let hit_px = p0 + delta * hi;
+    let hit_w = linear_depth(textureLoad(t_depth, vec2<i32>(hit_px), 0));
+    if 1.0 / mix(k0, k1, hi) - hit_w > GLASS_SSR_THICKNESS * hit_w {
+        return vec4f(0.0);
+    }
+    let hit_N = normalize(textureLoad(t_normal, vec2<i32>(hit_px), 0).rgb * 2.0 - 1.0);
+    if dot(hit_N, R) > 0.0 {
+        return vec4f(0.0);
+    }
+    let hit_uv = hit_px / dims;
+    // The mip whose texel matches composite.wgsl's opaque SSR blur radius (roughness × 32 px).
+    let lod = log2(max(roughness * 32.0, 1.0));
+    let color = textureSampleLevel(t_behind, s_linear, hit_uv, lod).rgb;
+
+    let edge = min(hit_uv, 1.0 - hit_uv);
+    let confidence = smoothstep(0.0, 0.08, min(edge.x, edge.y))
+        * (1.0 - smoothstep(GLASS_SSR_FADE_ROUGHNESS, GLASS_SSR_MAX_ROUGHNESS, roughness))
+        * (1.0 - smoothstep(0.1, 0.5, R_vs.z))
+        * (1.0 - smoothstep(0.7, 1.0, hi));
+    return vec4f(color, confidence);
+}
+
 struct ForwardVertex {
     @builtin(position) pos: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
@@ -866,11 +969,17 @@ fn fs_forward(in: ForwardVertex, @builtin(front_facing) front_facing: bool) -> @
     if debug.disable_direct == 0u {
         color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, -pos_vs.z);
     }
+    // Exposed, unlike `color`: screen-space hits come from the exposed `t_behind`.
+    var reflection = vec3f(0.0);
     if debug.disable_indirect == 0u {
         color += diffuse_color * sample_probe_irradiance(pos_ws, N, N, view_dir);
-        if debug.disable_reflections == 0u {
+        if debug.disable_reflections == 0u && any(reflectance > vec3f(0.0)) {
             let R = normalize(mix(reflect(-view_dir, N), N, alpha));
-            color += reflectance * sample_probe_irradiance(pos_ws, N, R, view_dir);
+            reflection = sample_probe_irradiance(pos_ws, N, R, view_dir) * cp.exposure;
+            if debug.disable_ssr == 0u && roughness < GLASS_SSR_MAX_ROUGHNESS {
+                let hit = glass_ssr(pos_ws, reflect(-view_dir, N), in.pos.xy, roughness);
+                reflection = mix(reflection, hit.rgb, hit.a);
+            }
         }
     }
 
@@ -890,5 +999,5 @@ fn fs_forward(in: ForwardVertex, @builtin(front_facing) front_facing: bool) -> @
         }
     }
     let transmitted = behind * albedo * (1.0 - reflectance) * (transmission * coverage);
-    return vec4f(color * cp.exposure + transmitted, coverage);
+    return vec4f(color * cp.exposure + reflectance * reflection + transmitted, coverage);
 }
