@@ -70,9 +70,17 @@ struct DebugFlags {
 // Mirrors rendering::light::ShadowedLights. Entry = kind << 16 | index.
 // lights[slot]: shadow origin in world space (xyz), light half size (w, 0 for point/spot).
 struct ShadowedLights {
-    entries: vec4<u32>,
+    entries: array<vec4<u32>, 2>,
     count:   u32,
-    lights:  array<vec4<f32>, 4>,
+    lights:  array<vec4<f32>, 8>,
+}
+
+// Mirrors rendering::light::MAX_SHADOWED_LIGHTS; the array sizes above and in LocalShadowParams
+// (6 faces each) follow it.
+const MAX_SHADOWED_LIGHTS: u32 = 8u;
+
+fn shadowed_entry(slot: u32) -> u32 {
+    return shadowed.entries[slot / 4u][slot % 4u];
 }
 
 @group(4) @binding(1) var<uniform> shadowed: ShadowedLights;
@@ -162,8 +170,8 @@ fn cube_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> vec
 fn local_shadow_of(kind: u32, index: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
     if debug.disable_shadows != 0u { return vec3f(1.0); }
     let entry = kind << 16u | index;
-    for (var slot = 0u; slot < min(shadowed.count, 4u); slot++) {
-        if shadowed.entries[slot] == entry { return cube_shadow(slot, pos, N, pixel); }
+    for (var slot = 0u; slot < min(shadowed.count, MAX_SHADOWED_LIGHTS); slot++) {
+        if shadowed_entry(slot) == entry { return cube_shadow(slot, pos, N, pixel); }
     }
     return vec3f(1.0);
 }
@@ -475,7 +483,7 @@ struct ShadowParams {
 
 // Mirrors rendering::pass::shadow::LocalShadowParams.
 struct LocalShadowParams {
-    face_vp:  array<mat4x4<f32>, 24>,
+    face_vp:  array<mat4x4<f32>, 48>,
     inv_size: f32,
 }
 

@@ -71,7 +71,9 @@ pub struct ShadowCaster {
 
 pub type SharedShadowCasters = std::sync::Arc<std::sync::Mutex<[Option<ShadowCaster>; MAX_SHADOWED_LIGHTS]>>;
 
-pub const MAX_SHADOWED_LIGHTS: usize = 4;
+/// Mirrored by `MAX_SHADOWED_LIGHTS` in `lighting.wgsl`; a multiple of 4 (`entries` is an array of
+/// `vec4<u32>` there). Each slot costs a 6 × 512² depth cube and a glass tint cube, about 18 MB.
+pub const MAX_SHADOWED_LIGHTS: usize = 8;
 pub const SHADOW_KIND_POINT: u32 = 0;
 pub const SHADOW_KIND_SPOT: u32 = 1;
 pub const SHADOW_KIND_AREA: u32 = 2;
