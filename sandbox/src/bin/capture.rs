@@ -9,7 +9,7 @@
 //!   --exposure E         linear exposure override
 //!   --no-specular --no-reflections --no-ssr --no-emissive-lights --no-indirect --no-direct --no-shadows
 //!   --view lit|albedo|normal|material|emissive|shadows
-//!   --point x,y,z,I      add a white point light of I candela (range 10)
+//!   --point x,y,z,I[,r]  add a white point light of I candela (range 10), source radius r (default 0)
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
 //! ```
 
@@ -40,7 +40,7 @@ struct Options {
     target: Option<Vec3>,
     exposure: Option<f32>,
     reloads: u32,
-    points: Vec<(Vec3, f32)>,
+    points: Vec<(Vec3, f32, f32)>,
     flags: RenderDebugFlags,
 }
 
@@ -86,8 +86,12 @@ fn parse_args() -> Result<Options> {
             "--reloads" => options.reloads = value()?.parse()?,
             "--point" => {
                 let v = value()?;
-                let (position, intensity) = v.rsplit_once(',').context("--point x,y,z,intensity")?;
-                options.points.push((parse_vec3(position)?, intensity.parse()?));
+                let parts: Vec<&str> = v.split(',').collect();
+                let [x, y, z, intensity, rest @ ..] = parts.as_slice() else {
+                    bail!("--point x,y,z,intensity[,source_radius]");
+                };
+                let source_radius = rest.first().map_or(Ok(0.0), |r| r.parse())?;
+                options.points.push((parse_vec3(&format!("{x},{y},{z}"))?, intensity.parse()?, source_radius));
             }
             "--no-specular" => flags.specular = false,
             "--no-reflections" => flags.reflections = false,
@@ -124,8 +128,8 @@ fn load_scene(options: &Options, world: &mut World) -> Result<()> {
     for (_, light) in lights::read_lights(&asset.document)? {
         light.spawn(world);
     }
-    for &(position, intensity) in &options.points {
-        world.add_entity(PointLight { position, color: Vec3::one(), intensity, radius: 10.0 });
+    for &(position, intensity, source_radius) in &options.points {
+        world.add_entity(PointLight { position, color: Vec3::one(), intensity, radius: 10.0, source_radius });
     }
     let mut scene = GltfScene::new(Arc::clone(&asset));
     while scene.load_batch(world, 1000) {}

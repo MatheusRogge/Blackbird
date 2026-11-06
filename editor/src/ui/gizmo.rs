@@ -872,6 +872,7 @@ mod tests {
             color: [1.0; 3],
             intensity: 1.0,
             radius: 1.0,
+            source_radius: 0.0,
             inner_angle: 0.1,
             outer_angle: 0.2,
         };

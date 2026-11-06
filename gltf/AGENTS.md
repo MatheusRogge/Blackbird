@@ -28,7 +28,7 @@ gltf::local_matrix(&node) -> Mat4             // node transform relative to its 
 Camera settings in `extras`: `PhysicalCamera { aperture, shutter_speed (s), iso }` under a camera's `blackbird_physical` (`ev100()`, `exposure() = 1 / (1.2 · 2^EV100)`), and the main camera's node index under the default scene's `blackbird_main_camera`. The editor writes both in `editor/src/export.rs`.
 
 ### `lights.rs`
-`LightData` (serde, tagged `type`: sky/point/spot/area) in physical units. `read_lights(doc)` returns `KHR_lights_punctual` node lights (world position/direction, missing `range` → cutoff radius) plus area lights from root `extras.blackbird_lights`. `LightData::spawn(world)` and `apply(world, key)` create and update the matching `rendering::light` entity. The editor writes lights back in `editor/src/lights.rs`. Keep both sides of the format in step.
+`LightData` (serde, tagged `type`: sky/point/spot/area) in physical units. `read_lights(doc)` returns `KHR_lights_punctual` node lights (world position/direction, missing `range` → cutoff radius; point/spot `source_radius` from the light's own `extras.blackbird_source_radius` (`SOURCE_RADIUS_KEY`), default 0) plus area lights from root `extras.blackbird_lights`. `LightData::spawn(world)` and `apply(world, key)` create and update the matching `rendering::light` entity. The editor writes lights back in `editor/src/lights.rs`. Keep both sides of the format in step.
 
 ## Scene loading
 `GltfScene` spreads the work across frames so a large scene doesn't stall the game thread:

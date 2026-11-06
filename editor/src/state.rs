@@ -138,6 +138,7 @@ impl LightDataExt for LightData {
                 color: [1.0, 1.0, 1.0],
                 intensity: 80.0,
                 radius: 10.0,
+                source_radius: 0.0,
             },
             LightKind::Spot => LightData::Spot {
                 position: [0.0, 3.0, 0.0],
@@ -145,6 +146,7 @@ impl LightDataExt for LightData {
                 color: [1.0, 1.0, 1.0],
                 intensity: 80.0,
                 radius: 10.0,
+                source_radius: 0.0,
                 inner_angle: 15.0_f32.to_radians(),
                 outer_angle: 30.0_f32.to_radians(),
             },

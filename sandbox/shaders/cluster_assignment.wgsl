@@ -13,11 +13,16 @@ struct ClusterParams {
     num_sky_lights: u32,
 }
 
+// Scalar padding: a trailing vec3 would be 16-aligned and break the 48-byte Rust layout.
 struct GpuPointLight {
     position_vs: vec3<f32>,
     radius: f32,
     color: vec3<f32>,
     intensity: f32,
+    source_radius: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: ClusterParams;

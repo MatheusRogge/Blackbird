@@ -95,20 +95,46 @@ fn cube_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> vec
     }
     let layer = slot * 6u + face;
 
+    let radius_texels = select(1.5, clamp(light.w / max(dist, 1e-3) / local_shadow.inv_size * 0.5, 1.5, 8.0), light.w > 0.0);
+    let radius = radius_texels * local_shadow.inv_size;
+
     // A 90° face spans 2·dist across at this distance: offset by ~1.5 texels along the normal.
     let texel = 2.0 * dist * local_shadow.inv_size;
-    let clip = local_shadow.face_vp[layer] * vec4f(pos + N * (1.5 * texel), 1.0);
+    let vp = local_shadow.face_vp[layer];
+    let p = pos + N * (1.5 * texel);
+    let clip = vp * vec4f(p, 1.0);
     let ndc = clip.xyz / clip.w;
     let uv = ndc.xy * vec2f(0.5, -0.5) + 0.5;
 
-    let radius_texels = select(1.5, clamp(light.w / max(dist, 1e-3) / local_shadow.inv_size * 0.5, 1.5, 8.0), light.w > 0.0);
-    let radius = radius_texels * local_shadow.inv_size;
+    // Receiver-plane depth bias: the depth slope of the receiver's tangent plane in shadow-map UV,
+    // from two projected tangent points, so each tap of a wide kernel is compared against the
+    // plane's depth under that tap instead of the center's (no self-shadowing grain on surfaces
+    // tilted away from the light). The slope is clamped where the plane turns edge-on.
+    let t1 = normalize(cross(N, select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(N.y) > 0.9)));
+    let t2 = cross(N, t1);
+    let c1 = vp * vec4f(p + t1 * texel, 1.0);
+    let c2 = vp * vec4f(p + t2 * texel, 1.0);
+    let du1 = (c1.xy / c1.w) * vec2f(0.5, -0.5) + 0.5 - uv;
+    let du2 = (c2.xy / c2.w) * vec2f(0.5, -0.5) + 0.5 - uv;
+    let dz1 = c1.z / c1.w - ndc.z;
+    let dz2 = c2.z / c2.w - ndc.z;
+    let det = du1.x * du2.y - du1.y * du2.x;
+    var slope = vec2f(0.0);
+    if abs(det) > 1e-12 {
+        slope = vec2f(dz1 * du2.y - dz2 * du1.y, du1.x * dz2 - du2.x * dz1) / det;
+    }
+    // At most the depth change of moving one kernel radius along the light ray.
+    let cap = vp * vec4f(p - (d / dist) * (radius_texels * texel), 1.0);
+    let max_dz = abs(cap.z / cap.w - ndc.z);
+
     let angle = fract(52.9829189 * fract(dot(pixel, vec2f(0.06711056, 0.00583715)))) * 6.28318531;
     let rot = mat2x2<f32>(cos(angle), sin(angle), -sin(angle), cos(angle));
     var lit = 0.0;
     for (var i = 0u; i < 12u; i++) {
-        let tap = clamp(uv + rot * POISSON[i] * radius, vec2f(0.0), vec2f(1.0));
-        lit += textureSampleCompareLevel(t_local_shadow, s_shadow, tap, i32(layer), ndc.z);
+        let offset = rot * POISSON[i] * radius;
+        let tap = clamp(uv + offset, vec2f(0.0), vec2f(1.0));
+        let depth = ndc.z + clamp(dot(slope, offset), -max_dz, max_dz);
+        lit += textureSampleCompareLevel(t_local_shadow, s_shadow, tap, i32(layer), depth);
     }
     if lit == 0.0 {
         return vec3f(0.0);
@@ -296,6 +322,21 @@ fn brdf(s: Surface, L: vec3<f32>) -> vec3<f32> {
     return diffuse_brdf(s, L) + specular_brdf(s, L, s.alpha);
 }
 
+// A spherical light of radius `source_radius` at `to_light` (Karis 2013, representative point):
+// diffuse from its center, specular from the point on the sphere closest to the reflection ray,
+// with the roughness widened by the sphere's angular size, as for area lights.
+fn sphere_light_brdf(s: Surface, to_light: vec3<f32>, dist: f32, source_radius: f32) -> vec3<f32> {
+    let L = to_light / dist;
+    if source_radius <= 0.0 {
+        return brdf(s, L);
+    }
+    let R = reflect(-s.V, s.N);
+    let center_to_ray = dot(to_light, R) * R - to_light;
+    let closest = to_light + center_to_ray * saturate(source_radius / max(length(center_to_ray), 1e-4));
+    let spec_alpha = saturate(s.alpha + source_radius / (2.0 * dist));
+    return diffuse_brdf(s, L) + specular_brdf(s, normalize(closest), spec_alpha);
+}
+
 // Karis' analytic fit of the split-sum environment BRDF (scale, bias applied to F0).
 fn env_brdf_approx(f0: vec3<f32>, roughness: f32, n_dot_v: f32) -> vec3<f32> {
     let c0 = vec4f(-1.0, -0.0275, -0.572, 0.022);
@@ -313,11 +354,16 @@ fn range_attenuation(dist: f32, range: f32) -> f32 {
     return window * window / max(dist * dist, 1e-4);
 }
 
+// Scalar padding: a trailing vec3 would be 16-aligned and break the 48-byte Rust layout.
 struct GpuPointLight {
     position_vs: vec3<f32>,
     radius: f32,
     color: vec3<f32>,
     intensity: f32,
+    source_radius: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 struct GpuSkyLight {
@@ -336,7 +382,7 @@ struct GpuSpotLight {
     color: vec3<f32>,
     outer_cos: f32,
     intensity: f32,
-    _pad0: f32,
+    source_radius: f32,
     _pad1: f32,
     _pad2: f32,
 }
@@ -461,9 +507,10 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
             continue;
         }
 
-        let L = to_light / dist;
         let vis = local_shadow_of(SHADOW_KIND_POINT, li, pos_ws, N, pixel);
-        color += brdf(surf_vs, L) * light.color * vis * (light.intensity * range_attenuation(dist, light.radius));
+        let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
+        color += sphere_light_brdf(surf_vs, to_light, dist, light.source_radius) * light.color * vis
+            * (light.intensity * falloff);
     }
 
     for (var i = 0u; i < light_counts.num_spot; i++) {
@@ -479,7 +526,9 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let cd = dot(-L, normalize(light.direction_vs));
         let t  = clamp((cd - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
         let vis = local_shadow_of(SHADOW_KIND_SPOT, i, pos_ws, N, pixel);
-        color += brdf(surf_vs, L) * light.color * vis * (light.intensity * t * t * range_attenuation(dist, light.radius));
+        let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
+        color += sphere_light_brdf(surf_vs, to_light, dist, light.source_radius) * light.color * vis
+            * (light.intensity * t * t * falloff);
     }
 
     // Representative-point approximation. Diffuse takes light from the closest point on the

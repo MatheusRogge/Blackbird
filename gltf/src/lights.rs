@@ -11,6 +11,9 @@ use ultraviolet::{Mat4, Vec4};
 
 pub const EXTENSION: &str = "KHR_lights_punctual";
 pub const EXTRAS_KEY: &str = "blackbird_lights";
+/// Key in a `KHR_lights_punctual` light's own `extras` holding its source radius (meters), which
+/// the extension can't express.
+pub const SOURCE_RADIUS_KEY: &str = "blackbird_source_radius";
 /// Illuminance (lux) at which a light with no `range` is cut off. The renderer needs a finite
 /// radius to cluster point lights, while glTF treats a missing range as infinite.
 const CUTOFF_ILLUMINANCE: f32 = 0.01;
@@ -29,6 +32,8 @@ pub enum LightData {
         color: [f32; 3],
         intensity: f32,
         radius: f32,
+        #[serde(default)]
+        source_radius: f32,
     },
     Spot {
         position: [f32; 3],
@@ -36,6 +41,8 @@ pub enum LightData {
         color: [f32; 3],
         intensity: f32,
         radius: f32,
+        #[serde(default)]
+        source_radius: f32,
         inner_angle: f32,
         outer_angle: f32,
     },
@@ -56,19 +63,21 @@ impl LightData {
                 color: color.into(),
                 intensity,
             }),
-            LightData::Point { position, color, intensity, radius } => world.add_entity(PointLight {
+            LightData::Point { position, color, intensity, radius, source_radius } => world.add_entity(PointLight {
                 position: position.into(),
                 color: color.into(),
                 intensity,
                 radius,
+                source_radius,
             }),
-            LightData::Spot { position, direction, color, intensity, radius, inner_angle, outer_angle } => {
+            LightData::Spot { position, direction, color, intensity, radius, source_radius, inner_angle, outer_angle } => {
                 world.add_entity(SpotLight {
                     position: position.into(),
                     direction: direction.into(),
                     color: color.into(),
                     intensity,
                     radius,
+                    source_radius,
                     inner_angle,
                     outer_angle,
                 })
@@ -94,21 +103,23 @@ impl LightData {
                     l.direction = direction.into();
                 }
             }
-            LightData::Point { position, color, intensity, radius } => {
+            LightData::Point { position, color, intensity, radius, source_radius } => {
                 if let Some(l) = world.get_entity_mut::<PointLight>(key) {
                     l.position = position.into();
                     l.color = color.into();
                     l.intensity = intensity;
                     l.radius = radius;
+                    l.source_radius = source_radius;
                 }
             }
-            LightData::Spot { position, direction, color, intensity, radius, inner_angle, outer_angle } => {
+            LightData::Spot { position, direction, color, intensity, radius, source_radius, inner_angle, outer_angle } => {
                 if let Some(l) = world.get_entity_mut::<SpotLight>(key) {
                     l.position = position.into();
                     l.direction = direction.into();
                     l.color = color.into();
                     l.intensity = intensity;
                     l.radius = radius;
+                    l.source_radius = source_radius;
                     l.inner_angle = inner_angle;
                     l.outer_angle = outer_angle;
                 }
@@ -155,15 +166,19 @@ fn read_punctual(doc: &gltf::Document) -> Vec<(Option<usize>, LightData)> {
         let color = light.color();
         let intensity = light.intensity();
         let radius = light.range().unwrap_or_else(|| (intensity / CUTOFF_ILLUMINANCE).sqrt().max(1.0));
+        let source_radius = read_source_radius(light.extras());
         let data = match light.kind() {
             gltf::khr_lights_punctual::Kind::Directional => LightData::Sky { color, intensity, direction },
-            gltf::khr_lights_punctual::Kind::Point => LightData::Point { position, color, intensity, radius },
+            gltf::khr_lights_punctual::Kind::Point => {
+                LightData::Point { position, color, intensity, radius, source_radius }
+            }
             gltf::khr_lights_punctual::Kind::Spot { inner_cone_angle, outer_cone_angle } => LightData::Spot {
                 position,
                 direction,
                 color,
                 intensity,
                 radius,
+                source_radius,
                 inner_angle: inner_cone_angle,
                 outer_angle: outer_cone_angle,
             },
@@ -171,6 +186,12 @@ fn read_punctual(doc: &gltf::Document) -> Vec<(Option<usize>, LightData)> {
         lights.push((Some(node.index()), data));
     }
     lights
+}
+
+fn read_source_radius(extras: &gltf::json::Extras) -> f32 {
+    let Some(raw) = extras else { return 0.0 };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(raw.get()) else { return 0.0 };
+    map.get(SOURCE_RADIUS_KEY).and_then(Value::as_f64).map_or(0.0, |r| r.max(0.0) as f32)
 }
 
 fn read_extras(doc: &gltf::Document) -> Result<Vec<LightData>, serde_json::Error> {

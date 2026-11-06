@@ -103,7 +103,7 @@ fn draw_light(ui: &mut egui::Ui, data: &mut LightData) {
             });
         }
 
-        LightData::Point { position, color, intensity, radius } => {
+        LightData::Point { position, color, intensity, radius, source_radius } => {
             egui::Grid::new("light_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
                 ui.label("Position");
                 ui.horizontal(|ui| {
@@ -124,10 +124,14 @@ fn draw_light(ui: &mut egui::Ui, data: &mut LightData) {
                 ui.label("Radius");
                 ui.add(egui::DragValue::new(radius).speed(0.1).range(0.0..=1000.0));
                 ui.end_row();
+
+                ui.label("Source radius");
+                ui.add(egui::DragValue::new(source_radius).speed(0.005).range(0.0..=10.0).suffix(" m"));
+                ui.end_row();
             });
         }
 
-        LightData::Spot { position, direction, color, intensity, radius, inner_angle, outer_angle } => {
+        LightData::Spot { position, direction, color, intensity, radius, source_radius, inner_angle, outer_angle } => {
             egui::Grid::new("light_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
                 ui.label("Position");
                 ui.horizontal(|ui| {
@@ -155,6 +159,10 @@ fn draw_light(ui: &mut egui::Ui, data: &mut LightData) {
 
                 ui.label("Radius");
                 ui.add(egui::DragValue::new(radius).speed(0.1).range(0.0..=1000.0));
+                ui.end_row();
+
+                ui.label("Source radius");
+                ui.add(egui::DragValue::new(source_radius).speed(0.005).range(0.0..=10.0).suffix(" m"));
                 ui.end_row();
 
                 let mut inner_deg = inner_angle.to_degrees();

@@ -239,6 +239,8 @@ impl Pass for LightUploadPass {
                 radius: l.radius,
                 color: l.color.into(),
                 intensity: l.intensity,
+                source_radius: l.source_radius,
+                _pad: [0.0; 3],
             })
             .collect();
 
@@ -253,7 +255,8 @@ impl Pass for LightUploadPass {
                 color: l.color.into(),
                 outer_cos: l.outer_angle.cos(),
                 intensity: l.intensity,
-                _pad: [0.0; 3],
+                source_radius: l.source_radius,
+                _pad: [0.0; 2],
             })
             .collect();
 
@@ -278,10 +281,10 @@ impl Pass for LightUploadPass {
             .take(MAX_POINT_LIGHTS)
             .enumerate()
             .map(|(i, l)| {
-                (importance(l.position, four_pi * l.intensity), caster(SHADOW_KIND_POINT, i, l.position, l.radius), 0.0)
+                (importance(l.position, four_pi * l.intensity), caster(SHADOW_KIND_POINT, i, l.position, l.radius), l.source_radius)
             })
             .chain(spots.iter().take(MAX_SPOT_LIGHTS).enumerate().map(|(i, l)| {
-                (importance(l.position, four_pi * l.intensity), caster(SHADOW_KIND_SPOT, i, l.position, l.radius), 0.0)
+                (importance(l.position, four_pi * l.intensity), caster(SHADOW_KIND_SPOT, i, l.position, l.radius), l.source_radius)
             }))
             .chain(areas.iter().enumerate().map(|(i, l)| {
                 let sides = if l.two_sided { 2.0 } else { 1.0 };

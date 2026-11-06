@@ -48,11 +48,16 @@ struct GpuSkyLight {
     _pad:         f32,
 }
 
+// Scalar padding: a trailing vec3 would be 16-aligned and break the 48-byte Rust layout.
 struct GpuPointLight {
-    position_vs: vec3<f32>,
-    radius:      f32,
-    color:       vec3<f32>,
-    intensity:   f32,
+    position_vs:   vec3<f32>,
+    radius:        f32,
+    color:         vec3<f32>,
+    intensity:     f32,
+    source_radius: f32,
+    _pad0:         f32,
+    _pad1:         f32,
+    _pad2:         f32,
 }
 
 // Scalar padding: a trailing vec3 would be 16-aligned and break the 64-byte Rust layout.
@@ -63,10 +68,10 @@ struct GpuSpotLight {
     inner_cos:    f32,
     color:        vec3<f32>,
     outer_cos:    f32,
-    intensity:    f32,
-    _pad0:        f32,
-    _pad1:        f32,
-    _pad2:        f32,
+    intensity:     f32,
+    source_radius: f32,
+    _pad1:         f32,
+    _pad2:         f32,
 }
 
 // right_vs / up_vs are half-extent vectors of the rectangle. One-sided lights emit toward right × up.

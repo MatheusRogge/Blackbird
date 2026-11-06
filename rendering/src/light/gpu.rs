@@ -5,6 +5,8 @@ pub struct GpuPointLight {
     pub radius: f32,
     pub color: [f32; 3],
     pub intensity: f32,
+    pub source_radius: f32,
+    pub _pad: [f32; 3],
 }
 
 #[repr(C)]
@@ -17,7 +19,8 @@ pub struct GpuSpotLight {
     pub color: [f32; 3],
     pub outer_cos: f32,
     pub intensity: f32,
-    pub _pad: [f32; 3],
+    pub source_radius: f32,
+    pub _pad: [f32; 2],
 }
 
 #[repr(C)]
@@ -45,7 +48,8 @@ pub struct GpuSkyLight {
 
 /// Local lights that get a cube shadow map, one slot each. An entry is `kind << 16 | index` into
 /// that kind's light buffer (`SHADOW_KIND_*`). `lights[slot]` is the shadow origin in world space
-/// (xyz) and the light's half size (w, 0 for point and spot lights), which widens the PCF. Slots
+/// (xyz) and the light's half size (w: half extent for area lights, source radius for point and
+/// spot lights), which widens the PCF. Slots
 /// can be empty (`SHADOW_ENTRY_NONE`); `count` is one past the last used slot.
 #[repr(C)]
 #[derive(Copy, Clone, Default, bytemuck::Pod, bytemuck::Zeroable)]

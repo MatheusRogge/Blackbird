@@ -2,7 +2,7 @@
 //! `engine::gltf::lights`.
 
 use anyhow::Result;
-use engine::gltf::lights::{EXTENSION, EXTRAS_KEY};
+use engine::gltf::lights::{EXTENSION, EXTRAS_KEY, SOURCE_RADIUS_KEY};
 use gltf_api::json::extensions::scene::khr_lights_punctual::{self as khr, Type};
 use gltf_api::json::scene::UnitQuaternion;
 use gltf_api::json::validation::Checked;
@@ -124,22 +124,28 @@ fn set_local_transform(node: &mut gltf_api::json::Node, parent: Mat4, world: Mat
 }
 
 fn to_khr(data: &LightData) -> Option<khr::Light> {
-    let (type_, color, intensity, range, spot) = match *data {
-        LightData::Sky { color, intensity, .. } => (Type::Directional, color, intensity, None, None),
-        LightData::Point { color, intensity, radius, .. } => (Type::Point, color, intensity, Some(radius), None),
-        LightData::Spot { color, intensity, radius, inner_angle, outer_angle, .. } => (
+    let (type_, color, intensity, range, spot, source_radius) = match *data {
+        LightData::Sky { color, intensity, .. } => (Type::Directional, color, intensity, None, None, 0.0),
+        LightData::Point { color, intensity, radius, source_radius, .. } => {
+            (Type::Point, color, intensity, Some(radius), None, source_radius)
+        }
+        LightData::Spot { color, intensity, radius, source_radius, inner_angle, outer_angle, .. } => (
             Type::Spot,
             color,
             intensity,
             Some(radius),
             Some(khr::Spot { inner_cone_angle: inner_angle, outer_cone_angle: outer_angle }),
+            source_radius,
         ),
         LightData::Area { .. } => return None,
     };
+    let extras = (source_radius > 0.0)
+        .then(|| serde_json::value::to_raw_value(&serde_json::json!({ SOURCE_RADIUS_KEY: source_radius })).ok())
+        .flatten();
     Some(khr::Light {
         color,
         extensions: None,
-        extras: Default::default(),
+        extras,
         intensity,
         name: Some(light_name(data).to_string()),
         range,
