@@ -16,6 +16,7 @@ use crate::{
     pass::lighting::{LightingBindings, LightingOutputs},
     pass::material::{MaterialTextures, material_key},
     pass::probe_atlas::ProbeAtlasOutputs,
+    pass::reflection_probe::ReflectionProbeOutputs,
     pass::shadow::ShadowOutputs,
     pass::{Pass, PassContext, PassDesc},
     resource::{ResourceDescriptor, ResourceId},
@@ -191,6 +192,7 @@ impl TransparentPass {
         shadow: &ShadowOutputs,
         probe_atlas: &ProbeAtlasOutputs,
         camera_buffer_id: ResourceId,
+        reflection: &ReflectionProbeOutputs,
         lighting_shader: ShaderAsset,
         debug_flags: Arc<RwLock<RenderDebugFlags>>,
     ) -> (Self, ResourceId) {
@@ -211,6 +213,7 @@ impl TransparentPass {
                 probe_atlas,
                 camera_buffer_id,
                 lighting.debug_flags_id,
+                reflection,
             ),
             debug_flags,
             scene_id,

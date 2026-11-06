@@ -11,6 +11,7 @@ use crate::{
     pass::gbuffer::GBufferOutputs,
     pass::light_upload::LightBuffers,
     pass::probe_atlas::ProbeAtlasOutputs,
+    pass::reflection_probe::{ReflectionProbeOutputs, SharedReflectionProbe, probe_textures},
     pass::shadow::ShadowOutputs,
     pass::{Pass, PassContext, PassDesc},
     resource::{ResourceDescriptor, ResourceId},
@@ -106,6 +107,8 @@ pub(crate) struct LightingBindings {
     probe_params_id: ResourceId,
     camera_buffer_id: ResourceId,
     current_atlas: Arc<AtomicUsize>,
+    reflection_params_id: ResourceId,
+    reflection_textures: SharedReflectionProbe,
 
     debug_flags_id: ResourceId,
     shadowed_buffer_id: ResourceId,
@@ -127,6 +130,7 @@ impl LightingBindings {
         probe_atlas: &ProbeAtlasOutputs,
         camera_buffer_id: ResourceId,
         debug_flags_id: ResourceId,
+        reflection: &ReflectionProbeOutputs,
     ) -> Self {
         Self {
             cluster_params_id: cluster.cluster_params_id,
@@ -148,6 +152,8 @@ impl LightingBindings {
             probe_params_id: probe_atlas.probe_params_id,
             camera_buffer_id,
             current_atlas: Arc::clone(&probe_atlas.current_atlas),
+            reflection_params_id: reflection.params_id,
+            reflection_textures: Arc::clone(&reflection.textures),
             debug_flags_id,
             shadowed_buffer_id: light_buffers.shadowed_buffer_id,
             layouts: None,
@@ -181,6 +187,7 @@ impl LightingBindings {
             self.visibility_atlas_ids[1],
             self.probe_params_id,
             self.camera_buffer_id,
+            self.reflection_params_id,
             self.shadowed_buffer_id,
         ]
     }
@@ -233,6 +240,14 @@ impl LightingBindings {
                         count: None,
                     },
                     uniform_entry(4, fragment | wgpu::ShaderStages::VERTEX),
+                    texture_entry(5, wgpu::TextureViewDimension::Cube, FILTERABLE),
+                    uniform_entry(6, fragment),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: fragment,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
                 ],
             });
             let debug_flags = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -324,6 +339,8 @@ impl LightingBindings {
             let visibility = view(&self.visibility_atlas_ids[atlas])?;
             let params = buffer(&self.probe_params_id)?;
             let camera = buffer(&self.camera_buffer_id)?;
+            let reflection_params = buffer(&self.reflection_params_id)?;
+            let reflection = probe_textures(&self.reflection_textures, device);
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("lighting_probe_bg"),
                 layout: &layouts.probe,
@@ -336,6 +353,9 @@ impl LightingBindings {
                         resource: wgpu::BindingResource::Sampler(&layouts.probe_sampler),
                     },
                     wgpu::BindGroupEntry { binding: 4, resource: camera.binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&reflection.view) },
+                    wgpu::BindGroupEntry { binding: 6, resource: reflection_params.binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&reflection.sampler) },
                 ],
             });
             self.probe_bg = Some((irradiance_ptr, bind_group));
@@ -400,6 +420,7 @@ impl LightingPass {
         shadow: &ShadowOutputs,
         probe_atlas: &ProbeAtlasOutputs,
         camera_buffer_id: ResourceId,
+        reflection: &ReflectionProbeOutputs,
         _surface_config: &wgpu::SurfaceConfiguration,
         shader: ShaderAsset,
         debug_flags: Arc<RwLock<RenderDebugFlags>>,
@@ -449,6 +470,7 @@ impl LightingPass {
                     probe_atlas,
                     camera_buffer_id,
                     debug_flags_id,
+                    reflection,
                 ),
                 debug_flags,
                 debug_flags_id,

@@ -12,6 +12,7 @@ pub mod present;
 pub mod probe_atlas;
 pub mod probe_trace;
 pub mod probe_update;
+pub mod reflection_probe;
 pub mod shadow;
 pub mod transparent;
 

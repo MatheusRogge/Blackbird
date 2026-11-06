@@ -40,6 +40,19 @@ struct CameraUniform {
 @group(3) @binding(3) var probe_sampler: sampler;
 @group(3) @binding(4) var<uniform> camera: CameraUniform;
 
+// Mirrors rendering::pass::reflection_probe::ReflectionProbeParams.
+struct ReflectionProbeParams {
+    // xyz: world-space center; w: 1 once captured.
+    center:  vec4<f32>,
+    max_lod: f32,
+}
+
+// The camera-following reflection probe, GGX-prefiltered: mip = perceptual roughness × max_lod.
+// rgb: unexposed radiance; a: distance from the center to what was captured in that direction.
+@group(3) @binding(5) var t_reflection: texture_cube<f32>;
+@group(3) @binding(6) var<uniform> reflection: ReflectionProbeParams;
+@group(3) @binding(7) var s_reflection: sampler;
+
 struct DebugFlags {
     disable_albedo:   u32,
     disable_indirect: u32,
@@ -350,6 +363,28 @@ fn env_brdf_approx(f0: vec3<f32>, roughness: f32, n_dot_v: f32) -> vec3<f32> {
 }
 
 // KHR_lights_punctual recommended falloff: inverse-square, smoothly windowed to zero at `range`.
+// Radiance (unexposed) arriving along `R` at `pos_ws`, for reflections SSR can't resolve: the
+// reflection probe once captured, else DDGI irradiance around `R`. The probe was captured from its
+// center, not from `pos_ws`, so the lookup direction is parallax-corrected with the captured
+// distance: a few fixed-point steps find where the ray from `pos_ws` meets the captured surface.
+fn reflected_radiance(pos_ws: vec3<f32>, N: vec3<f32>, R: vec3<f32>, view_dir: vec3<f32>, roughness: f32) -> vec3<f32> {
+    if reflection.center.w < 0.5 {
+        return sample_probe_irradiance(pos_ws, N, R, view_dir);
+    }
+    let c = reflection.center.xyz;
+    var dir = R;
+    var t = textureSampleLevel(t_reflection, s_reflection, R, 0.0).a;
+    for (var i = 0u; i < 4u; i++) {
+        let v = pos_ws + R * t - c;
+        dir = select(R, normalize(v), dot(v, v) > 1e-6);
+        let hit = c + dir * textureSampleLevel(t_reflection, s_reflection, dir, 0.0).a;
+        t = max(dot(hit - pos_ws, R), 0.0);
+    }
+    let v = pos_ws + R * t - c;
+    dir = select(R, normalize(v), dot(v, v) > 1e-6);
+    return textureSampleLevel(t_reflection, s_reflection, dir, roughness * reflection.max_lod).rgb;
+}
+
 fn range_attenuation(dist: f32, range: f32) -> f32 {
     let r = dist / range;
     let window = clamp(1.0 - r * r * r * r, 0.0, 1.0);
@@ -491,16 +526,26 @@ fn cluster_index(pixel: vec2<f32>, depth_vs: f32) -> u32 {
 
 // Direct light from every light, with shadows. `surf_vs` / `surf_ws` are the same surface in view
 // and world space, and `pixel` is the fragment position (cluster lookup, PCF rotation).
-fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws: vec3<f32>, pixel: vec2<f32>, depth_vs: f32) -> vec3<f32> {
+// `probe_capture` is for points seen by the reflection probe rather than the camera: the camera's
+// light clusters don't apply, so every point light is looped over, and the sky shadow comes from
+// whichever cascade contains the point.
+fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws: vec3<f32>, pixel: vec2<f32>, depth_vs: f32, probe_capture: bool) -> vec3<f32> {
     let N = surf_ws.N;
     let N_vs = surf_vs.N;
     let alpha = surf_vs.alpha;
-    let cluster_idx = cluster_index(pixel, depth_vs);
-    let light_count = light_grid[cluster_idx];
+    var cluster_idx = 0u;
+    var light_count = light_counts.num_point;
+    if !probe_capture {
+        cluster_idx = cluster_index(pixel, depth_vs);
+        light_count = light_grid[cluster_idx];
+    }
 
     var color = vec3f(0.0);
     for (var i = 0u; i < light_count; i++) {
-        let li    = light_indices[cluster_idx * MAX_LIGHTS_PER_CLUSTER + i];
+        var li = i;
+        if !probe_capture {
+            li = light_indices[cluster_idx * MAX_LIGHTS_PER_CLUSTER + i];
+        }
         let light = point_lights[li];
 
         let to_light = light.position_vs - pos_vs;
@@ -589,15 +634,33 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let L = normalize((camera.inv_view * vec4f(-sky.direction_vs, 0.0)).xyz);
         if L.y < 0.0 { continue; }
 
-        // Select cascade based on view-space depth and project into shadow space.
-        let cascade     = select_cascade(depth_vs);
+        // Select cascade based on view-space depth and project into shadow space. The cascades
+        // only cover the camera's frustum, so a probe capture takes the first cascade containing
+        // the point and treats a point none covers as shadowed: indoor reflections must not gain
+        // moonlight.
+        var cascade = select_cascade(depth_vs);
+        var covered = true;
+        if probe_capture {
+            covered = false;
+            for (var c = 0u; c < 4u; c++) {
+                let clip = sp.view_to_shadow[c] * vec4f(pos_vs, 1.0);
+                let ndc = clip.xyz / clip.w;
+                if all(abs(ndc.xy) <= vec2f(0.98)) && ndc.z >= 0.0 && ndc.z <= 1.0 {
+                    cascade = c;
+                    covered = true;
+                    break;
+                }
+            }
+        }
         let shadow_clip = sp.view_to_shadow[cascade] * vec4<f32>(pos_vs, 1.0);
         let shadow_ndc  = shadow_clip.xyz / shadow_clip.w;
         let shadow_uv   = shadow_ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
         let ref_depth   = shadow_ndc.z - sp.bias;
 
         var lit = vec3f(1.0);
-        if debug.disable_shadows == 0u &&
+        if debug.disable_shadows == 0u && !covered {
+            lit = vec3f(0.0);
+        } else if debug.disable_shadows == 0u &&
             shadow_uv.x >= 0.0 && shadow_uv.x <= 1.0 &&
             shadow_uv.y >= 0.0 && shadow_uv.y <= 1.0 &&
             ref_depth >= 0.0 && ref_depth <= 1.0 {
@@ -761,14 +824,14 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
             let n_dot_v = max(dot(N, view_dir), 1e-4);
             let R = normalize(mix(reflect(-view_dir, N), N, alpha));
             let weight = env_brdf_approx(f0, roughness, n_dot_v);
-            let env = sample_probe_irradiance(pos_ws, N, R, view_dir);
+            let env = reflected_radiance(pos_ws, N, R, view_dir, roughness);
             out.specular_weight = vec4f(weight, roughness);
             out.specular_fallback = vec4f(env * weight * cp.exposure, 1.0);
         }
     }
 
     if debug.disable_direct == 0u {
-        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, depth_vs);
+        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, depth_vs, false);
     }
 
     color += emissive;
@@ -965,8 +1028,9 @@ fn glass_ssr(pos_ws: vec3<f32>, R: vec3<f32>, frag: vec2<f32>, roughness: f32) -
     return vec4f(color, confidence);
 }
 
+// Invariant so the reflection probe's depth prepass and shading pass produce identical depths.
 struct ForwardVertex {
-    @builtin(position) pos: vec4<f32>,
+    @builtin(position) @invariant pos: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
     @location(1) world_normal: vec3<f32>,
     @location(2) color: vec3<f32>,
@@ -1047,18 +1111,18 @@ fn fs_forward(in: ForwardVertex, @builtin(front_facing) front_facing: bool) -> @
 
     var color = emissive * coverage;
     if debug.disable_direct == 0u {
-        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, -pos_vs.z);
+        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, -pos_vs.z, false);
     }
     // Exposed, unlike `color`: screen-space hits come from the exposed `t_behind`.
-    var reflection = vec3f(0.0);
+    var reflected = vec3f(0.0);
     if debug.disable_indirect == 0u {
         color += diffuse_color * sample_probe_irradiance(pos_ws, N, N, view_dir);
         if debug.disable_reflections == 0u && any(reflectance > vec3f(0.0)) {
             let R = normalize(mix(reflect(-view_dir, N), N, alpha));
-            reflection = sample_probe_irradiance(pos_ws, N, R, view_dir) * cp.exposure;
+            reflected = reflected_radiance(pos_ws, N, R, view_dir, roughness) * cp.exposure;
             if debug.disable_ssr == 0u && roughness < GLASS_SSR_MAX_ROUGHNESS {
                 let hit = glass_ssr(pos_ws, reflect(-view_dir, N), in.pos.xy, roughness);
-                reflection = mix(reflection, hit.rgb, hit.a);
+                reflected = mix(reflected, hit.rgb, hit.a);
             }
         }
     }
@@ -1079,5 +1143,139 @@ fn fs_forward(in: ForwardVertex, @builtin(front_facing) front_facing: bool) -> @
         }
     }
     let transmitted = behind * albedo * (1.0 - reflectance) * (transmission * coverage);
-    return vec4f(color * cp.exposure + reflectance * reflection + transmitted, coverage);
+    return vec4f(color * cp.exposure + reflectance * reflected + transmitted, coverage);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reflection probe capture (rendering::pass::reflection_probe). Opaque meshes are shaded from the
+// probe center into one cube face; group 0 holds the instance buffer (binding 7, shared with the
+// forward path) and the face below, groups 1–4 are the usual lighting bindings, group 5 the material.
+
+// Mirrors rendering::pass::reflection_probe::CaptureView.
+struct ProbeCapture {
+    view_proj: mat4x4<f32>,
+    center:    vec4<f32>,
+    // The face's basis: the direction through NDC (x, y) is forward + x·right + y·up.
+    forward:   vec4<f32>,
+    right:     vec4<f32>,
+    up:        vec4<f32>,
+}
+
+@group(0) @binding(11) var<uniform> probe_capture: ProbeCapture;
+
+// Distance stored for the sky, beyond any geometry.
+const PROBE_SKY_DISTANCE: f32 = 1.0e4;
+// The capture is unexposed Rgba16Float: anything brighter than this (a daylight sun) would become
+// inf, and filtering an inf texel produces NaN.
+const PROBE_MAX_RADIANCE: f32 = 6.0e4;
+
+@vertex
+fn vs_probe(
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec3<f32>,
+    @location(3) uv: vec2<f32>,
+    @location(4) tangent: vec4<f32>,
+    @builtin(instance_index) instance: u32,
+) -> ForwardVertex {
+    let m = models[instance];
+    let world = m.model * vec4f(position, 1.0);
+    var out: ForwardVertex;
+    out.pos = probe_capture.view_proj * world;
+    out.world_pos = world.xyz / world.w;
+    out.world_normal = normalize((m.normal * vec4f(normal, 0.0)).xyz);
+    out.color = color;
+    out.uv = uv;
+    // Left unnormalized: meshes without tangents have zero ones, which fs_probe must detect.
+    out.world_tangent = vec4f((m.model * vec4f(tangent.xyz, 0.0)).xyz, tangent.w);
+    out.instance = instance;
+    return out;
+}
+
+// Depth prepass for alpha-tested meshes: the capture is then shaded with an `Equal` depth test, so
+// every texel runs `fs_probe` once, however much geometry overlaps.
+@fragment
+fn fs_probe_depth(in: ForwardVertex) {
+    let m = models[in.instance];
+    if textureSample(m_albedo, m_sampler, in.uv).a * m.base_color.a < m.material.x {
+        discard;
+    }
+}
+
+@fragment
+fn fs_probe(in: ForwardVertex, @builtin(front_facing) front_facing: bool) -> @location(0) vec4<f32> {
+    let m = models[in.instance];
+    let base = textureSample(m_albedo, m_sampler, in.uv) * m.base_color * vec4f(in.color, 1.0);
+    return shade_probe(in, front_facing, m, base);
+}
+
+// rgb: unexposed radiance toward the probe center; a: distance to the center. Same material and
+// lights as the deferred path; reflections inside the capture use DDGI irradiance, not the probe.
+fn shade_probe(in: ForwardVertex, front_facing: bool, m: Model, base: vec4<f32>) -> vec4<f32> {
+    let normal_sample = textureSample(m_normal, m_sampler, in.uv).rgb;
+    let mr = textureSample(m_metallic_roughness, m_sampler, in.uv);
+    let emissive = textureSample(m_emissive, m_sampler, in.uv).rgb * m.emissive.rgb;
+
+    var Ng = normalize(in.world_normal);
+    if !front_facing {
+        Ng = -Ng;
+    }
+    // The capture target is float, so a NaN normal from a mesh without tangents would survive
+    // (the G-buffer's unorm targets flush it); such meshes keep the geometric normal.
+    var N = Ng;
+    let tangent_len = length(in.world_tangent.xyz);
+    if tangent_len > 1e-6 {
+        let T = in.world_tangent.xyz / tangent_len;
+        let B = cross(Ng, T) * in.world_tangent.w;
+        let tangent_normal = normalize(normal_sample * 2.0 - 1.0);
+        N = normalize(T * tangent_normal.x + B * tangent_normal.y + Ng * tangent_normal.z);
+    }
+
+    let albedo = select(base.rgb, vec3f(1.0), debug.disable_albedo != 0u);
+    let roughness = max(mr.g * m.material.w, MIN_ROUGHNESS);
+    let metallic = mr.b * m.material.z;
+    let f0 = mix(vec3f(0.04), albedo, metallic);
+    let alpha = roughness * roughness;
+    let diffuse_color = albedo * (1.0 - metallic);
+
+    // Lights are in the camera's view space; the viewer is the probe center.
+    let cam_pos = camera.inv_view[3].xyz;
+    let rot = mat3x3<f32>(camera.inv_view[0].xyz, camera.inv_view[1].xyz, camera.inv_view[2].xyz);
+    let pos_ws = in.world_pos;
+    let pos_vs = (pos_ws - cam_pos) * rot;
+    let center = probe_capture.center.xyz;
+    let view_dir = normalize(center - pos_ws);
+    let surf_vs = Surface(normalize(N * rot), normalize(view_dir * rot), diffuse_color, f0, alpha);
+    let surf_ws = Surface(N, view_dir, diffuse_color, f0, alpha);
+
+    var color = emissive;
+    if debug.disable_direct == 0u {
+        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, -pos_vs.z, true);
+    }
+    if debug.disable_indirect == 0u {
+        color += diffuse_color * sample_probe_irradiance(pos_ws, N, N, view_dir);
+        let n_dot_v = max(dot(N, view_dir), 1e-4);
+        let R = normalize(mix(reflect(-view_dir, N), N, alpha));
+        color += env_brdf_approx(f0, roughness, n_dot_v) * sample_probe_irradiance(pos_ws, N, R, view_dir);
+    }
+    return vec4f(min(color, vec3f(PROBE_MAX_RADIANCE)), length(pos_ws - center));
+}
+
+struct ProbeSkyVertex {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) ndc: vec2<f32>,
+}
+
+// A fullscreen triangle at the far plane (standard depth), so it only fills where no mesh was drawn.
+@vertex
+fn vs_probe_sky(@builtin(vertex_index) vi: u32) -> ProbeSkyVertex {
+    let uv = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+    let ndc = uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0);
+    return ProbeSkyVertex(vec4f(ndc, 1.0, 1.0), ndc);
+}
+
+@fragment
+fn fs_probe_sky(in: ProbeSkyVertex) -> @location(0) vec4<f32> {
+    let dir = normalize(probe_capture.forward.xyz + in.ndc.x * probe_capture.right.xyz + in.ndc.y * probe_capture.up.xyz);
+    return vec4f(min(sky_color(dir), vec3f(PROBE_MAX_RADIANCE)), PROBE_SKY_DISTANCE);
 }

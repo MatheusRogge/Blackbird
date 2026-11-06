@@ -107,6 +107,7 @@ impl UiLayer for DebugLayer {
                     ui.add_enabled_ui(flags.reflections, |ui| {
                         ui.indent("reflections_indent", |ui| {
                             ui.checkbox(&mut flags.ssr, "Screen-space");
+                            ui.checkbox(&mut flags.reflection_probe, "Reflection probe");
                         });
                     });
                     egui::ComboBox::from_label("View")

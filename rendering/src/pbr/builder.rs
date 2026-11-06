@@ -17,6 +17,7 @@ use crate::{
         probe_atlas::{ProbeAtlasPass, ProbeGridConfig},
         probe_trace::ProbeTracePass,
         probe_update::ProbeUpdatePass,
+        reflection_probe::ReflectionProbePass,
         shadow::ShadowPass,
         transparent::TransparentPass,
     },
@@ -138,6 +139,18 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             ClusterAssignmentPass::new(&mut graph, &light_buffers, self.cluster_shader);
         graph.add_pass(device, cluster_pass);
 
+        let (reflection_probe_pass, reflection_outputs) = ReflectionProbePass::new(
+            &mut graph,
+            &cluster_outputs,
+            &light_buffers,
+            &shadow_outputs,
+            &probe_atlas_outputs,
+            camera_buffer_id,
+            self.lighting_shader.clone(),
+            Arc::clone(&debug_flags),
+        );
+        graph.add_pass(device, reflection_probe_pass);
+
         let (lighting_pass, lighting_outputs) = LightingPass::new(
             &mut graph,
             &gbuffer_outputs,
@@ -146,6 +159,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             &shadow_outputs,
             &probe_atlas_outputs,
             camera_buffer_id,
+            &reflection_outputs,
             surface_config,
             self.lighting_shader.clone(),
             std::sync::Arc::clone(&debug_flags),
@@ -192,6 +206,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             &shadow_outputs,
             &probe_atlas_outputs,
             camera_buffer_id,
+            &reflection_outputs,
             self.lighting_shader,
             Arc::clone(&debug_flags),
         );

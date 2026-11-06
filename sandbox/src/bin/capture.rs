@@ -4,10 +4,11 @@
 //! cargo run -p sandbox --bin capture -- <asset-root> <scene> <out.png> [options]
 //!   --size WxH           default 1280x720
 //!   --frames N           frames rendered before the capture, so GI can converge (default 400)
+//!   --stats              print per-pass CPU/GPU timings after every frame
 //!   --eye x,y,z          camera position (default: the scene's main camera)
 //!   --target x,y,z       point the camera looks at
 //!   --exposure E         linear exposure override
-//!   --no-specular --no-reflections --no-ssr --no-emissive-lights --no-indirect --no-direct --no-shadows
+//!   --no-specular --no-reflections --no-ssr --no-reflection-probe --no-emissive-lights --no-indirect --no-direct --no-shadows
 //!   --view lit|albedo|normal|material|emissive|shadows
 //!   --point x,y,z,I[,r]  add a white point light of I candela (range 10), source radius r (default 0)
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
@@ -41,6 +42,7 @@ struct Options {
     exposure: Option<f32>,
     reloads: u32,
     points: Vec<(Vec3, f32, f32)>,
+    stats: bool,
     flags: RenderDebugFlags,
 }
 
@@ -67,6 +69,7 @@ fn parse_args() -> Result<Options> {
         exposure: None,
         reloads: 0,
         points: Vec::new(),
+        stats: false,
         flags: RenderDebugFlags::default(),
     };
 
@@ -80,6 +83,7 @@ fn parse_args() -> Result<Options> {
                 options.size = (w.parse()?, h.parse()?);
             }
             "--frames" => options.frames = value()?.parse()?,
+            "--stats" => options.stats = true,
             "--eye" => options.eye = Some(parse_vec3(&value()?)?),
             "--target" => options.target = Some(parse_vec3(&value()?)?),
             "--exposure" => options.exposure = Some(value()?.parse()?),
@@ -96,6 +100,7 @@ fn parse_args() -> Result<Options> {
             "--no-specular" => flags.specular = false,
             "--no-reflections" => flags.reflections = false,
             "--no-ssr" => flags.ssr = false,
+            "--no-reflection-probe" => flags.reflection_probe = false,
             "--no-emissive-lights" => flags.emissive_lights = false,
             "--no-indirect" => flags.indirect = false,
             "--no-direct" => flags.direct = false,
@@ -222,6 +227,9 @@ fn main() -> Result<()> {
     }
     for _ in 0..options.frames {
         renderer.render(&world, None);
+        if options.stats {
+            eprintln!("{}", renderer.frame_stats());
+        }
     }
 
     let frame = renderer.read_frame()?;

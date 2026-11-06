@@ -56,6 +56,9 @@ pub struct RenderDebugFlags {
     pub reflections: bool,
     /// Screen-space reflections only: with this off, reflections come from the probe fallback alone.
     pub ssr: bool,
+    /// The camera-following reflection probe (`reflection_probe` pass): with this off, reflections
+    /// SSR misses fall back to DDGI irradiance around the reflection vector.
+    pub reflection_probe: bool,
     pub view:     GBufferView,
 
     pub show_bvh:        bool,
@@ -82,6 +85,7 @@ impl Default for RenderDebugFlags {
             emissive_lights: true,
             reflections: true,
             ssr: true,
+            reflection_probe: true,
             view:     GBufferView::Lit,
 
             show_bvh:        false,
