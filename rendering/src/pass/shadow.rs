@@ -77,13 +77,35 @@ const CUBE_FACES: [(Vec3, Vec3); 6] = [
     (Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.0, -1.0, 0.0)),
 ];
 
-/// One local light face: its view-projection and where its tile sits in the atlas.
+/// One local light face as it was last rendered: its view-projection, where its tile sits in the
+/// atlas, and the light it was rendered for (identical on every face of a slot). Rendering can lag
+/// the light by a few frames (`LOCAL_SHADOW_TEXEL_BUDGET`), so the shader reads all of it from here.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct LocalShadowFace {
     pub view_proj: [[f32; 4]; 4],
-    /// `Tile::rect`: atlas UV offset (xy) and scale (z), tile size in texels (w).
+    /// `Tile::rect`: atlas UV offset (xy) and scale (z), tile size in texels (w). w = 0 on a slot's
+    /// first face: its map isn't rendered yet, so the light is unshadowed.
     pub rect: [f32; 4],
+    /// Shadow origin in world space (xyz), light half size (w).
+    pub light: [f32; 4],
+    /// Face count (6 cube, 1 spot), tan of half the field of view, near plane, far plane.
+    pub shape: [f32; 4],
+}
+
+/// Most atlas texels re-rendered per frame (two 512² cubes). Lights whose maps are new come first
+/// by rank, then stale ones (moved, or nearby geometry moved) by rank over frames waited, so none
+/// starves. At least one light renders per frame however big.
+const LOCAL_SHADOW_TEXEL_BUDGET: u64 = 2 * 6 * 512 * 512;
+
+/// What a slot's maps were last rendered for.
+#[derive(Copy, Clone)]
+struct RenderedSlot {
+    caster: ShadowCaster,
+    /// `ShadowPass::render_local_shadows`' signature of the meshes in the light's range.
+    geometry: u64,
+    /// Frame since which the maps have been out of date, while they wait for the budget.
+    stale_since: Option<u64>,
 }
 
 /// Every local light face, slot-major (`slot * 6 + face`). Mirrors `LocalShadowParams` in
@@ -244,8 +266,8 @@ pub struct ShadowPass {
     /// Clear one atlas tile (`vs_clear`): far depth, and the glass tint clear value.
     clear_depth_pipeline: Option<wgpu::RenderPipeline>,
     clear_tint_pipeline: Option<wgpu::RenderPipeline>,
-    /// What each slot's faces were last rendered for, with the scene geometry signature then.
-    rendered: [Option<(ShadowCaster, u64)>; MAX_SHADOWED_LIGHTS],
+    rendered: [Option<RenderedSlot>; MAX_SHADOWED_LIGHTS],
+    frame: u64,
     local_params: LocalShadowParams,
 }
 
@@ -346,6 +368,7 @@ impl ShadowPass {
                 clear_depth_pipeline: None,
                 clear_tint_pipeline: None,
                 rendered: [None; MAX_SHADOWED_LIGHTS],
+                frame: 0,
                 local_params: LocalShadowParams::zeroed(),
             },
             outputs,
@@ -354,8 +377,9 @@ impl ShadowPass {
 }
 
 impl ShadowPass {
-    /// Renders the faces of every shadowed light whose caster (light, shape, tiles) or the scene
-    /// geometry changed since its last render into their atlas tiles, and uploads all faces.
+    /// Renders the faces of shadowed lights whose maps are missing or out of date (the light, or
+    /// a mesh in its range, changed) into their atlas tiles, within `LOCAL_SHADOW_TEXEL_BUDGET`,
+    /// and uploads all faces.
     fn render_local_shadows(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -394,30 +418,82 @@ impl ShadowPass {
             return;
         };
 
-        let mut hasher = std::hash::DefaultHasher::new();
-        ctx.geometry.generation().hash(&mut hasher);
-        for handle in meshes.iter().chain(glass) {
-            handle.id.hash(&mut hasher);
-            for value in handle.entity.transform.as_array() {
-                value.to_bits().hash(&mut hasher);
-            }
-        }
-        let geometry = hasher.finish();
+        // A light's maps only depend on the meshes reaching into its range, so a moving object
+        // re-renders the lights around it rather than all of them.
+        let mesh_keys: Vec<(u64, Aabb)> = meshes
+            .iter()
+            .chain(glass)
+            .filter_map(|h| {
+                let draw = ctx.geometry.get(h.id)?;
+                let mut hasher = std::hash::DefaultHasher::new();
+                h.id.hash(&mut hasher);
+                for value in h.entity.transform.as_array() {
+                    value.to_bits().hash(&mut hasher);
+                }
+                Some((hasher.finish(), draw.bounds.transformed(h.entity.transform)))
+            })
+            .collect();
+        let generation = ctx.geometry.generation();
+        let signature = |caster: &ShadowCaster| {
+            let reach = caster.range * caster.range;
+            mesh_keys
+                .iter()
+                .filter(|(_, b)| {
+                    let gap = Vec3::zero().max_by_component(b.min - caster.origin).max_by_component(caster.origin - b.max);
+                    !b.is_empty() && gap.mag_sq() <= reach
+                })
+                .fold(generation.wrapping_mul(0x9e37_79b9_7f4a_7c15), |sum, (key, _)| sum.wrapping_add(*key))
+        };
 
-        // (face index, tile, view-projection) of every face to re-render.
-        let mut faces: Vec<(usize, Tile, Mat4)> = Vec::new();
+        // (order, slot, geometry signature): new maps first by rank (order < 1), then stale ones by
+        // rank over frames waited (order > 1).
+        self.frame += 1;
         let casters = *self.casters.lock().expect("shadow_casters poisoned");
+        let mut pending: Vec<(f32, usize, u64)> = Vec::new();
         for (slot, caster) in casters.iter().enumerate() {
-            let Some(caster) = *caster else {
+            let Some(caster) = caster else {
                 self.rendered[slot] = None;
+                self.local_params.faces[slot * 6].rect = [0.0; 4];
                 continue;
             };
-            if self.rendered[slot] == Some((caster, geometry)) {
+            let geometry = signature(caster);
+            match &mut self.rendered[slot] {
+                Some(r) if r.caster.entry == caster.entry && r.caster.tiles[..r.caster.faces()] == caster.tiles[..caster.faces()] => {
+                    if r.caster.renders_like(caster) && r.geometry == geometry {
+                        r.stale_since = None;
+                        continue;
+                    }
+                    let waited = (self.frame - *r.stale_since.get_or_insert(self.frame)) as f32;
+                    pending.push((1.0 + (caster.rank as f32 + 1.0) / (1.0 + waited), slot, geometry));
+                }
+                _ => {
+                    // The tiles hold nothing of this light yet: unshadowed until rendered.
+                    self.rendered[slot] = None;
+                    self.local_params.faces[slot * 6].rect = [0.0; 4];
+                    pending.push((caster.rank as f32 / MAX_SHADOWED_LIGHTS as f32, slot, geometry));
+                }
+            }
+        }
+        pending.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        // (face index, tile, view-projection) of every face to render this frame.
+        let mut faces: Vec<(usize, Tile, Mat4)> = Vec::new();
+        let mut texels = 0;
+        for (_, slot, geometry) in pending {
+            let Some(caster) = casters[slot] else { continue };
+            let tiles = &caster.tiles[..caster.faces()];
+            let cost: u64 = tiles.iter().map(|t| u64::from(t.size).pow(2)).sum();
+            if texels > 0 && texels + cost > LOCAL_SHADOW_TEXEL_BUDGET {
                 continue;
             }
-            self.rendered[slot] = Some((caster, geometry));
+            texels += cost;
+            self.rendered[slot] = Some(RenderedSlot { caster, geometry, stale_since: None });
+
             let (near, far) = caster.planes();
-            for (face, &tile) in caster.tiles[..caster.faces()].iter().enumerate() {
+            let tan_half_fov = caster.spot.map_or(1.0, |s| s.tan_half_fov);
+            let light = [caster.origin.x, caster.origin.y, caster.origin.z, caster.half_size];
+            let shape = [caster.faces() as f32, tan_half_fov, near, far];
+            for (face, &tile) in tiles.iter().enumerate() {
                 let vp = match caster.spot {
                     Some(spot) => {
                         let fov = 2.0 * spot.tan_half_fov.atan();
@@ -434,7 +510,7 @@ impl ShadowPass {
                 let index = slot * 6 + face;
                 let cols = vp.cols;
                 let view_proj: [[f32; 4]; 4] = [cols[0].into(), cols[1].into(), cols[2].into(), cols[3].into()];
-                self.local_params.faces[index] = LocalShadowFace { view_proj, rect: tile.rect() };
+                self.local_params.faces[index] = LocalShadowFace { view_proj, rect: tile.rect(), light, shape };
                 let view = ShadowView { view_proj, light: [caster.origin.x, caster.origin.y, caster.origin.z, 1.0] };
                 vp_buf.write_at(queue, CASCADE_VP_STRIDE * index as u64, bytemuck::bytes_of(&view));
                 faces.push((index, tile, vp));

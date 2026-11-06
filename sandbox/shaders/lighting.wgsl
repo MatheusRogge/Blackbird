@@ -67,13 +67,10 @@ struct DebugFlags {
 
 @group(4) @binding(0) var<uniform> debug: DebugFlags;
 
-// Mirrors rendering::light::ShadowedLights. Lights point at their slot through `shadow_slot`.
-// lights[slot]: shadow origin in world space (xyz), light half size (w, 0 for point/spot).
-// shapes[slot]: face count (6 = cube, 1 = spot), tan of half the field of view.
+// Mirrors rendering::light::ShadowedLights. Lights point at their slot through `shadow_slot`; the
+// slot's maps and the light they were rendered for are in `local_shadow.faces`.
 struct ShadowedLights {
-    count:  u32,
-    lights: array<vec4<f32>, 32>,
-    shapes: array<vec4<f32>, 32>,
+    count: u32,
 }
 
 // Mirrors rendering::light::SHADOW_SLOT_NONE.
@@ -102,8 +99,13 @@ const POISSON: array<vec2<f32>, 12> = array<vec2<f32>, 12>(
 // is the light's size × (receiver − blocker) / blocker, so shadows are sharp at contact and
 // soften away from it.
 fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
-    let light = shadowed.lights[slot];
-    let shape = shadowed.shapes[slot];
+    // Origin and shape as the maps were rendered, which can lag the light by a few frames.
+    let first = local_shadow.faces[slot * 6u];
+    if first.rect.w == 0.0 {
+        return vec3f(1.0);
+    }
+    let light = first.light;
+    let shape = first.shape;
     let d = pos - light.xyz;
     let dist = length(d);
     var face = 0u;
@@ -527,11 +529,15 @@ struct ShadowParams {
 // Shadow atlas of every local light face (rendering::light::shadow_atlas).
 @group(2) @binding(3) var          t_local_shadow: texture_depth_2d;
 
-// Mirrors rendering::pass::shadow::LocalShadowFace. rect: atlas UV offset (xy) and scale (z), tile
-// size in texels (w).
+// Mirrors rendering::pass::shadow::LocalShadowFace, as last rendered. rect: atlas UV offset (xy)
+// and scale (z), tile size in texels (w; 0 on a slot's first face = not rendered yet). light:
+// shadow origin (xyz), half size (w). shape: face count (6 cube, 1 spot), tan of half the field of
+// view, near, far.
 struct LocalShadowFace {
     view_proj: mat4x4<f32>,
     rect:      vec4<f32>,
+    light:     vec4<f32>,
+    shape:     vec4<f32>,
 }
 
 // Mirrors rendering::pass::shadow::LocalShadowParams: six faces per slot (+X −X +Y −Y +Z −Z; a

@@ -335,8 +335,8 @@ impl Pass for LightUploadPass {
 
         let slots = self.shadow_slots.update(&candidates);
         let mut shadowed = ShadowedLights::default();
-        for (slot, entry) in slots.iter().enumerate() {
-            let Some((caster, half_size)) = *entry else { continue };
+        for (slot, caster) in slots.iter().enumerate() {
+            let Some(caster) = caster else { continue };
             let index = (caster.entry & 0xffff) as usize;
             let slot_id = slot as u32;
             match caster.entry >> 16 {
@@ -344,13 +344,9 @@ impl Pass for LightUploadPass {
                 SHADOW_KIND_SPOT => spot_lights[index].shadow_slot = slot_id,
                 _ => area_lights[index].shadow_slot = slot_id,
             }
-            shadowed.lights[slot] = [caster.origin.x, caster.origin.y, caster.origin.z, half_size];
-            let tan_half_fov = caster.spot.map_or(1.0, |s| s.tan_half_fov);
-            let (near, far) = caster.planes();
-            shadowed.shapes[slot] = [caster.faces() as f32, tan_half_fov, near, far];
             shadowed.count = slot_id + 1;
         }
-        *self.shadow_casters.lock().expect("shadow_casters poisoned") = slots.map(|s| s.map(|(c, _)| c));
+        *self.shadow_casters.lock().expect("shadow_casters poisoned") = slots;
 
         let sky_lights: Vec<GpuSkyLight> = world
             .get_entities::<SkyLight>()

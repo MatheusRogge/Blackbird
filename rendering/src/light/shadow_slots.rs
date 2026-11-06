@@ -16,7 +16,7 @@ pub struct ShadowCandidate {
     pub origin: Vec3,
     pub range: f32,
     pub spot: Option<SpotShadow>,
-    /// Light half size (`ShadowedLights::lights` w).
+    /// Light half size (`ShadowCaster::half_size`).
     pub half_size: f32,
     /// How much of the view the light's range can fill: range / distance to the camera.
     pub coverage: f32,
@@ -45,45 +45,46 @@ fn tile_size(coverage: f32, current: Option<u32>) -> u32 {
     size
 }
 
-#[derive(Copy, Clone)]
-struct Slot {
-    caster: ShadowCaster,
-    half_size: f32,
-}
-
 #[derive(Default)]
 pub struct ShadowSlots {
     atlas: ShadowAtlas,
-    slots: [Option<Slot>; MAX_SHADOWED_LIGHTS],
+    slots: [Option<ShadowCaster>; MAX_SHADOWED_LIGHTS],
 }
 
 impl ShadowSlots {
     /// Shadows the first `MAX_SHADOWED_LIGHTS` of `candidates` (sorted by score). A light keeps
     /// its slot and tiles while it stays selected with the same shape and tile size, so its map
-    /// stays cached. Returns each slot's caster and half size.
-    pub fn update(&mut self, candidates: &[ShadowCandidate]) -> [Option<(ShadowCaster, f32)>; MAX_SHADOWED_LIGHTS] {
+    /// stays cached. Returns each slot's caster.
+    pub fn update(&mut self, candidates: &[ShadowCandidate]) -> [Option<ShadowCaster>; MAX_SHADOWED_LIGHTS] {
         let selected = &candidates[..candidates.len().min(MAX_SHADOWED_LIGHTS)];
         let rank = |entry: u32| selected.iter().position(|c| c.entry == entry);
 
         let mut pending: Vec<(usize, usize, u32)> = Vec::new();
         for slot in 0..MAX_SHADOWED_LIGHTS {
             let Some(current) = self.slots[slot] else { continue };
-            let Some(r) = rank(current.caster.entry) else {
+            let Some(r) = rank(current.entry) else {
                 self.release(slot);
                 continue;
             };
             let c = &selected[r];
-            let size = tile_size(c.coverage, Some(current.caster.tiles[0].size));
-            if size != current.caster.tiles[0].size || c.spot.is_some() != current.caster.spot.is_some() {
+            let size = tile_size(c.coverage, Some(current.tiles[0].size));
+            if size != current.tiles[0].size || c.spot.is_some() != current.spot.is_some() {
                 self.release(slot);
                 pending.push((r, slot, size));
             } else {
-                let caster = ShadowCaster { origin: c.origin, range: c.range, spot: c.spot, ..current.caster };
-                self.slots[slot] = Some(Slot { caster, half_size: c.half_size });
+                let caster = ShadowCaster {
+                    origin: c.origin,
+                    range: c.range,
+                    spot: c.spot,
+                    half_size: c.half_size,
+                    rank: r as u32,
+                    ..current
+                };
+                self.slots[slot] = Some(caster);
             }
         }
         for (r, c) in selected.iter().enumerate() {
-            let placed = self.slots.iter().flatten().any(|s| s.caster.entry == c.entry)
+            let placed = self.slots.iter().flatten().any(|s| s.entry == c.entry)
                 || pending.iter().any(|&(pr, ..)| pr == r);
             if placed {
                 continue;
@@ -101,11 +102,18 @@ impl ShadowSlots {
             let c = &selected[r];
             let faces = if c.spot.is_some() { 1 } else { 6 };
             if let Some(tiles) = self.alloc_faces(faces, size, r, &rank) {
-                let caster = ShadowCaster { entry: c.entry, origin: c.origin, range: c.range, spot: c.spot, tiles };
-                self.slots[slot] = Some(Slot { caster, half_size: c.half_size });
+                self.slots[slot] = Some(ShadowCaster {
+                    entry: c.entry,
+                    origin: c.origin,
+                    range: c.range,
+                    spot: c.spot,
+                    tiles,
+                    half_size: c.half_size,
+                    rank: r as u32,
+                });
             }
         }
-        self.slots.map(|s| s.map(|s| (s.caster, s.half_size)))
+        self.slots
     }
 
     /// `faces` tiles of `size`, or of a smaller size if the atlas is too full. When even
@@ -130,7 +138,7 @@ impl ShadowSlots {
                 size /= 2;
             }
             let victim = (0..MAX_SHADOWED_LIGHTS)
-                .filter_map(|s| Some((s, rank_of(self.slots[s]?.caster.entry)?)))
+                .filter_map(|s| Some((s, rank_of(self.slots[s]?.entry)?)))
                 .filter(|&(_, r)| r > rank)
                 .max_by_key(|&(_, r)| r)?;
             self.release(victim.0);
@@ -139,7 +147,7 @@ impl ShadowSlots {
 
     fn release(&mut self, slot: usize) {
         if let Some(s) = self.slots[slot].take() {
-            for &tile in &s.caster.tiles[..s.caster.faces()] {
+            for &tile in &s.tiles[..s.faces()] {
                 self.atlas.free(tile);
             }
         }
@@ -169,9 +177,15 @@ mod tests {
     fn keeps_slots_and_tiles_while_selected() {
         let mut slots = ShadowSlots::default();
         let first = slots.update(&[candidate(1, 3.0, 2.0), candidate(2, 2.0, 2.0)]);
-        // Ranking flips: same slots, same tiles.
+        // Ranking flips: same slots, same tiles, only the ranks swap.
         let second = slots.update(&[candidate(2, 3.0, 2.0), candidate(1, 2.0, 2.0)]);
-        assert_eq!(first, second);
+        for (a, b) in first.iter().zip(&second) {
+            assert_eq!(a.is_some(), b.is_some());
+            if let (Some(a), Some(b)) = (a, b) {
+                assert!(a.renders_like(b));
+            }
+        }
+        assert_eq!(second[0].map(|c| c.rank), Some(1));
     }
 
     #[test]
@@ -188,7 +202,7 @@ mod tests {
         // 32 cube lights all wanting 512² faces: 192 faces against the 64 the atlas holds.
         let candidates: Vec<_> = (0..MAX_SHADOWED_LIGHTS as u32).map(|i| candidate(i, 100.0 - i as f32, 2.0)).collect();
         let result = slots.update(&candidates);
-        let shadowed: Vec<_> = result.iter().flatten().map(|(c, _)| c.entry).collect();
+        let shadowed: Vec<_> = result.iter().flatten().map(|c| c.entry).collect();
         assert!(shadowed.len() >= 10, "only {} lights got tiles", shadowed.len());
         let first_missing = (0..MAX_SHADOWED_LIGHTS as u32).find(|e| !shadowed.contains(e)).expect("some light misses out");
         assert!(shadowed.iter().all(|&e| e < first_missing), "a lower-ranked light kept tiles over {first_missing}");
@@ -197,6 +211,6 @@ mod tests {
         let mut fewer = candidates.clone();
         fewer.remove(0);
         let after = slots.update(&fewer);
-        assert!(after.iter().flatten().any(|(c, _)| c.entry == first_missing));
+        assert!(after.iter().flatten().any(|c| c.entry == first_missing));
     }
 }

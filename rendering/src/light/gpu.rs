@@ -54,18 +54,14 @@ pub struct GpuSkyLight {
 }
 
 /// Local lights with a shadow map in the atlas, one slot each; lights point at theirs through
-/// `shadow_slot`. `lights[slot]` is the shadow origin in world space (xyz) and the light's half
-/// size (w: half extent for area lights, source radius for point and spot lights), which sets the
-/// penumbra. `shapes[slot]` is (face count: 6 for a cube, 1 for a spot, tan of half the field of
-/// view, near plane, far plane). Faces are `slot * 6 + face` in `LocalShadowParams`. Slots can be empty; `count` is
-/// one past the last used slot.
+/// `shadow_slot`. Everything about a slot's map (origin, planes, tiles) is in the `shadow` pass's
+/// `LocalShadowParams`, written when the map is rendered, since rendering can lag the light.
+/// `count` is one past the last used slot.
 #[repr(C)]
 #[derive(Copy, Clone, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShadowedLights {
     pub count: u32,
     pub _pad: [u32; 3],
-    pub lights: [[f32; 4]; MAX_SHADOWED_LIGHTS],
-    pub shapes: [[f32; 4]; MAX_SHADOWED_LIGHTS],
 }
 
 /// A single-tile spot light shadow: the light's direction and tan of half the field of view.
@@ -86,6 +82,11 @@ pub struct ShadowCaster {
     /// `None`: a cube, six faces in `tiles`. `Some`: one face in `tiles[0]`.
     pub spot: Option<SpotShadow>,
     pub tiles: [Tile; 6],
+    /// The light's half size (half extent for area lights, source radius for point and spot
+    /// lights), which sets the penumbra.
+    pub half_size: f32,
+    /// Rank among this frame's shadowed lights, 0 the most important. Orders re-renders.
+    pub rank: u32,
 }
 
 /// Near plane of every local light face.
@@ -99,6 +100,11 @@ impl ShadowCaster {
     /// Near and far planes of its faces' projections.
     pub fn planes(&self) -> (f32, f32) {
         (LOCAL_SHADOW_NEAR, self.range.max(LOCAL_SHADOW_NEAR * 2.0))
+    }
+
+    /// Whether this light's maps would be drawn differently from `other`'s (rank aside).
+    pub fn renders_like(&self, other: &Self) -> bool {
+        Self { rank: 0, ..*self } == Self { rank: 0, ..*other }
     }
 }
 
