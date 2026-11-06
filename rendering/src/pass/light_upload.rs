@@ -13,8 +13,9 @@ use crate::{
         emissive::{self, EmissiveRect},
         AreaLight, GpuAreaLight, GpuPointLight, GpuSkyLight, GpuSpotLight, LightCounts,
         MAX_AREA_LIGHTS, MAX_POINT_LIGHTS, MAX_SKY_LIGHTS, MAX_SPOT_LIGHTS, PointLight, SkyLight,
-        SpotLight, MAX_SHADOWED_LIGHTS, SHADOW_ENTRY_NONE, SHADOW_KIND_AREA, SHADOW_KIND_POINT, SHADOW_KIND_SPOT, ShadowCaster,
-        ShadowedLights, SharedShadowCasters,
+        SpotLight, SHADOW_KIND_AREA, SHADOW_KIND_POINT, SHADOW_KIND_SPOT, SHADOW_SLOT_NONE, ShadowedLights,
+        SharedShadowCasters, SpotShadow,
+        shadow_slots::{ShadowCandidate, ShadowSlots},
     },
     mesh::Mesh,
     pass::{PassContext, Pass, PassDesc},
@@ -28,6 +29,11 @@ const MIN_SHADOW_ILLUMINANCE: f32 = 1e-3;
 const MAX_AREA_SHADOW_RANGE: f32 = 50.0;
 /// How far in front of a one-sided area light its shadow map is centred.
 const AREA_SHADOW_OFFSET: f32 = 0.02;
+/// Spot lights up to this outer angle get one atlas tile instead of a cube.
+const MAX_SPOT_SHADOW_ANGLE: f32 = std::f32::consts::FRAC_PI_3;
+/// Extra field of view around a spot's outer cone, so PCF and the normal offset near the cone's
+/// edge still land on the map.
+const SPOT_SHADOW_MARGIN: f32 = 0.1;
 
 pub struct LightBuffers {
     pub point_buffer_id: ResourceId,
@@ -49,6 +55,7 @@ pub struct LightUploadPass {
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
     /// The slots picked this frame, for `ShadowPass` to render.
     shadow_casters: SharedShadowCasters,
+    shadow_slots: ShadowSlots,
 }
 
 impl LightUploadPass {
@@ -102,6 +109,7 @@ impl LightUploadPass {
             emissive_means: HashMap::new(),
             debug_flags,
             shadow_casters,
+            shadow_slots: ShadowSlots::default(),
             buffers: LightBuffers {
                 point_buffer_id,
                 spot_buffer_id,
@@ -231,7 +239,7 @@ impl Pass for LightUploadPass {
             areas.extend(self.emissive_lights(world).into_iter().take(free));
         }
 
-        let point_lights: Vec<GpuPointLight> = points
+        let mut point_lights: Vec<GpuPointLight> = points
             .iter()
             .take(MAX_POINT_LIGHTS)
             .map(|l| GpuPointLight {
@@ -240,11 +248,12 @@ impl Pass for LightUploadPass {
                 color: l.color.into(),
                 intensity: l.intensity,
                 source_radius: l.source_radius,
-                _pad: [0.0; 3],
+                shadow_slot: SHADOW_SLOT_NONE,
+                _pad: [0.0; 2],
             })
             .collect();
 
-        let spot_lights: Vec<GpuSpotLight> = spots
+        let mut spot_lights: Vec<GpuSpotLight> = spots
             .iter()
             .take(MAX_SPOT_LIGHTS)
             .map(|l| GpuSpotLight {
@@ -256,7 +265,8 @@ impl Pass for LightUploadPass {
                 outer_cos: l.outer_angle.cos(),
                 intensity: l.intensity,
                 source_radius: l.source_radius,
-                _pad: [0.0; 2],
+                shadow_slot: SHADOW_SLOT_NONE,
+                _pad: 0.0,
             })
             .collect();
 
@@ -266,25 +276,40 @@ impl Pass for LightUploadPass {
             right_vs: dir_to_vs(l.right),
             two_sided: if l.two_sided { 1.0 } else { 0.0 },
             up_vs: dir_to_vs(l.up),
-            _pad1: 0.0,
+            shadow_slot: SHADOW_SLOT_NONE,
             color: l.color.into(),
             _pad2: 0.0,
         };
-        let area_lights: Vec<GpuAreaLight> = areas.iter().map(to_gpu).collect();
+        let mut area_lights: Vec<GpuAreaLight> = areas.iter().map(to_gpu).collect();
 
         // The lights most likely to matter on screen: flux over squared distance to the camera.
-        let importance = |position: ultraviolet::Vec3, flux: f32| flux / ((position - camera.eye).mag_sq() + 1.0);
+        let candidate = |kind: u32, i: usize, position: ultraviolet::Vec3, origin, range: f32, flux: f32, half_size, spot| {
+            let distance = (position - camera.eye).mag();
+            ShadowCandidate {
+                score: flux / (distance * distance + 1.0),
+                entry: kind << 16 | i as u32,
+                origin,
+                range,
+                spot,
+                half_size,
+                coverage: range / distance.max(1e-3),
+            }
+        };
         let four_pi = 4.0 * std::f32::consts::PI;
-        let caster = |kind: u32, i: usize, origin, range| ShadowCaster { entry: kind << 16 | i as u32, origin, range };
-        let mut candidates: Vec<(f32, ShadowCaster, f32)> = points
+        let mut candidates: Vec<ShadowCandidate> = points
             .iter()
             .take(MAX_POINT_LIGHTS)
             .enumerate()
             .map(|(i, l)| {
-                (importance(l.position, four_pi * l.intensity), caster(SHADOW_KIND_POINT, i, l.position, l.radius), l.source_radius)
+                candidate(SHADOW_KIND_POINT, i, l.position, l.position, l.radius, four_pi * l.intensity, l.source_radius, None)
             })
             .chain(spots.iter().take(MAX_SPOT_LIGHTS).enumerate().map(|(i, l)| {
-                (importance(l.position, four_pi * l.intensity), caster(SHADOW_KIND_SPOT, i, l.position, l.radius), l.source_radius)
+                let spot = (l.outer_angle <= MAX_SPOT_SHADOW_ANGLE).then(|| SpotShadow {
+                    direction: l.direction.normalized(),
+                    tan_half_fov: (l.outer_angle + SPOT_SHADOW_MARGIN).tan(),
+                });
+                let flux = four_pi * l.intensity;
+                candidate(SHADOW_KIND_SPOT, i, l.position, l.position, l.radius, flux, l.source_radius, spot)
             }))
             .chain(areas.iter().enumerate().map(|(i, l)| {
                 let sides = if l.two_sided { 2.0 } else { 1.0 };
@@ -299,39 +324,32 @@ impl Pass for LightUploadPass {
                     l.position + l.right.cross(l.up).normalized() * AREA_SHADOW_OFFSET
                 };
                 let half_size = l.right.mag().max(l.up.mag());
-                (importance(l.position, flux), caster(SHADOW_KIND_AREA, i, origin, range), half_size)
+                candidate(SHADOW_KIND_AREA, i, l.position, origin, range, flux, half_size, None)
             }))
-            .filter(|(score, ..)| *score > 0.0)
+            .filter(|c| c.score > 0.0)
             .collect();
-        candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
-
-        // A light keeps its slot while it stays selected, so its cube map stays cached when the
-        // ranking reshuffles as the camera moves.
-        let selected = &candidates[..candidates.len().min(if shadows { MAX_SHADOWED_LIGHTS } else { 0 })];
-        let mut shared = self.shadow_casters.lock().expect("shadow_casters poisoned");
-        let mut slots: [Option<(ShadowCaster, f32)>; MAX_SHADOWED_LIGHTS] = [None; MAX_SHADOWED_LIGHTS];
-        for (slot, previous) in shared.iter().enumerate() {
-            slots[slot] = previous
-                .and_then(|p| selected.iter().find(|(_, c, _)| c.entry == p.entry))
-                .map(|&(_, c, half_size)| (c, half_size));
-        }
-        for &(_, caster, half_size) in selected {
-            if slots.iter().flatten().all(|(c, _)| c.entry != caster.entry)
-                && let Some(free) = slots.iter_mut().find(|s| s.is_none())
-            {
-                *free = Some((caster, half_size));
-            }
+        candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+        if !shadows {
+            candidates.clear();
         }
 
-        let mut shadowed = ShadowedLights { entries: [SHADOW_ENTRY_NONE; MAX_SHADOWED_LIGHTS], ..Default::default() };
+        let slots = self.shadow_slots.update(&candidates);
+        let mut shadowed = ShadowedLights::default();
         for (slot, entry) in slots.iter().enumerate() {
             let Some((caster, half_size)) = *entry else { continue };
-            shadowed.entries[slot] = caster.entry;
+            let index = (caster.entry & 0xffff) as usize;
+            let slot_id = slot as u32;
+            match caster.entry >> 16 {
+                SHADOW_KIND_POINT => point_lights[index].shadow_slot = slot_id,
+                SHADOW_KIND_SPOT => spot_lights[index].shadow_slot = slot_id,
+                _ => area_lights[index].shadow_slot = slot_id,
+            }
             shadowed.lights[slot] = [caster.origin.x, caster.origin.y, caster.origin.z, half_size];
-            shadowed.count = slot as u32 + 1;
+            let tan_half_fov = caster.spot.map_or(1.0, |s| s.tan_half_fov);
+            shadowed.shapes[slot] = [caster.faces() as f32, tan_half_fov, 0.0, 0.0];
+            shadowed.count = slot_id + 1;
         }
-        *shared = slots.map(|s| s.map(|(c, _)| c));
-        drop(shared);
+        *self.shadow_casters.lock().expect("shadow_casters poisoned") = slots.map(|s| s.map(|(c, _)| c));
 
         let sky_lights: Vec<GpuSkyLight> = world
             .get_entities::<SkyLight>()

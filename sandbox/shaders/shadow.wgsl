@@ -130,3 +130,18 @@ fn fs_glass(in: GlassOutput) -> @location(0) vec4<f32> {
     let through = (1.0 - base.a) + base.a * transmission * pow(1.0 - fresnel, interfaces) * tint;
     return vec4f(through, in.depth);
 }
+
+// Clears one atlas tile (rendering::pass::shadow): a load-op clear would wipe the whole atlas, so
+// a triangle covering the tile's viewport writes the far depth (and, with `fs_clear_tint`, the
+// tint clear value).
+@vertex
+fn vs_clear(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    return vec4<f32>(uv * 2.0 - 1.0, 1.0, 1.0);
+}
+
+// Mirrors GLASS_TINT_CLEAR: no tint, and a depth beyond any receiver.
+@fragment
+fn fs_clear_tint() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0e4);
+}

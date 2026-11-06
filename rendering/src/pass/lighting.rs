@@ -221,10 +221,10 @@ impl LightingBindings {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                         count: None,
                     },
-                    texture_entry(3, wgpu::TextureViewDimension::D2Array, wgpu::TextureSampleType::Depth),
+                    texture_entry(3, wgpu::TextureViewDimension::D2, wgpu::TextureSampleType::Depth),
                     uniform_entry(4, fragment),
                     texture_entry(5, wgpu::TextureViewDimension::D2Array, FILTERABLE),
-                    texture_entry(6, wgpu::TextureViewDimension::D2Array, FILTERABLE),
+                    texture_entry(6, wgpu::TextureViewDimension::D2, FILTERABLE),
                 ],
             });
             let probe = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

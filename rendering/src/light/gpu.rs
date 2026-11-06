@@ -1,3 +1,5 @@
+use super::shadow_atlas::Tile;
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuPointLight {
@@ -6,7 +8,9 @@ pub struct GpuPointLight {
     pub color: [f32; 3],
     pub intensity: f32,
     pub source_radius: f32,
-    pub _pad: [f32; 3],
+    /// Index into `ShadowedLights`, or `SHADOW_SLOT_NONE`.
+    pub shadow_slot: u32,
+    pub _pad: [f32; 2],
 }
 
 #[repr(C)]
@@ -20,7 +24,9 @@ pub struct GpuSpotLight {
     pub outer_cos: f32,
     pub intensity: f32,
     pub source_radius: f32,
-    pub _pad: [f32; 2],
+    /// Index into `ShadowedLights`, or `SHADOW_SLOT_NONE`.
+    pub shadow_slot: u32,
+    pub _pad: f32,
 }
 
 #[repr(C)]
@@ -32,7 +38,8 @@ pub struct GpuAreaLight {
     /// 1 = emits from both faces, 0 = only toward `right × up`.
     pub two_sided: f32,
     pub up_vs: [f32; 3],
-    pub _pad1: f32,
+    /// Index into `ShadowedLights`, or `SHADOW_SLOT_NONE`.
+    pub shadow_slot: u32,
     pub color: [f32; 3],
     pub _pad2: f32,
 }
@@ -46,38 +53,57 @@ pub struct GpuSkyLight {
     pub _pad: f32,
 }
 
-/// Local lights that get a cube shadow map, one slot each. An entry is `kind << 16 | index` into
-/// that kind's light buffer (`SHADOW_KIND_*`). `lights[slot]` is the shadow origin in world space
-/// (xyz) and the light's half size (w: half extent for area lights, source radius for point and
-/// spot lights), which widens the PCF. Slots
-/// can be empty (`SHADOW_ENTRY_NONE`); `count` is one past the last used slot.
+/// Local lights with a shadow map in the atlas, one slot each; lights point at theirs through
+/// `shadow_slot`. `lights[slot]` is the shadow origin in world space (xyz) and the light's half
+/// size (w: half extent for area lights, source radius for point and spot lights), which widens
+/// the PCF. `shapes[slot]` is (face count: 6 for a cube, 1 for a spot, tan of half the field of
+/// view, 0, 0). Faces are `slot * 6 + face` in `LocalShadowParams`. Slots can be empty; `count` is
+/// one past the last used slot.
 #[repr(C)]
 #[derive(Copy, Clone, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShadowedLights {
-    pub entries: [u32; MAX_SHADOWED_LIGHTS],
     pub count: u32,
     pub _pad: [u32; 3],
     pub lights: [[f32; 4]; MAX_SHADOWED_LIGHTS],
+    pub shapes: [[f32; 4]; MAX_SHADOWED_LIGHTS],
 }
 
-/// What the shadow pass needs to render a slot's cube map. Shared from `light_upload` to `shadow`.
+/// A single-tile spot light shadow: the light's direction and tan of half the field of view.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct SpotShadow {
+    pub direction: ultraviolet::Vec3,
+    pub tan_half_fov: f32,
+}
+
+/// What the shadow pass needs to render a slot. Shared from `light_upload` to `shadow`.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ShadowCaster {
+    /// `kind << 16 | index` into that kind's light list (`SHADOW_KIND_*`), CPU-side identity.
     pub entry: u32,
     pub origin: ultraviolet::Vec3,
-    /// Far plane of the cube faces: the light's range.
+    /// Far plane of the faces: the light's range.
     pub range: f32,
+    /// `None`: a cube, six faces in `tiles`. `Some`: one face in `tiles[0]`.
+    pub spot: Option<SpotShadow>,
+    pub tiles: [Tile; 6],
+}
+
+impl ShadowCaster {
+    pub fn faces(&self) -> usize {
+        if self.spot.is_some() { 1 } else { 6 }
+    }
 }
 
 pub type SharedShadowCasters = std::sync::Arc<std::sync::Mutex<[Option<ShadowCaster>; MAX_SHADOWED_LIGHTS]>>;
 
-/// Mirrored by `MAX_SHADOWED_LIGHTS` in `lighting.wgsl`; a multiple of 4 (`entries` is an array of
-/// `vec4<u32>` there). Each slot costs a 6 × 512² depth cube and a glass tint cube, about 18 MB.
-pub const MAX_SHADOWED_LIGHTS: usize = 8;
+/// Mirrored by `MAX_SHADOWED_LIGHTS` in `lighting.wgsl` (with `LocalShadowParams` holding 6 faces
+/// per slot). Lights share the tiles of one atlas (`shadow_atlas`), so this only bounds the
+/// uniforms and the per-frame selection.
+pub const MAX_SHADOWED_LIGHTS: usize = 32;
 pub const SHADOW_KIND_POINT: u32 = 0;
 pub const SHADOW_KIND_SPOT: u32 = 1;
 pub const SHADOW_KIND_AREA: u32 = 2;
-pub const SHADOW_ENTRY_NONE: u32 = u32::MAX;
+pub const SHADOW_SLOT_NONE: u32 = u32::MAX;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
