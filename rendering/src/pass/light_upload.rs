@@ -346,7 +346,8 @@ impl Pass for LightUploadPass {
             }
             shadowed.lights[slot] = [caster.origin.x, caster.origin.y, caster.origin.z, half_size];
             let tan_half_fov = caster.spot.map_or(1.0, |s| s.tan_half_fov);
-            shadowed.shapes[slot] = [caster.faces() as f32, tan_half_fov, 0.0, 0.0];
+            let (near, far) = caster.planes();
+            shadowed.shapes[slot] = [caster.faces() as f32, tan_half_fov, near, far];
             shadowed.count = slot_id + 1;
         }
         *self.shadow_casters.lock().expect("shadow_casters poisoned") = slots.map(|s| s.map(|(c, _)| c));

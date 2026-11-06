@@ -82,7 +82,11 @@ const SHADOW_SLOT_NONE: u32 = 0xffffffffu;
 @group(4) @binding(1) var<uniform> shadowed: ShadowedLights;
 
 
-// 12-tap Poisson disc on the unit disc, for cube shadow PCF.
+// Widest blocker search and PCF kernel of a local light shadow, in texels of its face: 12 taps
+// get sparse beyond this.
+const MAX_PENUMBRA_TEXELS: f32 = 16.0;
+
+// 12-tap Poisson disc on the unit disc, for local light shadow PCF.
 const POISSON: array<vec2<f32>, 12> = array<vec2<f32>, 12>(
     vec2f(-0.326, -0.406), vec2f(-0.840, -0.074), vec2f(-0.696,  0.457),
     vec2f(-0.203,  0.621), vec2f( 0.962, -0.195), vec2f( 0.473, -0.480),
@@ -93,8 +97,10 @@ const POISSON: array<vec2<f32>, 12> = array<vec2<f32>, 12>(
 // Visibility of shadowed light `slot` at world position `pos` (normal `N`), from its faces in the
 // shadow atlas: a cube picks the face by the dominant axis of the light-to-point direction, a spot
 // has one. The face is projected with its own view-projection so the lookup matches what was
-// rasterized, and every tap stays inside the face's tile. Area and sphere lights widen the PCF by
-// their size over the distance, a cheap stand-in for a penumbra.
+// rasterized, and every tap stays inside the face's tile. Area and sphere lights get penumbrae
+// from their size (PCSS): a blocker search finds the average occluder depth, and the PCF radius
+// is the light's size × (receiver − blocker) / blocker, so shadows are sharp at contact and
+// soften away from it.
 fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
     let light = shadowed.lights[slot];
     let shape = shadowed.shapes[slot];
@@ -114,10 +120,6 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> ve
     let f = local_shadow.faces[slot * 6u + face];
     let size = f.rect.w;
     let tan_half = shape.y;
-
-    // Light size over distance, in texels of this face: the face spans 2·tan_half across per unit.
-    let radius_texels = select(1.5, clamp(light.w / max(dist, 1e-3) * size / (2.0 * tan_half), 1.5, 8.0), light.w > 0.0);
-    let radius = radius_texels / size;
 
     // World size of a texel at this distance: offset by ~1.5 of them along the normal.
     let texel = 2.0 * dist * tan_half / size;
@@ -149,23 +151,60 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> ve
     if abs(det) > 1e-12 {
         slope = vec2f(dz1 * du2.y - dz2 * du1.y, du1.x * dz2 - du2.x * dz1) / det;
     }
-    // At most the depth change of moving one kernel radius along the light ray.
-    let cap = vp * vec4f(p - (d / dist) * (radius_texels * texel), 1.0);
-    let max_dz = abs(cap.z / cap.w - ndc.z);
+    // The slope's offset is capped at the depth change of moving along the light ray by as far
+    // as the tap moved sideways: per texel here, times the kernel radius below.
+    let cap = vp * vec4f(p - (d / dist) * texel, 1.0);
+    let max_dz_per_texel = abs(cap.z / cap.w - ndc.z);
 
     // Taps stay half a texel inside the tile, so bilinear comparisons never read a neighbour's.
     let half_texel = 0.5 / size;
     let angle = fract(52.9829189 * fract(dot(pixel, vec2f(0.06711056, 0.00583715)))) * 6.28318531;
     let rot = mat2x2<f32>(cos(angle), sin(angle), -sin(angle), cos(angle));
-    var lit = 0.0;
-    for (var i = 0u; i < 12u; i++) {
-        let offset = rot * POISSON[i] * radius;
-        let tap = clamp(uv + offset, vec2f(half_texel), vec2f(1.0 - half_texel));
-        let depth = ndc.z + clamp(dot(slope, offset), -max_dz, max_dz);
-        lit += textureSampleCompareLevel(t_local_shadow, s_shadow, f.rect.xy + tap * f.rect.z, depth);
+    // Tangent of the field of view to texels of this face.
+    let to_texels = size / (2.0 * tan_half);
+
+    var radius_texels = 1.5;
+    if light.w > 0.0 {
+        // Blocker search over where occluders as far as two thirds of the way back to the light
+        // can still partly hide it: light size × (receiver − blocker) / (receiver × blocker).
+        let receiver = clip.w;
+        let search_texels = clamp(2.0 * light.w / receiver * to_texels, 1.5, MAX_PENUMBRA_TEXELS);
+        let atlas = vec2f(textureDimensions(t_local_shadow));
+        var blockers = 0.0;
+        var blocker_depth = 0.0;
+        for (var i = 0u; i < 12u; i++) {
+            let offset = rot * POISSON[i] * (search_texels / size);
+            let tap = clamp(uv + offset, vec2f(half_texel), vec2f(1.0 - half_texel));
+            let max_dz = max_dz_per_texel * search_texels;
+            let reference = ndc.z + clamp(dot(slope, offset), -max_dz, max_dz);
+            let z = textureLoad(t_local_shadow, vec2<i32>((f.rect.xy + tap * f.rect.z) * atlas), 0);
+            if z < reference {
+                blockers += 1.0;
+                blocker_depth += shape.z * shape.w / (shape.w - z * (shape.w - shape.z));
+            }
+        }
+        if blockers == 0.0 {
+            radius_texels = 0.0;
+        } else {
+            let blocker = blocker_depth / blockers;
+            radius_texels = clamp(light.w * max(receiver - blocker, 0.0) / (receiver * blocker) * to_texels, 1.5, MAX_PENUMBRA_TEXELS);
+        }
     }
-    if lit == 0.0 {
-        return vec3f(0.0);
+
+    var lit = 12.0;
+    if radius_texels > 0.0 {
+        let radius = radius_texels / size;
+        let max_dz = max_dz_per_texel * radius_texels;
+        lit = 0.0;
+        for (var i = 0u; i < 12u; i++) {
+            let offset = rot * POISSON[i] * radius;
+            let tap = clamp(uv + offset, vec2f(half_texel), vec2f(1.0 - half_texel));
+            let depth = ndc.z + clamp(dot(slope, offset), -max_dz, max_dz);
+            lit += textureSampleCompareLevel(t_local_shadow, s_shadow, f.rect.xy + tap * f.rect.z, depth);
+        }
+        if lit == 0.0 {
+            return vec3f(0.0);
+        }
     }
     // One glass-tint texel of slack, so glass doesn't tint itself.
     let tint_size = f.rect.z * f32(textureDimensions(t_local_glass_tint).x);

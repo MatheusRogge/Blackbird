@@ -46,7 +46,6 @@ struct ShadowView {
 
 /// Face slots in `LocalShadowParams`: six per shadowed light (spot lights use the first).
 pub const LOCAL_SHADOW_FACES: usize = MAX_SHADOWED_LIGHTS * 6;
-const LOCAL_SHADOW_NEAR: f32 = 0.02;
 
 /// Glass tint maps (`fs_glass` in `shadow.wgsl`), one layer per cascade / cube face: rgb is the
 /// transmittance of every blended surface along the light ray, a the depth of the one nearest the
@@ -417,18 +416,18 @@ impl ShadowPass {
                 continue;
             }
             self.rendered[slot] = Some((caster, geometry));
-            let far = caster.range.max(LOCAL_SHADOW_NEAR * 2.0);
+            let (near, far) = caster.planes();
             for (face, &tile) in caster.tiles[..caster.faces()].iter().enumerate() {
                 let vp = match caster.spot {
                     Some(spot) => {
                         let fov = 2.0 * spot.tan_half_fov.atan();
                         let up = if spot.direction.y.abs() > 0.99 { Vec3::unit_x() } else { Vec3::unit_y() };
-                        ultraviolet::projection::perspective_wgpu_dx(fov, 1.0, LOCAL_SHADOW_NEAR, far)
+                        ultraviolet::projection::perspective_wgpu_dx(fov, 1.0, near, far)
                             * Mat4::look_at(caster.origin, caster.origin + spot.direction, up)
                     }
                     None => {
                         let (dir, up) = CUBE_FACES[face];
-                        ultraviolet::projection::perspective_wgpu_dx(std::f32::consts::FRAC_PI_2, 1.0, LOCAL_SHADOW_NEAR, far)
+                        ultraviolet::projection::perspective_wgpu_dx(std::f32::consts::FRAC_PI_2, 1.0, near, far)
                             * Mat4::look_at(caster.origin, caster.origin + dir, up)
                     }
                 };

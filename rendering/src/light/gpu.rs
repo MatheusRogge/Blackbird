@@ -55,9 +55,9 @@ pub struct GpuSkyLight {
 
 /// Local lights with a shadow map in the atlas, one slot each; lights point at theirs through
 /// `shadow_slot`. `lights[slot]` is the shadow origin in world space (xyz) and the light's half
-/// size (w: half extent for area lights, source radius for point and spot lights), which widens
-/// the PCF. `shapes[slot]` is (face count: 6 for a cube, 1 for a spot, tan of half the field of
-/// view, 0, 0). Faces are `slot * 6 + face` in `LocalShadowParams`. Slots can be empty; `count` is
+/// size (w: half extent for area lights, source radius for point and spot lights), which sets the
+/// penumbra. `shapes[slot]` is (face count: 6 for a cube, 1 for a spot, tan of half the field of
+/// view, near plane, far plane). Faces are `slot * 6 + face` in `LocalShadowParams`. Slots can be empty; `count` is
 /// one past the last used slot.
 #[repr(C)]
 #[derive(Copy, Clone, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -88,9 +88,17 @@ pub struct ShadowCaster {
     pub tiles: [Tile; 6],
 }
 
+/// Near plane of every local light face.
+const LOCAL_SHADOW_NEAR: f32 = 0.02;
+
 impl ShadowCaster {
     pub fn faces(&self) -> usize {
         if self.spot.is_some() { 1 } else { 6 }
+    }
+
+    /// Near and far planes of its faces' projections.
+    pub fn planes(&self) -> (f32, f32) {
+        (LOCAL_SHADOW_NEAR, self.range.max(LOCAL_SHADOW_NEAR * 2.0))
     }
 }
 
