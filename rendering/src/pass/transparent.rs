@@ -1,9 +1,11 @@
 use std::sync::{Arc, RwLock};
 
 use engine_core::world::World;
+use ultraviolet::{Mat4, Vec2, Vec4};
 
 use crate::{
     arena::GeometryArena,
+    bounds::Aabb,
     camera::Camera,
     debug_flags::{GBufferView, RenderDebugFlags},
     graph::{NodeId, RenderGraph},
@@ -21,6 +23,76 @@ use crate::{
 };
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Most `t_behind` refreshes per frame (see `execute`); past it, glass sees the last copy.
+const MAX_BEHIND_REFRESHES: u32 = 4;
+/// Pixels added around each mesh's projected bounds, for refraction reaching past its silhouette.
+const SCREEN_RECT_PAD: u32 = 16;
+
+/// A pixel rectangle, `x1` / `y1` exclusive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScreenRect {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+impl ScreenRect {
+    fn full((width, height): (u32, u32)) -> Self {
+        Self { x0: 0, y0: 0, x1: width, y1: height }
+    }
+
+    /// The screen area `bounds` (world space) covers under `view_proj`, padded by
+    /// `SCREEN_RECT_PAD`. The whole screen if any corner is behind the camera.
+    fn of_bounds(bounds: &Aabb, view_proj: Mat4, size: (u32, u32)) -> Self {
+        let (mut lo, mut hi) = (Vec2::broadcast(f32::MAX), Vec2::broadcast(f32::MIN));
+        for corner in bounds.corners() {
+            let clip = view_proj * Vec4::new(corner.x, corner.y, corner.z, 1.0);
+            if clip.w <= 1e-4 {
+                return Self::full(size);
+            }
+            let ndc = Vec2::new(clip.x, clip.y) / clip.w;
+            lo = lo.min_by_component(ndc);
+            hi = hi.max_by_component(ndc);
+        }
+        let (w, h) = (size.0 as f32, size.1 as f32);
+        let to_px = |v: f32, extent: f32, pad: f32| (v * extent + pad).clamp(0.0, extent) as u32;
+        let pad = SCREEN_RECT_PAD as f32;
+        Self {
+            x0: to_px(lo.x * 0.5 + 0.5, w, -pad),
+            x1: to_px(hi.x * 0.5 + 0.5, w, pad + 1.0),
+            y0: to_px(0.5 - hi.y * 0.5, h, -pad),
+            y1: to_px(0.5 - lo.y * 0.5, h, pad + 1.0),
+        }
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        self.x0 < other.x1 && other.x0 < self.x1 && self.y0 < other.y1 && other.y0 < self.y1
+    }
+
+    fn union(&self, other: &Self) -> Self {
+        Self {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+
+    /// This rectangle at mip `level` of a `size` texture, padded by 2 texels: each level is a
+    /// 4×4 tent over the one above, so a changed texel reaches its neighbours one level down.
+    fn at_level(&self, level: u32, (width, height): (u32, u32)) -> Self {
+        let (lw, lh) = ((width >> level).max(1), (height >> level).max(1));
+        let down = |v: u32| v >> level;
+        let up = |v: u32| (v + (1 << level) - 1) >> level;
+        Self {
+            x0: down(self.x0).saturating_sub(2),
+            y0: down(self.y0).saturating_sub(2),
+            x1: (up(self.x1) + 2).min(lw),
+            y1: (up(self.y1) + 2).min(lh),
+        }
+    }
+}
 
 struct Pipelines {
     background: wgpu::RenderPipeline,
@@ -38,15 +110,19 @@ struct Pipelines {
     materials: MaterialTextures,
 }
 
-/// The opaque scene with a mip chain, read by transmissive surfaces: refraction samples it off the
-/// fragment's own pixel, and rough surfaces sample a blurrier level.
+/// The scene behind the glass being drawn, with a mip chain: refraction samples it off the
+/// fragment's own pixel, rough surfaces sample a blurrier level and glass reflections read it.
+/// Starts as the opaque scene and is refreshed from the pass's own target where earlier glass
+/// was drawn (see `execute`).
 struct Behind {
     size: (u32, u32),
     view: wgpu::TextureView,
     mips: Vec<wgpu::TextureView>,
-    /// One per level: level 0 reads the scene, level `i` reads level `i - 1`. Keyed by the scene
-    /// view address.
-    blit_bgs: Option<(usize, Vec<wgpu::BindGroup>)>,
+    /// Level 0 copy bind groups, keyed by source view address (the opaque scene and this pass's
+    /// own target).
+    copy_bgs: Vec<(usize, wgpu::BindGroup)>,
+    /// Level `i + 1` reads level `i`.
+    downsample_bgs: Vec<wgpu::BindGroup>,
 }
 
 impl Behind {
@@ -75,7 +151,8 @@ impl Behind {
             size: (width, height),
             view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
             mips,
-            blit_bgs: None,
+            copy_bgs: Vec::new(),
+            downsample_bgs: Vec::new(),
         }
     }
 }
@@ -324,49 +401,95 @@ fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-/// Fills `behind` from `scene`: a copy into level 0, then each level downsampled from the last.
+/// Fills `behind` from `source`: a copy into level 0, then each level downsampled from the last.
+/// With a `region`, only that part of level 0 (and the matching part of each level) is rebuilt and
+/// the rest is kept.
 fn build_behind_chain(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &Pipelines,
     behind: &mut Behind,
-    scene_view: &wgpu::TextureView,
+    source: &wgpu::TextureView,
+    region: Option<ScreenRect>,
 ) {
-    let scene_key = scene_view as *const wgpu::TextureView as usize;
-    if behind.blit_bgs.as_ref().is_none_or(|(k, _)| *k != scene_key) {
-        let sources = std::iter::once(scene_view).chain(&behind.mips);
-        let bind_groups = sources
-            .take(behind.mips.len())
-            .map(|source| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("transparent_blit_bg"),
-                    layout: &pipelines.blit_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&pipelines.sampler) },
-                        wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(source) },
-                    ],
-                })
-            })
-            .collect();
-        behind.blit_bgs = Some((scene_key, bind_groups));
+    let blit_bg = |view: &wgpu::TextureView| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("transparent_blit_bg"),
+            layout: &pipelines.blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&pipelines.sampler) },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(view) },
+            ],
+        })
+    };
+    let source_key = source as *const wgpu::TextureView as usize;
+    if !behind.copy_bgs.iter().any(|(key, _)| *key == source_key) {
+        // Views only change on resize or graph changes, so a stale entry is rare; keep it bounded.
+        if behind.copy_bgs.len() >= 4 {
+            behind.copy_bgs.clear();
+        }
+        behind.copy_bgs.push((source_key, blit_bg(source)));
     }
-    let Some((_, bind_groups)) = behind.blit_bgs.as_ref() else { return };
+    if behind.downsample_bgs.is_empty() {
+        behind.downsample_bgs = behind.mips.iter().take(behind.mips.len() - 1).map(blit_bg).collect();
+    }
+    let Some((_, copy_bg)) = behind.copy_bgs.iter().find(|(key, _)| *key == source_key) else { return };
 
+    let bind_groups = std::iter::once(copy_bg).chain(&behind.downsample_bgs);
     for (level, (target, bind_group)) in behind.mips.iter().zip(bind_groups).enumerate() {
+        let load = if region.is_some() { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::BLACK) };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("transparent_behind_mip"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 depth_slice: None,
                 resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
             })],
             ..Default::default()
         });
+        if let Some(region) = region {
+            let r = if level == 0 { region } else { region.at_level(level as u32, behind.size) };
+            if r.x1 <= r.x0 || r.y1 <= r.y0 {
+                continue;
+            }
+            pass.set_scissor_rect(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+        }
         pass.set_pipeline(if level == 0 { &pipelines.scene_copy } else { &pipelines.scene_downsample });
         pass.set_bind_group(0, bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
+}
+
+/// Opens the forward pass on `output` (cleared or kept per `load`) and binds groups 0–4.
+fn begin_forward<'e>(
+    encoder: &'e mut wgpu::CommandEncoder,
+    output: &wgpu::TextureView,
+    depth: &wgpu::TextureView,
+    load: wgpu::LoadOp<wgpu::Color>,
+    scene_bg: &wgpu::BindGroup,
+    lighting_bgs: [&wgpu::BindGroup; 4],
+) -> wgpu::RenderPass<'e> {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("transparent"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: output,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+        })],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: depth,
+            depth_ops: None,
+            stencil_ops: None,
+        }),
+        ..Default::default()
+    });
+    pass.set_bind_group(0, scene_bg, &[]);
+    for (i, bind_group) in lighting_bgs.into_iter().enumerate() {
+        pass.set_bind_group(i as u32 + 1, bind_group, &[]);
+    }
+    pass
 }
 
 impl PassDesc for TransparentPass {
@@ -437,13 +560,15 @@ impl Pass for TransparentPass {
                 }
                 let bounds = draw.bounds.transformed(h.entity.transform);
                 let distance = ((bounds.min + bounds.max) * 0.5 - eye).mag_sq();
-                Some((distance, h, draw))
+                let rect = ScreenRect::of_bounds(&bounds, view_proj, ctx.surface_size);
+                Some((distance, h, draw, rect))
             })
             .collect();
         meshes.sort_by(|a, b| b.0.total_cmp(&a.0));
 
         let Some(pipelines) = self.pipelines.as_mut() else { return };
-        pipelines.materials.prepare(device, queue, encoder, meshes.iter().map(|(_, h, _)| h.entity));
+        pipelines.materials.prepare(device, queue, encoder, meshes.iter().map(|(_, h, _, _)| h.entity));
+        let pipelines = &*pipelines;
 
         if self.behind.as_ref().is_none_or(|b| b.size != ctx.surface_size) {
             self.behind = Some(Behind::new(device, ctx.surface_size));
@@ -451,10 +576,10 @@ impl Pass for TransparentPass {
         }
         let Some(behind) = self.behind.as_mut() else { return };
         // Every blended surface reflects, so with SSR on the chain is needed for any of them.
-        if screen_reflections && !meshes.is_empty()
-            || meshes.iter().any(|(_, h, _)| h.entity.material.transmission > 0.0)
-        {
-            build_behind_chain(device, encoder, pipelines, behind, scene_view);
+        let any_transmissive = meshes.iter().any(|(_, h, _, _)| h.entity.material.transmission > 0.0);
+        let needs_behind = screen_reflections && !meshes.is_empty() || any_transmissive;
+        if needs_behind {
+            build_behind_chain(device, encoder, pipelines, behind, scene_view, None);
         }
 
         let key = (
@@ -481,26 +606,8 @@ impl Pass for TransparentPass {
         let Some((_, scene_bg)) = self.scene_bg.as_ref() else { return };
         let Some(lighting_bgs) = self.bindings.bind_groups(device, ctx) else { return };
 
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("transparent"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: output_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: depth_view,
-                depth_ops: None,
-                stencil_ops: None,
-            }),
-            ..Default::default()
-        });
-
-        pass.set_bind_group(0, scene_bg, &[]);
-        for (i, bind_group) in lighting_bgs.into_iter().enumerate() {
-            pass.set_bind_group(i as u32 + 1, bind_group, &[]);
-        }
+        let clear = wgpu::LoadOp::Clear(wgpu::Color::BLACK);
+        let mut pass = begin_forward(encoder, output_view, depth_view, clear, scene_bg, lighting_bgs);
         pass.set_pipeline(&pipelines.background);
         pass.set_bind_group(5, pipelines.materials.bind_group(Default::default()), &[]);
         pass.draw(0..3, 0..1);
@@ -508,10 +615,30 @@ impl Pass for TransparentPass {
         if meshes.is_empty() {
             return;
         }
-        pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
-        pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-        for (_, handle, draw) in &meshes {
+        // `t_behind` starts as the opaque scene, so glass behind other glass would be missing from
+        // it. Before a transmissive mesh whose screen area overlaps glass drawn since the last copy,
+        // the copy is refreshed from this pass's own target over that area. Meshes that don't
+        // overlap share a copy, so scattered glass costs nothing extra.
+        let mut dirty: Vec<ScreenRect> = Vec::new();
+        let mut refreshes = 0;
+        for (_, handle, draw, rect) in &meshes {
             let mesh = handle.entity;
+            if needs_behind
+                && mesh.material.transmission > 0.0
+                && refreshes < MAX_BEHIND_REFRESHES
+                && dirty.iter().any(|d| d.overlaps(rect))
+            {
+                drop(pass);
+                let region = dirty.iter().skip(1).fold(dirty[0], |acc, r| acc.union(r));
+                build_behind_chain(device, encoder, pipelines, behind, output_view, Some(region));
+                refreshes += 1;
+                dirty.clear();
+                pass = begin_forward(encoder, output_view, depth_view, wgpu::LoadOp::Load, scene_bg, lighting_bgs);
+            }
+            dirty.push(*rect);
+
+            pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
+            pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
             pass.set_bind_group(5, pipelines.materials.bind_group(material_key(mesh)), &[]);
             if mesh.double_sided {
                 pass.set_pipeline(&pipelines.back);
