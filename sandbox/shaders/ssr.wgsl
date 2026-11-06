@@ -1,7 +1,10 @@
-// Screen-space reflections. Marches the reflection ray across the screen with perspective-correct
-// depth and writes the lit color it hits, premultiplied by a confidence the composite pass blends with.
+// Screen-space reflections. Traces the reflection ray through a Hi-Z depth pyramid (built by the
+// `ssr` pass, rendering/src/pass/hiz.wgsl) and writes the lit color it hits, premultiplied by a
+// confidence the composite pass blends with. `ssr_temporal` accumulates it over frames.
 
-@group(0) @binding(0) var t_depth:           texture_depth_2d;
+// Hi-Z pyramid: level 0 is the G-buffer depth (reversed-Z), each further level the max (nearest)
+// of the texels it covers.
+@group(0) @binding(0) var t_hiz:             texture_2d<f32>;
 @group(0) @binding(1) var t_normal:          texture_2d<f32>;
 @group(0) @binding(2) var t_lit:             texture_2d<f32>;
 // rgb: reflection weight (0 = nothing to reflect), a: roughness. Written by lighting.wgsl.
@@ -26,7 +29,6 @@ struct CameraUniform {
     view_proj:     mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
     inv_view:      mat4x4<f32>,
-    // near, far
     // near, far, frame index
     depth_params:  vec4<f32>,
 }
@@ -35,9 +37,8 @@ struct CameraUniform {
 const MAX_ROUGHNESS:  f32 = 0.4;
 const FADE_ROUGHNESS: f32 = 0.25;
 const MAX_DISTANCE:   f32 = 50.0;
-const MAX_STEPS:      u32 = 64u;
-const STEP_PIXELS:    f32 = 2.0;
-const REFINE_STEPS:   u32 = 6u;
+// Hi-Z cell visits per ray: empty space is crossed in large cells, so this covers long rays.
+const MAX_ITERATIONS: u32 = 64u;
 // A ray counts as hitting a surface when it is behind it by less than this fraction of its depth.
 const THICKNESS:      f32 = 0.03;
 
@@ -67,12 +68,61 @@ fn clip_to_pixel(h: vec4<f32>, dims: vec2<f32>) -> vec2<f32> {
     return vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * dims;
 }
 
+// Hi-Z traversal in screen space, where NDC depth is linear along the ray. `p0` / `dir` are
+// (pixel x, pixel y, NDC depth) at t = 0 and the change up to t = 1. A cell whose nearest depth is
+// behind the ray over the whole stretch the ray spends in it is skipped and the next one is
+// tested a level up; otherwise the trace descends, down to single pixels. Returns the hit's t, or
+// −1 for a miss.
+fn trace_hiz(p0: vec3<f32>, dir: vec3<f32>, t_end: f32, t_start: f32) -> f32 {
+    let max_level = i32(textureNumLevels(t_hiz)) - 1;
+    let eps = 0.01 / max(length(dir.xy), 1.0);
+    let step_up = select(vec2f(0.0), vec2f(1.0), dir.xy > vec2f(0.0));
+    var t = t_start;
+    var level = 0;
+    for (var i = 0u; i < MAX_ITERATIONS; i++) {
+        if t > t_end {
+            break;
+        }
+        let p = p0 + dir * t;
+        let cell_size = f32(1 << u32(level));
+        let cell = min(vec2<i32>(p.xy / cell_size), vec2<i32>(textureDimensions(t_hiz, level)) - 1);
+        let nearest = textureLoad(t_hiz, cell, level).r;
+
+        let bound = (vec2f(cell) + step_up) * cell_size;
+        let tx = select(1e10, (bound.x - p0.x) / dir.x, abs(dir.x) > 1e-6);
+        let ty = select(1e10, (bound.y - p0.y) / dir.y, abs(dir.y) > 1e-6);
+        let t_exit = min(max(min(tx, ty), t), t_end);
+        // Reversed-Z: smaller is farther. The ray's farthest depth in the cell is at one end.
+        let z_far = min(p.z, p0.z + dir.z * t_exit);
+        if z_far > nearest {
+            t = t_exit + eps;
+            level = min(level + 1, max_level);
+            continue;
+        }
+        if level > 0 {
+            level -= 1;
+            continue;
+        }
+        // Level 0: the ray reaches this pixel's surface. Accept it if the ray isn't too far behind
+        // (a thin object it passed behind), else keep walking.
+        if nearest > 0.0 {
+            let surface_w = linear_depth(nearest);
+            if linear_depth(z_far) - surface_w < THICKNESS * surface_w {
+                let t_surface = select(t, (nearest - p0.z) / dir.z, abs(dir.z) > 1e-9);
+                return clamp(t_surface, t, t_exit);
+            }
+        }
+        t = t_exit + eps;
+    }
+    return -1.0;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let px = vec2<i32>(in.pos.xy);
-    let dims = vec2<f32>(textureDimensions(t_depth));
+    let dims = vec2<f32>(textureDimensions(t_hiz));
 
-    let depth = textureLoad(t_depth, px, 0);
+    let depth = textureLoad(t_hiz, px, 0).r;
     let weight = textureLoad(t_specular_weight, px, 0);
     let roughness = weight.a;
     if debug.disable_ssr != 0u || depth == 0.0 || all(weight.rgb == vec3f(0.0)) || roughness > MAX_ROUGHNESS {
@@ -101,51 +151,31 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4f(0.0);
     }
 
-    // March in screen space, interpolating 1/w so depth stays perspective-correct.
     let h0 = camera.view_proj * vec4f(pos, 1.0);
     let h1 = camera.view_proj * vec4f(pos + R * dist, 1.0);
-    let k0 = 1.0 / h0.w;
-    let k1 = 1.0 / h1.w;
-    let p0 = clip_to_pixel(h0, dims);
-    let delta = clip_to_pixel(h1, dims) - p0;
-    let steps = u32(clamp(length(delta) / STEP_PIXELS, 1.0, f32(MAX_STEPS)));
-    // Varies per frame so `ssr_temporal` averages it out.
-    let jitter = interleaved_gradient_noise(in.pos.xy + 5.588238 * camera.depth_params.z);
-
-    var lo = 0.0;
-    var hi = -1.0;
-    for (var i = 1u; i <= steps; i++) {
-        let s = (f32(i) - jitter) / f32(steps);
-        let p = p0 + delta * s;
-        if any(p < vec2f(0.0)) || any(p >= dims) {
-            break;
-        }
-        let scene_d = textureLoad(t_depth, vec2<i32>(p), 0);
-        if scene_d > 0.0 {
-            let scene_w = linear_depth(scene_d);
-            let behind = 1.0 / mix(k0, k1, s) - scene_w;
-            if behind > 0.0 && behind < THICKNESS * scene_w {
-                hi = s;
-                break;
-            }
-        }
-        lo = s;
-    }
-    if hi < 0.0 {
+    let p0 = vec3f(in.pos.xy, h0.z / h0.w);
+    let dir = vec3f(clip_to_pixel(h1, dims), h1.z / h1.w) - p0;
+    let len_px = length(dir.xy);
+    if len_px < 1.0 {
         return vec4f(0.0);
     }
 
-    for (var i = 0u; i < REFINE_STEPS; i++) {
-        let mid = 0.5 * (lo + hi);
-        let scene_d = textureLoad(t_depth, vec2<i32>(p0 + delta * mid), 0);
-        if scene_d > 0.0 && 1.0 / mix(k0, k1, mid) > linear_depth(scene_d) {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
+    // Stop where the ray leaves the screen.
+    var t_end = 1.0;
+    if dir.x > 0.0 { t_end = min(t_end, (dims.x - 0.5 - p0.x) / dir.x); }
+    if dir.x < 0.0 { t_end = min(t_end, (0.5 - p0.x) / dir.x); }
+    if dir.y > 0.0 { t_end = min(t_end, (dims.y - 0.5 - p0.y) / dir.y); }
+    if dir.y < 0.0 { t_end = min(t_end, (0.5 - p0.y) / dir.y); }
+
+    // Start a jittered 1–2 pixels out so the ray leaves its own surface; the jitter varies per
+    // frame for `ssr_temporal`.
+    let jitter = interleaved_gradient_noise(in.pos.xy + 5.588238 * camera.depth_params.z);
+    let hit = trace_hiz(p0, dir, t_end, (1.0 + jitter) / len_px);
+    if hit < 0.0 {
+        return vec4f(0.0);
     }
 
-    let hit_px = p0 + delta * hi;
+    let hit_px = p0.xy + dir.xy * hit;
     let hit_N = normalize(textureLoad(t_normal, vec2<i32>(hit_px), 0).rgb * 2.0 - 1.0);
     if dot(hit_N, R) > 0.0 {
         return vec4f(0.0);
@@ -157,6 +187,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let confidence = smoothstep(0.0, 0.08, min(edge.x, edge.y))
         * (1.0 - smoothstep(FADE_ROUGHNESS, MAX_ROUGHNESS, roughness))
         * (1.0 - smoothstep(0.1, 0.5, R_vs.z))
-        * (1.0 - smoothstep(0.7, 1.0, hi));
+        * (1.0 - smoothstep(0.7, 1.0, hit));
     return vec4f(color * confidence, confidence);
 }

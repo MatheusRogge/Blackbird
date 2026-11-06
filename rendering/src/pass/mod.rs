@@ -13,6 +13,7 @@ pub mod probe_atlas;
 pub mod probe_trace;
 pub mod probe_update;
 pub mod reflection_probe;
+pub mod ssr;
 pub mod ssr_temporal;
 pub mod shadow;
 pub mod transparent;

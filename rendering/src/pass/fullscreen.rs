@@ -7,28 +7,15 @@ use crate::{
     shader::ShaderAsset,
 };
 
-#[derive(Clone, Copy)]
-pub enum FullscreenInput {
-    Color(ResourceId),
-    Depth(ResourceId),
-}
-
-impl FullscreenInput {
-    fn id(self) -> ResourceId {
-        match self {
-            Self::Color(id) | Self::Depth(id) => id,
-        }
-    }
-}
-
-/// A fullscreen triangle that reads screen textures and uniforms and writes one screen texture.
+/// A fullscreen triangle that reads filterable color screen textures and uniforms and writes one
+/// screen texture.
 /// The shader's group 0 holds the inputs at bindings `0..n`, then the uniforms, then a linear
 /// clamp-to-edge sampler. Its entry points are `vs_main` and `fs_main`.
 pub struct FullscreenPass {
     name: &'static str,
     node_id: Option<NodeId>,
     shader: ShaderAsset,
-    inputs: Vec<FullscreenInput>,
+    inputs: Vec<ResourceId>,
     uniforms: Vec<ResourceId>,
     output_id: ResourceId,
     output_format: wgpu::TextureFormat,
@@ -41,7 +28,7 @@ impl FullscreenPass {
     pub fn new(
         graph: &mut RenderGraph,
         name: &'static str,
-        inputs: Vec<FullscreenInput>,
+        inputs: Vec<ResourceId>,
         uniforms: Vec<ResourceId>,
         output_format: wgpu::TextureFormat,
         shader: ShaderAsset,
@@ -67,15 +54,13 @@ impl FullscreenPass {
     fn create_pipeline(&self, device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::Sampler) {
         let module = self.shader.compile(device).expect("fullscreen shader compilation failed");
 
-        let textures = self.inputs.iter().map(|input| match input {
-            FullscreenInput::Color(_) => wgpu::TextureSampleType::Float { filterable: true },
-            FullscreenInput::Depth(_) => wgpu::TextureSampleType::Depth,
-        });
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = textures
-            .map(|sample_type| wgpu::BindingType::Texture {
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = self
+            .inputs
+            .iter()
+            .map(|_| wgpu::BindingType::Texture {
                 multisampled: false,
                 view_dimension: wgpu::TextureViewDimension::D2,
-                sample_type,
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
             })
             .chain(self.uniforms.iter().map(|_| wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
@@ -142,7 +127,7 @@ impl PassDesc for FullscreenPass {
     }
 
     fn reads(&self) -> Vec<ResourceId> {
-        self.inputs.iter().map(|i| i.id()).chain(self.uniforms.iter().copied()).collect()
+        self.inputs.iter().chain(&self.uniforms).copied().collect()
     }
 
     fn writes(&self) -> Vec<ResourceId> {
@@ -168,7 +153,7 @@ impl Pass for FullscreenPass {
         _world: &World,
     ) {
         let Some(&output_view) = ctx.views.get(&self.output_id) else { return };
-        let Some(views) = self.inputs.iter().map(|i| ctx.views.get(&i.id()).copied()).collect::<Option<Vec<_>>>()
+        let Some(views) = self.inputs.iter().map(|id| ctx.views.get(id).copied()).collect::<Option<Vec<_>>>()
         else {
             return;
         };

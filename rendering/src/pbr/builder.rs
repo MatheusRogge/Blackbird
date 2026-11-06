@@ -9,7 +9,7 @@ use crate::{
         camera::CameraPass,
         cluster_assignment::ClusterAssignmentPass,
         debug_overlay::DebugOverlayPass,
-        fullscreen::{FullscreenInput, FullscreenPass},
+        fullscreen::FullscreenPass,
         gbuffer::GBufferPass,
         light_upload::LightUploadPass,
         lighting::LightingPass,
@@ -18,6 +18,7 @@ use crate::{
         probe_trace::ProbeTracePass,
         probe_update::ProbeUpdatePass,
         reflection_probe::ReflectionProbePass,
+        ssr::{SsrInputs, SsrPass},
         ssr_temporal::SsrTemporalPass,
         shadow::ShadowPass,
         transparent::TransparentPass,
@@ -170,17 +171,16 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         );
         graph.add_pass(device, lighting_pass);
 
-        let (ssr_pass, ssr_id) = FullscreenPass::new(
+        let (ssr_pass, ssr_id) = SsrPass::new(
             &mut graph,
-            "ssr",
-            vec![
-                FullscreenInput::Depth(gbuffer_outputs.depth_id),
-                FullscreenInput::Color(gbuffer_outputs.normal_id),
-                FullscreenInput::Color(lighting_outputs.lit_id),
-                FullscreenInput::Color(lighting_outputs.specular_weight_id),
-            ],
-            vec![camera_buffer_id, lighting_outputs.debug_flags_id],
-            wgpu::TextureFormat::Rgba16Float,
+            SsrInputs {
+                depth_id: gbuffer_outputs.depth_id,
+                normal_id: gbuffer_outputs.normal_id,
+                lit_id: lighting_outputs.lit_id,
+                specular_weight_id: lighting_outputs.specular_weight_id,
+                camera_buffer_id,
+                debug_flags_id: lighting_outputs.debug_flags_id,
+            },
             self.ssr_shader,
         );
         graph.add_pass(device, ssr_pass);
@@ -199,10 +199,10 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             &mut graph,
             "composite",
             vec![
-                FullscreenInput::Color(lighting_outputs.lit_id),
-                FullscreenInput::Color(lighting_outputs.specular_weight_id),
-                FullscreenInput::Color(lighting_outputs.specular_fallback_id),
-                FullscreenInput::Color(ssr_resolved_id),
+                lighting_outputs.lit_id,
+                lighting_outputs.specular_weight_id,
+                lighting_outputs.specular_fallback_id,
+                ssr_resolved_id,
             ],
             vec![],
             wgpu::TextureFormat::Rgba16Float,
