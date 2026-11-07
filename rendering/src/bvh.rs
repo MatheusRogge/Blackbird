@@ -79,11 +79,13 @@ pub struct BvhInfo {
 pub struct BvhBuild {
     pub nodes: Vec<BvhNode>,
     pub triangles: Vec<GpuTriangle>,
+    /// For each of `triangles`, its index in the input.
+    pub order: Vec<u32>,
 }
 
 pub fn build(triangles: Vec<GpuTriangle>) -> BvhBuild {
     if triangles.is_empty() {
-        return BvhBuild { nodes: vec![], triangles: vec![] };
+        return BvhBuild { nodes: vec![], triangles: vec![], order: vec![] };
     }
 
     let centroids: Vec<[f32; 3]> = triangles
@@ -105,7 +107,7 @@ pub fn build(triangles: Vec<GpuTriangle>) -> BvhBuild {
     let ordered: Vec<GpuTriangle> =
         prim_indices.iter().map(|&i| triangles[i as usize]).collect();
 
-    BvhBuild { nodes, triangles: ordered }
+    BvhBuild { nodes, triangles: ordered, order: prim_indices }
 }
 
 fn build_node(

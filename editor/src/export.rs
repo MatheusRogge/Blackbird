@@ -267,6 +267,30 @@ mod tests {
     }
 
     #[test]
+    fn save_keeps_animation_clips() {
+        let json = r#"{
+            "asset": { "version": "2.0" },
+            "scene": 0,
+            "scenes": [{ "nodes": [] }],
+            "extras": { "blackbird_animations": [{ "name": "Flicker", "tracks": [{
+                "pointer": "/materials/0/emissiveFactor", "keys": [{ "time": 0.0, "value": [1, 1, 1] }] }] }] }
+        }"#;
+        let doc = gltf_api::Gltf::from_slice(json.as_bytes()).unwrap().document;
+        let dir = std::env::temp_dir().join(format!("blackbird_animation_test_{}", std::process::id()));
+        let scene_path = dir.join("level.gltf");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let shared = EditorState::new();
+        let mut state = shared.lock().unwrap();
+        state.document = Some(doc);
+        write_gltf(&state, &scene_path).unwrap();
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&scene_path).unwrap()).unwrap();
+        assert_eq!(saved["extras"]["blackbird_animations"][0]["name"], "Flicker");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn relative_uri_climbs_out_of_the_scene_folder() {
         let scene = Path::new("/project/scenes/level.gltf");
         assert_eq!(relative_uri(scene, Path::new("/project/assets/models/chair.gltf")), "../assets/models/chair.gltf");

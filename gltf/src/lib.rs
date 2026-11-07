@@ -1,3 +1,4 @@
+pub mod animation;
 pub mod camera;
 pub mod lights;
 pub mod objects;
@@ -172,12 +173,13 @@ impl TextureCache {
     }
 }
 
+/// Each primitive's `Mesh`, with its material's index (`None` for the default material).
 fn build_mesh_primitives(
     mesh: &gltf::Mesh<'_>,
     buffers: &[gltf::buffer::Data],
     images: &[gltf::image::Data],
     textures: &mut TextureCache,
-) -> Vec<Mesh> {
+) -> Vec<(Mesh, Option<usize>)> {
     let mut out = Vec::new();
 
     for primitive in mesh.primitives() {
@@ -277,12 +279,13 @@ fn build_mesh_primitives(
             gltf::material::AlphaMode::Mask => AlphaMode::Mask(material.alpha_cutoff().unwrap_or(0.5)),
             gltf::material::AlphaMode::Blend => AlphaMode::Blend,
         };
-        out.push(
+        out.push((
             Mesh::new(vertices, indices, albedo_texture, normal_texture)
                 .with_material(factors, metallic_roughness_texture, emissive_texture)
                 .with_alpha_mode(alpha_mode)
                 .with_double_sided(material.double_sided()),
-        );
+            material.index(),
+        ));
     }
 
     out
@@ -360,11 +363,27 @@ pub struct GltfScene {
     node_entities: HashMap<usize, Vec<EntityKey>>,
     node_cameras: HashMap<usize, EntityKey>,
     node_emitters: HashMap<usize, EntityKey>,
+    clips: Vec<animation::PlayingClip>,
+    /// Mesh entities by the index of their material.
+    material_meshes: HashMap<usize, Vec<EntityKey>>,
+    /// Light entities by `KHR_lights_punctual` index, and by `blackbird_lights` index (`bind_lights`).
+    punctual_lights: HashMap<usize, EntityKey>,
+    area_lights: HashMap<usize, EntityKey>,
+    /// Punctual light entities by the node they hang from.
+    node_lights: HashMap<usize, EntityKey>,
+    /// Translation, rotation, scale of the nodes animation has moved.
+    animated_nodes: HashMap<usize, animation::Trs>,
 }
 
 impl GltfScene {
     pub fn new(asset: Arc<GLTFAsset>) -> Self {
         Self {
+            clips: animation::load_clips(&asset.document, &asset.buffers),
+            material_meshes: HashMap::new(),
+            punctual_lights: HashMap::new(),
+            area_lights: HashMap::new(),
+            node_lights: HashMap::new(),
+            animated_nodes: HashMap::new(),
             pending: mesh_nodes(&asset.document),
             root: Mat4::identity(),
             asset,
@@ -432,8 +451,12 @@ impl GltfScene {
             let primitives =
                 build_mesh_primitives(&mesh, &self.asset.buffers, &self.asset.images, &mut self.textures);
             let keys = self.node_entities.entry(node_index).or_default();
-            for entity in primitives {
-                keys.push(world.add_entity(entity.with_transform(self.root * transform)));
+            for (entity, material) in primitives {
+                let key = world.add_entity(entity.with_transform(self.root * transform));
+                keys.push(key);
+                if let Some(material) = material {
+                    self.material_meshes.entry(material).or_default().push(key);
+                }
             }
         }
         self.next_node = end;

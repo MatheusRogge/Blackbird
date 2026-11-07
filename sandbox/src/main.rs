@@ -96,6 +96,7 @@ impl Plugin for MyGame {
         if let Some(scene) = &mut self.scene {
             let mut world = engine.world();
             scene.load_batch(&mut world, 10);
+            scene.animate(&mut world, delta);
         }
     }
 }

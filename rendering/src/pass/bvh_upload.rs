@@ -6,7 +6,10 @@ use bytemuck::bytes_of;
 use engine_core::world::World;
 use ultraviolet::{Mat4, Vec3};
 
+use engine_core::entity::EntityKey;
+
 use crate::{
+    arena::BufferRange,
     bvh::{self, BvhInfo, BvhNode, GpuTriangle, MAX_BVH_NODES, MAX_BVH_TRIS, pack_emissive},
     graph::{NodeId, RenderGraph},
     mesh::Mesh,
@@ -18,6 +21,16 @@ use crate::{
 /// Frames a transform change must stay unchanged before the BVH is rebuilt, so
 /// dragging a mesh doesn't rebuild it every frame.
 const SETTLE_FRAMES: u32 = 10;
+
+/// A mesh in the uploaded BVH, so a change to its emissive (e.g. an animated material) is
+/// written into its triangles without a rebuild.
+struct BuiltMesh {
+    key: EntityKey,
+    /// The packed emissive its triangles carry.
+    emissive: u32,
+    /// Its triangles' indices in the uploaded (BVH-ordered) triangle buffer.
+    triangles: Vec<u32>,
+}
 
 pub struct BvhOutputs {
     pub nodes_id: ResourceId,
@@ -39,6 +52,7 @@ pub struct BvhUploadPass {
     node_count: Arc<AtomicU32>,
     /// `TextureAsset::mean` per (`TextureAsset::id`, sRGB), pruned to live textures on each rebuild.
     texture_means: HashMap<(u64, bool), [f32; 4]>,
+    built_meshes: Vec<BuiltMesh>,
 }
 
 fn pack_unorm4x8(v: [f32; 4]) -> u32 {
@@ -78,6 +92,7 @@ impl BvhUploadPass {
                 settled_frames: 0,
                 node_count,
                 texture_means: HashMap::new(),
+                built_meshes: Vec::new(),
             },
             outputs,
         )
@@ -115,7 +130,8 @@ impl Pass for BvhUploadPass {
         let Some(&tris_buf) = ctx.buffers.get(&self.tris_id) else { return };
         let Some(&info_buf) = ctx.buffers.get(&self.info_id) else { return };
 
-        let meshes = world.get_entities::<Mesh>();
+        let handles = world.get_entity_handles::<Mesh>();
+        let meshes: Vec<&Mesh> = handles.iter().map(|h| h.entity).collect();
 
         if meshes.len() != self.last_mesh_count {
             self.last_mesh_count = meshes.len();
@@ -136,12 +152,14 @@ impl Pass for BvhUploadPass {
         }
 
         if !self.dirty {
+            self.refresh_emissive(queue, tris_buf, world);
             return;
         }
         self.dirty = false;
         self.settled_frames = 0;
         self.built_transforms = transforms;
 
+        self.built_meshes.clear();
         if meshes.is_empty() {
             self.node_count.store(0, Ordering::Relaxed);
             info_buf.write(queue, bytes_of(&BvhInfo { node_count: 0, tri_count: 0, enabled: 0, _pad: 0 }));
@@ -151,8 +169,11 @@ impl Pass for BvhUploadPass {
         // Collect triangles from all meshes. Probe rays can't sample textures, so each triangle
         // carries its material factors times the average of its textures.
         let mut gpu_tris: Vec<GpuTriangle> = Vec::new();
+        // Index into `built_meshes` per triangle.
+        let mut tri_mesh: Vec<u32> = Vec::new();
         // Blended surfaces would block GI rays as if they were solid.
-        for mesh in meshes.iter().filter(|m| !m.is_blended()) {
+        for handle in handles.iter().filter(|h| !h.entity.is_blended()) {
+            let mesh = handle.entity;
             let mut mean = |texture: &Option<Arc<TextureAsset>>, srgb: bool| {
                 texture.as_ref().map_or([1.0; 4], |t| {
                     *self.texture_means.entry((t.id(), srgb)).or_insert_with(|| t.mean(srgb))
@@ -164,9 +185,9 @@ impl Pass for BvhUploadPass {
             let albedo: [f32; 3] = std::array::from_fn(|c| factors.base_color[c] * albedo_mean[c]);
             let metallic = factors.metallic * mr_mean[2];
             let roughness = factors.roughness * mr_mean[1];
-            let emissive_mean = mean(&mesh.emissive_texture, true);
-            let emissive =
-                pack_emissive(std::array::from_fn(|c| factors.emissive[c] * factors.emissive_strength * emissive_mean[c]));
+            let emissive = emissive_of(mesh, &mut self.texture_means);
+            let mesh_index = self.built_meshes.len() as u32;
+            self.built_meshes.push(BuiltMesh { key: handle.id, emissive, triangles: Vec::new() });
 
             let world_pos = |i: usize| -> [f32; 3] {
                 mesh.transform.transform_point3(Vec3::from(mesh.vertices[i].position)).into()
@@ -192,6 +213,7 @@ impl Pass for BvhUploadPass {
                 let albedo_metallic = pack_unorm4x8([albedo[0] * color(0), albedo[1] * color(1), albedo[2] * color(2), metallic]);
                 let roughness_coverage = pack_unorm4x8([roughness, coverage, 0.0, 0.0]);
                 gpu_tris.push(GpuTriangle { v0, albedo_metallic, v1, roughness_coverage, v2, emissive });
+                tri_mesh.push(mesh_index);
             }
         }
 
@@ -220,6 +242,10 @@ impl Pass for BvhUploadPass {
             return;
         }
 
+        for (index, &source) in built.order.iter().enumerate() {
+            self.built_meshes[tri_mesh[source as usize] as usize].triangles.push(index as u32);
+        }
+
         let n = built.nodes.len() as u32;
         nodes_buf.write(queue, bytemuck::cast_slice(&built.nodes));
         tris_buf.write(queue, bytemuck::cast_slice(&built.triangles));
@@ -233,4 +259,33 @@ impl Pass for BvhUploadPass {
         self.node_count.store(n, Ordering::Relaxed);
         log::info!("bvh_upload: {} nodes uploaded", node_count);
     }
+}
+
+impl BvhUploadPass {
+    /// Rewrites the emissive word of the triangles of each mesh whose emissive changed since the build.
+    fn refresh_emissive(&mut self, queue: &wgpu::Queue, tris: BufferRange<'_>, world: &World) {
+        const EMISSIVE_OFFSET: u64 = std::mem::offset_of!(GpuTriangle, emissive) as u64;
+        for built in &mut self.built_meshes {
+            let Some(mesh) = world.get_entity::<Mesh>(built.key) else { continue };
+            let emissive = emissive_of(mesh, &mut self.texture_means);
+            if emissive == built.emissive {
+                continue;
+            }
+            built.emissive = emissive;
+            for &index in &built.triangles {
+                let offset = u64::from(index) * std::mem::size_of::<GpuTriangle>() as u64 + EMISSIVE_OFFSET;
+                tris.write_at(queue, offset, bytes_of(&emissive));
+            }
+        }
+    }
+}
+
+/// The mesh's packed emitted radiance: factor × strength × its emissive texture's mean.
+fn emissive_of(mesh: &Mesh, texture_means: &mut HashMap<(u64, bool), [f32; 4]>) -> u32 {
+    let mean = mesh
+        .emissive_texture
+        .as_ref()
+        .map_or([1.0; 4], |t| *texture_means.entry((t.id(), true)).or_insert_with(|| t.mean(true)));
+    let factors = &mesh.material;
+    pack_emissive(std::array::from_fn(|c| factors.emissive[c] * factors.emissive_strength * mean[c]))
 }

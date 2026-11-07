@@ -99,12 +99,11 @@ impl Game {
 
         match result {
             Ok(asset) => {
+                let mut lights = Vec::new();
                 match lights::read_lights(&asset.document) {
                     Ok(scene_lights) => {
                         let mut world = engine.world();
-                        for (_, light) in scene_lights {
-                            light.spawn(&mut world);
-                        }
+                        lights = scene_lights.into_iter().map(|(node, light)| (node, light.spawn(&mut world))).collect();
                     }
                     Err(e) => log::error!("{}: invalid lights: {e}", self.scene_path),
                 }
@@ -112,7 +111,9 @@ impl Game {
                     Ok(scene_objects) => self.spawn_objects(engine, scene_objects),
                     Err(e) => log::error!("{}: invalid objects: {e}", self.scene_path),
                 }
-                self.scene = Some(GltfScene::new(Arc::clone(&asset)));
+                let mut scene = GltfScene::new(Arc::clone(&asset));
+                scene.bind_lights(lights);
+                self.scene = Some(scene);
                 log::info!("Loaded {}", self.scene_path);
             }
             Err(e) => log::error!("Loading {} failed: {e}", self.scene_path),
@@ -316,6 +317,12 @@ impl Plugin for Game {
                 self.ensure_camera(engine);
             }
             self.set_status();
+        }
+        {
+            let mut world = engine.world();
+            for scene in self.scene.iter_mut().chain(self.models.iter_mut().filter_map(|m| m.scene.as_mut())) {
+                scene.animate(&mut world, delta);
+            }
         }
 
         self.handle_input(engine, delta);

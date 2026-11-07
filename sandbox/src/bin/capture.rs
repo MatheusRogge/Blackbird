@@ -135,19 +135,20 @@ fn parse_args() -> Result<Options> {
 /// Loads the scene like the player does: lights, every mesh, the editor's objects (shapes, placed
 /// models), and only the main camera, or one at the player start. Each call reads the file again,
 /// so its textures are new allocations.
-fn load_scene(options: &Options, world: &mut World) -> Result<()> {
+/// Returns the loaded scenes, which `animate` the world each frame.
+fn load_scene(options: &Options, world: &mut World) -> Result<Vec<GltfScene>> {
     let mut assets = AssetManager::default();
     assets.set_source(Arc::new(DirectorySource::new(&options.root)));
     engine::register_asset_resolvers(&mut assets);
     let asset: Arc<GLTFAsset> = assets.load_asset(&options.scene)?;
 
-    for (_, light) in lights::read_lights(&asset.document)? {
-        light.spawn(world);
-    }
+    let lights: Vec<_> =
+        lights::read_lights(&asset.document)?.into_iter().map(|(node, light)| (node, light.spawn(world))).collect();
     for &(position, intensity, source_radius) in &options.points {
         world.add_entity(PointLight { position, color: Vec3::one(), intensity, radius: 10.0, source_radius });
     }
     let mut scene = GltfScene::new(Arc::clone(&asset));
+    scene.bind_lights(lights);
     while scene.load_batch(world, 1000) {}
     if let Some(main) = scene.main_camera() {
         for &key in scene.node_cameras().values().filter(|&&key| key != main) {
@@ -156,7 +157,9 @@ fn load_scene(options: &Options, world: &mut World) -> Result<()> {
     }
 
     let mut player_start = None;
-    for object in objects::read_objects(&asset.document)? {
+    let objects = objects::read_objects(&asset.document)?;
+    let mut scenes = vec![scene];
+    for object in objects {
         match &object.kind {
             ObjectKind::Shape { shape, material } => {
                 world.add_entity(shape.mesh(material).with_transform(object.matrix()));
@@ -170,6 +173,7 @@ fn load_scene(options: &Options, world: &mut World) -> Result<()> {
                 for &key in placed.node_cameras().values() {
                     world.remove_entity(key);
                 }
+                scenes.push(placed);
             }
             ObjectKind::PlayerStart => player_start = player_start.or(Some(object)),
         }
@@ -219,7 +223,7 @@ fn load_scene(options: &Options, world: &mut World) -> Result<()> {
         camera.exposure = exposure;
     }
     log::info!("camera eye {:?} target {:?} exposure {}", camera.eye, camera.target, camera.exposure);
-    Ok(())
+    Ok(scenes)
 }
 
 /// Removes everything `load_scene` spawned, keeping the world (and its entity key versions).
@@ -249,7 +253,7 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let mut options = parse_args()?;
     let mut world = World::default();
-    load_scene(&options, &mut world)?;
+    let mut scenes = load_scene(&options, &mut world)?;
 
     let flags = Arc::new(RwLock::new(std::mem::take(&mut options.flags)));
     let builder = RenderGraphPBRBuilder::new(
@@ -275,10 +279,13 @@ fn main() -> Result<()> {
             renderer.render(&world, None);
         }
         clear_scene(&mut world);
-        load_scene(&options, &mut world)?;
+        scenes = load_scene(&options, &mut world)?;
     }
     for frame in 0..options.frames {
         world.tick_all(CAPTURE_FRAME_TIME);
+        for scene in &mut scenes {
+            scene.animate(&mut world, CAPTURE_FRAME_TIME);
+        }
         if frame == 1 && options.burst > 0 {
             for emitter in world.get_entities_mut::<ParticleEmitter>() {
                 emitter.burst(options.burst);

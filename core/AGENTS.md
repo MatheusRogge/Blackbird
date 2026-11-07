@@ -23,6 +23,9 @@ Engine-agnostic primitives shared by every other crate. No GPU, windowing or thr
 
 Iteration order is slotmap order, not insertion order guaranteed across removals. Code that takes "the first camera" (`get_entities::<Camera>().first()`) depends on this.
 
+### `animation`
+Keyframe math with no knowledge of entities. `Curve { components (1–4), rotation, keys }` with `Key { time, value: [f32; 4], interpolation, in_tangent, out_tangent }`; `sample(t)` holds the end keys outside the range. `Interpolation` (set on the earlier key of a segment): `Step`, `Linear` (slerp for rotation curves), `Smooth` (Hermite with Catmull-Rom tangents), `EaseIn` / `EaseOut` / `EaseInOut` (cubic), `Cubic` (Hermite with the keys' own tangents in value per second, like glTF CUBICSPLINE). Rotation curves are normalized after every non-step blend. `Clip<T> { name, tracks: Vec<(T, Curve)>, wrap: Loop | Once }` (`duration`, `local_time(elapsed)`, `sample(t)`), `Playback { elapsed, speed, playing }` (`advance(delta)`).
+
 ### `input`
 - `InputEvent`: keys (`Key` enum: named keys + `Scancode(u32)`), text, modifiers, mouse buttons/move/scroll, cursor left, focus, scale factor, `FileDrop(PathBuf)`.
 - `InputBuffer`: a FIFO capped at **64** events. `push` adds to the front and truncates, so under overflow the *oldest* events are dropped. `pop` takes the oldest.
