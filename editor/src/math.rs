@@ -87,15 +87,20 @@ pub fn rotate(q: Quat, v: Vec3) -> Vec3 {
 
 /// Rotation taking the local -Z axis onto `dir`, the way glTF lights and cameras point.
 pub fn quat_look(dir: Vec3) -> Quat {
-    let from = Vec3::new(0.0, 0.0, -1.0);
-    let dir = dir.normalized();
-    let dot = from.dot(dir);
+    quat_between(Vec3::new(0.0, 0.0, -1.0), dir)
+}
+
+/// Shortest rotation taking direction `from` onto `to`.
+pub fn quat_between(from: Vec3, to: Vec3) -> Quat {
+    let (from, to) = (from.normalized(), to.normalized());
+    let dot = from.dot(to);
     if dot > 0.9999 {
         [0.0, 0.0, 0.0, 1.0]
     } else if dot < -0.9999 {
-        quat_from_axis_angle(Vec3::unit_y(), std::f32::consts::PI)
+        let axis = if from.x.abs() < 0.9 { from.cross(Vec3::unit_x()) } else { from.cross(Vec3::unit_y()) };
+        quat_from_axis_angle(axis, std::f32::consts::PI)
     } else {
-        quat_from_axis_angle(from.cross(dir), dot.acos())
+        quat_from_axis_angle(from.cross(to), dot.acos())
     }
 }
 

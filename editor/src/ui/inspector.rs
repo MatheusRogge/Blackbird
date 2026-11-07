@@ -1,6 +1,13 @@
 use egui::Ui;
 
-use crate::state::{CameraEdit, EditorState, LightData, LightDataExt, NodeEdit, NodeKind, PhysicalCamera, SceneNode, Selection};
+use std::path::Path;
+
+use engine::gltf::objects::PLAYER_EYE_HEIGHT;
+
+use crate::state::{
+    CameraEdit, EditorObject, EditorState, LightData, LightDataExt, NodeEdit, NodeKind, ObjectKind, PhysicalCamera,
+    SceneNode, Selection, Shape, ShapeMaterial,
+};
 
 const UNNAMED: &str = "(unnamed)";
 const DEFAULT_FAR: f32 = 1000.0;
@@ -21,6 +28,12 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                 Some(Selection::Light(idx)) => {
                     if let Some(light) = state.lights.get_mut(idx) {
                         draw_light(ui, &mut light.data);
+                    }
+                }
+                Some(Selection::Object(id)) => {
+                    let project_dir = state.project_dir.clone();
+                    if let Some(object) = state.objects.iter_mut().find(|o| o.id == id) {
+                        ui.push_id(id, |ui| draw_object(ui, object, project_dir.as_deref()));
                     }
                 }
                 Some(Selection::GltfNode(idx)) => {
@@ -49,7 +62,7 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
 
                     if let Some(edit) = state.node_edits.get_mut(&idx) {
                         ui.push_id(idx, |ui| {
-                            draw_transform(ui, edit);
+                            draw_transform(ui, &mut edit.translation, &mut edit.rotation, &mut edit.scale);
                             if let Some(NodeKind::Mesh(_)) = &node_kind {
                                 draw_material(ui, edit);
                             }
@@ -220,9 +233,75 @@ fn draw_light(ui: &mut egui::Ui, data: &mut LightData) {
     }
 }
 
-fn draw_transform(ui: &mut egui::Ui, edit: &mut NodeEdit) {
+fn draw_object(ui: &mut egui::Ui, object: &mut EditorObject, project_dir: Option<&Path>) {
+    ui.add(egui::TextEdit::singleline(&mut object.data.name).hint_text(UNNAMED));
+    let data = &mut object.data;
+    match &mut data.kind {
+        ObjectKind::Shape { shape, .. } => {
+            ui.horizontal(|ui| {
+                ui.label("Shape");
+                egui::ComboBox::from_id_salt("shape").selected_text(shape.label()).show_ui(ui, |ui| {
+                    for option in Shape::ALL {
+                        ui.selectable_value(shape, option, option.label());
+                    }
+                });
+            });
+        }
+        ObjectKind::Model { uri } => {
+            let path = Path::new(uri.as_str());
+            let shown = project_dir.and_then(|dir| path.strip_prefix(dir).ok()).unwrap_or(path);
+            ui.label(egui::RichText::new(format!("Model {}", shown.display())).weak());
+        }
+        ObjectKind::PlayerStart => {
+            ui.label(
+                egui::RichText::new(format!(
+                    "The player spawns here with its eyes {PLAYER_EYE_HEIGHT} m up, facing the arrow. Only the heading of the rotation is used."
+                ))
+                .weak(),
+            );
+        }
+    }
+    ui.separator();
+    draw_transform(ui, &mut data.translation, &mut data.rotation, &mut data.scale);
+    if let ObjectKind::Shape { material, .. } = &mut data.kind {
+        draw_shape_material(ui, material);
+    }
+}
+
+fn draw_shape_material(ui: &mut egui::Ui, material: &mut ShapeMaterial) {
+    ui.collapsing("Material", |ui| {
+        egui::Grid::new("shape_material_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            ui.label("Base Color");
+            ui.horizontal(|ui| {
+                let color = &mut material.base_color;
+                let mut rgb = [color[0], color[1], color[2]];
+                ui.color_edit_button_rgb(&mut rgb);
+                color[..3].copy_from_slice(&rgb);
+                ui.add(egui::DragValue::new(&mut color[3]).speed(0.01).range(0.0..=1.0).prefix("A "));
+            });
+            ui.end_row();
+
+            ui.label("Metallic");
+            ui.add(egui::Slider::new(&mut material.metallic, 0.0..=1.0));
+            ui.end_row();
+
+            ui.label("Roughness");
+            ui.add(egui::Slider::new(&mut material.roughness, 0.0..=1.0));
+            ui.end_row();
+
+            ui.label("Emissive");
+            ui.horizontal(|ui| {
+                ui.color_edit_button_rgb(&mut material.emissive);
+                ui.add(egui::DragValue::new(&mut material.emissive_strength).speed(0.1).range(0.0..=f32::MAX).prefix("× "));
+            });
+            ui.end_row();
+        });
+    });
+}
+
+fn draw_transform(ui: &mut egui::Ui, translation: &mut [f32; 3], rotation: &mut [f32; 4], scale: &mut [f32; 3]) {
     ui.collapsing("Transform", |ui| {
-        let euler = quat_to_euler(edit.rotation);
+        let euler = quat_to_euler(*rotation);
         let mut euler_edit = euler;
 
         egui::Grid::new("transform_grid")
@@ -231,9 +310,9 @@ fn draw_transform(ui: &mut egui::Ui, edit: &mut NodeEdit) {
             .show(ui, |ui| {
                 ui.label("Translation");
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut edit.translation[0]).speed(0.1).prefix("X "));
-                    ui.add(egui::DragValue::new(&mut edit.translation[1]).speed(0.1).prefix("Y "));
-                    ui.add(egui::DragValue::new(&mut edit.translation[2]).speed(0.1).prefix("Z "));
+                    ui.add(egui::DragValue::new(&mut translation[0]).speed(0.1).prefix("X "));
+                    ui.add(egui::DragValue::new(&mut translation[1]).speed(0.1).prefix("Y "));
+                    ui.add(egui::DragValue::new(&mut translation[2]).speed(0.1).prefix("Z "));
                 });
                 ui.end_row();
 
@@ -247,15 +326,15 @@ fn draw_transform(ui: &mut egui::Ui, edit: &mut NodeEdit) {
 
                 ui.label("Scale");
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut edit.scale[0]).speed(0.01).prefix("X "));
-                    ui.add(egui::DragValue::new(&mut edit.scale[1]).speed(0.01).prefix("Y "));
-                    ui.add(egui::DragValue::new(&mut edit.scale[2]).speed(0.01).prefix("Z "));
+                    ui.add(egui::DragValue::new(&mut scale[0]).speed(0.01).prefix("X "));
+                    ui.add(egui::DragValue::new(&mut scale[1]).speed(0.01).prefix("Y "));
+                    ui.add(egui::DragValue::new(&mut scale[2]).speed(0.01).prefix("Z "));
                 });
                 ui.end_row();
             });
 
         if euler_edit != euler {
-            edit.rotation = euler_to_quat(euler_edit);
+            *rotation = euler_to_quat(euler_edit);
         }
     });
 }

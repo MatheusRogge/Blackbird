@@ -2,9 +2,11 @@ use std::collections::{HashMap, HashSet};
 
 use egui::Ui;
 
-use crate::state::{EditorState, LightDataExt, LightKind, NodeKind, SceneNode, Selection};
+use crate::state::{AddKind, EditorState, LightDataExt, NodeKind, SceneNode, Selection};
 
-pub fn draw(root: &mut Ui, state: &mut EditorState) {
+/// Returns what the user asked to add from the context menu; the caller places it.
+pub fn draw(root: &mut Ui, state: &mut EditorState) -> Option<AddKind> {
+    let mut add = None;
     egui::Panel::left("hierarchy")
         .min_size(180.0)
         .default_size(220.0)
@@ -12,7 +14,7 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
             ui.heading("Scene");
             ui.separator();
 
-            // Right-click the panel background to add lights or make this the default scene.
+            // Right-click the panel background to add something or make this the default scene.
             let bg_response = ui.interact(
                 ui.available_rect_before_wrap(),
                 ui.scope_id().with("scene_ctx"),
@@ -29,27 +31,17 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                     }
                     ui.separator();
                 }
-                ui.menu_button("Add Light", |ui| {
-                    if ui.button("☀ Sky Light").clicked() {
-                        state.add_light_requested = Some(LightKind::Sky);
+                ui.menu_button("Add", |ui| {
+                    if let Some(kind) = super::add_menu::items(ui, state) {
+                        add = Some(kind);
                         ui.close();
                     }
-                    if ui.button("💡 Point Light").clicked() {
-                        state.add_light_requested = Some(LightKind::Point);
-                        ui.close();
-                    }
-                    if ui.button("◎ Spot Light").clicked() {
-                        state.add_light_requested = Some(LightKind::Spot);
-                        ui.close();
-                    }
-                    if ui.button("▪ Area Light").clicked() {
-                        state.add_light_requested = Some(LightKind::Area);
-                        ui.close();
-                    }
-                });
+                })
+                .response
+                .on_hover_text("Placed at the centre of the view; right-click the viewport to place under the cursor.");
             });
 
-            if state.document.is_none() && state.lights.is_empty() {
+            if state.document.is_none() && state.lights.is_empty() && state.objects.is_empty() {
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("Open a GLTF file to begin.").weak());
                 return;
@@ -62,9 +54,10 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                 .filter_map(|(idx, light)| Some((light.node?, (idx, light.data.icon()))))
                 .collect();
 
+            let deleted: HashSet<usize> = state.deleted_nodes.iter().copied().collect();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                for node in &nodes {
-                    draw_node(ui, node, &node_lights, &mut new_selection);
+                for node in nodes.iter().filter(|n| !deleted.contains(&n.index)) {
+                    draw_node(ui, node, &node_lights, &deleted, &mut new_selection);
                 }
                 // Lights that have no row of their own in the tree: added in the editor, area
                 // lights from `extras`, or carried by a mesh/camera node or a node outside the
@@ -81,6 +74,13 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                         new_selection = Some(target);
                     }
                 }
+                for object in &state.objects {
+                    let target = Selection::Object(object.id);
+                    let label = format!("{} {}", object.icon(), object.data.name);
+                    if ui.selectable_label(new_selection.as_ref() == Some(&target), label).clicked() {
+                        new_selection = Some(target);
+                    }
+                }
             });
 
             if new_selection != state.selected {
@@ -90,6 +90,7 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                 state.selected = new_selection;
             }
         });
+    add
 }
 
 fn collect_light_nodes(node: &SceneNode, out: &mut HashSet<usize>) {
@@ -107,6 +108,7 @@ fn draw_node(
     ui: &mut egui::Ui,
     node: &SceneNode,
     node_lights: &HashMap<usize, (usize, &'static str)>,
+    deleted: &HashSet<usize>,
     selection: &mut Option<Selection>,
 ) {
     let light = node_lights.get(&node.index).filter(|_| matches!(node.kind, NodeKind::Light));
@@ -141,8 +143,8 @@ fn draw_node(
         })
         .body(|ui| {
             ui.indent(node.index, |ui| {
-                for child in &node.children {
-                    draw_node(ui, child, node_lights, selection);
+                for child in node.children.iter().filter(|c| !deleted.contains(&c.index)) {
+                    draw_node(ui, child, node_lights, deleted, selection);
                 }
             });
         });

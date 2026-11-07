@@ -1,5 +1,5 @@
-//! Viewport transform gizmo for the selected glTF node or light, light markers, and
-//! click-to-select.
+//! Viewport transform gizmo for the selected glTF node, light or object, light and player-start
+//! markers, click-to-select, and the right-click Add menu.
 //!
 //! Translate and rotate act along world axes. Scale acts along the target's own
 //! axes, and the white centre square scales uniformly. Node edits are written to
@@ -7,13 +7,14 @@
 //! edits go straight into the light's `LightData`.
 
 use egui::{Color32, Id, LayerId, Order, Pos2, Rect, Sense, Shape, Stroke};
+use engine::gltf::objects::PLAYER_EYE_HEIGHT;
 use engine::rendering::camera::Camera;
 use engine::rendering::mesh::Mesh;
 use engine_core::world::World;
 use ultraviolet::{Mat4, Vec3, Vec4};
 
 use crate::math::{self, Quat};
-use crate::state::{EditorState, GizmoMode, LightData, Selection};
+use crate::state::{AddKind, EditorState, GizmoMode, LightData, ObjectKind, Placement, Selection};
 
 const GIZMO_PX: f32 = 90.0;
 const PICK_PX: f32 = 8.0;
@@ -52,7 +53,19 @@ enum Handle {
 enum Target {
     Node(usize),
     Light(usize),
+    Object(u64),
 }
+
+/// Open right-click Add menu: where it was opened and what it places at.
+#[derive(Clone, Copy)]
+struct AddMenu {
+    pos: Pos2,
+    placement: Placement,
+}
+
+/// Placement when nothing is hit and the ray misses the ground: this far along it.
+const FALLBACK_DISTANCE: f32 = 5.0;
+const PLAYER_START_COLOR: Color32 = Color32::from_rgb(80, 220, 120);
 
 /// A target's transform relative to its parent (identity for lights).
 #[derive(Clone, Copy)]
@@ -169,7 +182,8 @@ pub fn draw(ctx: &egui::Context, state: &mut EditorState, world: &World, viewpor
     let painter = ctx
         .layer_painter(LayerId::new(Order::Background, Id::unique("gizmo_paint")))
         .with_clip_rect(viewport);
-    let markers = paint_light_markers(&painter, &view, state);
+    let mut markers = paint_light_markers(&painter, &view, state);
+    markers.extend(paint_player_starts(&painter, &view, state));
 
     let mut hovered = None;
     if let Some(target) = target
@@ -240,29 +254,94 @@ pub fn draw(ctx: &egui::Context, state: &mut EditorState, world: &World, viewpor
         && ctx.input(|i| i.pointer.primary_clicked())
         && let Some(p) = pointer
     {
-        if let Some(light) = pick_marker(&markers, p) {
-            state.selected = Some(Selection::Light(light));
-        } else {
-            let picked = pick(world, state, view.ray(p));
-            state.selected = picked.map(Selection::GltfNode);
-            if let Some(node) = picked {
-                state.ensure_node_edit(node);
-            }
+        state.selected = pick_marker(&markers, p).or_else(|| raycast(world, state, view.ray(p)).and_then(|hit| hit.owner));
+        if let Some(Selection::GltfNode(node)) = state.selected {
+            state.ensure_node_edit(node);
         }
     }
+
+    draw_add_menu(ctx, state, world, &view, pointer, pointer_free && drag.is_none() && hovered.is_none());
+}
+
+/// Right-click (without dragging, which orbits) in the viewport opens an Add menu that places
+/// the new light or object where the click ray meets the scene.
+fn draw_add_menu(ctx: &egui::Context, state: &mut EditorState, world: &World, view: &View, pointer: Option<Pos2>, pointer_free: bool) {
+    let menu_id = Id::unique("viewport_add_menu");
+    if pointer_free
+        && !ctx.is_pointer_over_egui()
+        && ctx.input(|i| i.pointer.secondary_clicked())
+        && let Some(p) = pointer
+    {
+        let menu = AddMenu { pos: p, placement: placement(world, state, view, p) };
+        ctx.data_mut(|d| d.insert_temp(menu_id, menu));
+    }
+    let Some(menu) = ctx.data(|d| d.get_temp::<AddMenu>(menu_id)) else { return };
+
+    let mut picked = None;
+    egui::Area::new(menu_id).order(Order::Foreground).fixed_pos(menu.pos).show(ctx, |ui| {
+        egui::Frame::menu(ui.style()).show(ui, |ui| {
+            ui.label(egui::RichText::new("Add").strong());
+            ui.separator();
+            picked = super::add_menu::items(ui, state);
+        });
+    });
+
+    // Menus and their submenus live on foreground layers; a press anywhere else closes it.
+    let pressed_elsewhere = ctx.input(|i| i.pointer.any_pressed())
+        && pointer.is_some_and(|p| ctx.layer_id_at(p).is_none_or(|layer| layer.order != Order::Foreground));
+    let chose = picked.is_some();
+    if let Some(kind) = picked {
+        state.add(kind, menu.placement);
+    }
+    if chose || pressed_elsewhere || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ctx.data_mut(|d| d.remove::<AddMenu>(menu_id));
+    }
+}
+
+/// Adds `kind` where the ray through `at` (the viewport centre if `None`) meets the scene.
+pub fn place(ctx: &egui::Context, state: &mut EditorState, world: &World, kind: AddKind, at: Option<Pos2>) {
+    let Some(camera) = state.editor_camera_key.and_then(|key| world.get_entity::<Camera>(key)) else { return };
+    let view = View::new(camera, ctx.content_rect());
+    let placement = placement(world, state, &view, at.unwrap_or(view.screen.center()));
+    state.add(kind, placement);
+}
+
+/// Where a new object goes for a click at `pointer`: the nearest surface hit, else the ground
+/// plane, else a few meters along the ray.
+fn placement(world: &World, state: &EditorState, view: &View, pointer: Pos2) -> Placement {
+    let (origin, dir) = view.ray(pointer);
+    if let Some(hit) = raycast(world, state, (origin, dir)) {
+        return Placement { point: hit.point, normal: hit.normal, view_dir: dir };
+    }
+    let t = if dir.y < -1e-4 { -origin.y / dir.y } else { FALLBACK_DISTANCE };
+    Placement { point: origin + dir * t.min(1000.0), normal: Vec3::unit_y(), view_dir: dir }
 }
 
 fn selected_target(state: &EditorState) -> Option<Target> {
     match state.selected {
         Some(Selection::GltfNode(idx)) => Some(Target::Node(idx)),
         Some(Selection::Light(idx)) if idx < state.lights.len() => Some(Target::Light(idx)),
+        Some(Selection::Object(id)) if state.objects.iter().any(|o| o.id == id) => Some(Target::Object(id)),
         _ => None,
     }
 }
 
+fn object(state: &EditorState, id: u64) -> Option<&crate::state::ObjectData> {
+    state.objects.iter().find(|o| o.id == id).map(|o| &o.data)
+}
+
 /// Axes the gizmo offers in `mode`, or `None` when the target can't be edited that way.
 fn editable_axes(state: &EditorState, target: Target, mode: GizmoMode) -> Option<[bool; 3]> {
-    let Target::Light(idx) = target else { return Some(ALL_AXES) };
+    let idx = match target {
+        Target::Node(_) => return Some(ALL_AXES),
+        Target::Object(id) => {
+            return match (&object(state, id)?.kind, mode) {
+                (ObjectKind::PlayerStart, GizmoMode::Scale) => None,
+                _ => Some(ALL_AXES),
+            };
+        }
+        Target::Light(idx) => idx,
+    };
     match (&state.lights.get(idx)?.data, mode) {
         (LightData::Point { .. }, GizmoMode::Translate)
         | (LightData::Spot { .. }, GizmoMode::Translate | GizmoMode::Rotate)
@@ -281,6 +360,7 @@ fn read_pose(state: &EditorState, target: Target) -> Option<Pose> {
             scale: edit.scale,
         }),
         Target::Light(idx) => Some(light_pose(&state.lights.get(idx)?.data)),
+        Target::Object(id) => object(state, id).map(|o| Pose { translation: o.translation, rotation: o.rotation, scale: o.scale }),
     }
 }
 
@@ -298,13 +378,20 @@ fn write_pose(state: &mut EditorState, target: Target, pose: Pose) {
                 apply_light_pose(&mut light.data, pose);
             }
         }
+        Target::Object(id) => {
+            if let Some(object) = state.objects.iter_mut().find(|o| o.id == id) {
+                object.data.translation = pose.translation;
+                object.data.rotation = pose.rotation;
+                object.data.scale = pose.scale;
+            }
+        }
     }
 }
 
 fn target_world(state: &EditorState, target: Target) -> Option<Mat4> {
     match target {
         Target::Node(idx) => Some(state.node_world(idx)),
-        Target::Light(_) => {
+        Target::Light(_) | Target::Object(_) => {
             let pose = read_pose(state, target)?;
             Some(math::trs(pose.translation, pose.rotation, pose.scale))
         }
@@ -314,7 +401,7 @@ fn target_world(state: &EditorState, target: Target) -> Option<Mat4> {
 fn target_parent_world(state: &EditorState, target: Target) -> Mat4 {
     match target {
         Target::Node(idx) => state.parent_world(idx),
-        Target::Light(_) => Mat4::identity(),
+        Target::Light(_) | Target::Object(_) => Mat4::identity(),
     }
 }
 
@@ -366,8 +453,38 @@ fn apply_light_pose(data: &mut LightData, pose: Pose) {
     }
 }
 
+/// Draws each player start (a post to eye height with an arrow along its heading) and returns
+/// their screen positions for picking.
+fn paint_player_starts(painter: &egui::Painter, view: &View, state: &EditorState) -> Vec<(Selection, Pos2)> {
+    let mut markers = Vec::new();
+    let mut marks = Marks::default();
+    for object in &state.objects {
+        if !matches!(object.data.kind, ObjectKind::PlayerStart) {
+            continue;
+        }
+        let selected = state.selected == Some(Selection::Object(object.id));
+        if !state.show_gizmos && !selected {
+            continue;
+        }
+        let outline = if selected { ACTIVE_COLOR } else { Color32::from_gray(230) };
+        let feet = Vec3::from(object.data.translation);
+        let eye = feet + Vec3::unit_y() * PLAYER_EYE_HEIGHT;
+        let heading = math::rotate(object.data.rotation, -Vec3::unit_z());
+        let ahead = eye + Vec3::new(heading.x, 0.0, heading.z).normalized() * view.world_size(eye, SPOT_LINE_PX);
+        let (Some(feet_px), Some(eye_px), Some(ahead_px)) = (view.project(feet), view.project(eye), view.project(ahead)) else {
+            continue;
+        };
+        marks.0.push(Mark::Line(vec![feet_px, eye_px], outline));
+        marks.0.push(Mark::Line(vec![eye_px, ahead_px], outline));
+        marks.0.push(Mark::Disc(eye_px, MARKER_RADIUS_PX, PLAYER_START_COLOR, outline));
+        markers.push((Selection::Object(object.id), eye_px));
+    }
+    marks.paint(painter);
+    markers
+}
+
 /// Draws a marker for every positioned light and returns their screen positions for picking.
-fn paint_light_markers(painter: &egui::Painter, view: &View, state: &EditorState) -> Vec<(usize, Pos2)> {
+fn paint_light_markers(painter: &egui::Painter, view: &View, state: &EditorState) -> Vec<(Selection, Pos2)> {
     let selected = match state.selected {
         Some(Selection::Light(idx)) => Some(idx),
         _ => None,
@@ -382,7 +499,7 @@ fn paint_light_markers(painter: &egui::Painter, view: &View, state: &EditorState
         let (position, color) = match light.data {
             LightData::Sky { direction, color, .. } => {
                 if let Some(sun) = sun_marks(&mut marks, view, direction.into(), color32(color), stroke_color) {
-                    markers.push((idx, sun));
+                    markers.push((Selection::Light(idx), sun));
                 }
                 continue;
             }
@@ -413,7 +530,7 @@ fn paint_light_markers(painter: &egui::Painter, view: &View, state: &EditorState
             _ => {}
         }
         marks.0.push(Mark::Disc(screen, MARKER_RADIUS_PX, fill, stroke_color));
-        markers.push((idx, screen));
+        markers.push((Selection::Light(idx), screen));
     }
     marks.paint(painter);
     markers
@@ -486,13 +603,13 @@ fn sun_marks(marks: &mut Marks, view: &View, direction: Vec3, fill: Color32, out
     Some(sun)
 }
 
-fn pick_marker(markers: &[(usize, Pos2)], pointer: Pos2) -> Option<usize> {
+fn pick_marker(markers: &[(Selection, Pos2)], pointer: Pos2) -> Option<Selection> {
     markers
         .iter()
-        .map(|&(idx, pos)| (idx, pos.distance(pointer)))
+        .map(|(target, pos)| (target, pos.distance(pointer)))
         .filter(|&(_, dist)| dist <= MARKER_RADIUS_PX + PICK_PX * 0.5)
         .min_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(idx, _)| idx)
+        .map(|(target, _)| target.clone())
 }
 
 fn draw_mode_toolbar(ctx: &egui::Context, state: &mut EditorState, target: Option<Target>, viewport: Rect) {
@@ -772,15 +889,35 @@ fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     p.distance(a + ab * t)
 }
 
-/// Nearest glTF node whose mesh bounds the ray hits.
-fn pick(world: &World, state: &EditorState, ray: (Vec3, Vec3)) -> Option<usize> {
-    let mut best: Option<(f32, usize)> = None;
+/// The nearest triangle a pick ray hits, among meshes of visible scene nodes and objects.
+struct Hit {
+    t: f32,
+    point: Vec3,
+    /// Facing back along the ray.
+    normal: Vec3,
+    owner: Option<Selection>,
+}
+
+/// Nearest triangle along `ray` (world space; `dir` normalized). Each mesh is tested in its own
+/// space after a bounds check, so only meshes the ray reaches cost a triangle walk.
+fn raycast(world: &World, state: &EditorState, (origin, dir): (Vec3, Vec3)) -> Option<Hit> {
+    let mut best: Option<Hit> = None;
     for handle in world.get_entity_handles::<Mesh>() {
-        let Some(&node) = state.entity_nodes.get(&handle.id) else { continue };
+        let owner = match state.entity_nodes.get(&handle.id) {
+            Some(&node) if state.is_node_deleted(node) => continue,
+            Some(&node) => Selection::GltfNode(node),
+            None => match state.entity_objects.get(&handle.id) {
+                Some(&id) => Selection::Object(id),
+                None => continue,
+            },
+        };
         let mesh = handle.entity;
-        if mesh.vertices.is_empty() {
+        if mesh.vertices.is_empty() || mesh.transform.determinant().abs() < 1e-12 {
             continue;
         }
+        let to_local = mesh.transform.inversed();
+        // Same ray parameter in both spaces: t along `dir` in world is t along `local_dir` here.
+        let (local_origin, local_dir) = (to_local.transform_point3(origin), to_local.transform_vec3(dir));
 
         let (mut lo, mut hi) = (Vec3::broadcast(f32::MAX), Vec3::broadcast(f32::MIN));
         for v in &mesh.vertices {
@@ -788,26 +925,46 @@ fn pick(world: &World, state: &EditorState, ray: (Vec3, Vec3)) -> Option<usize> 
             lo = lo.min_by_component(p);
             hi = hi.max_by_component(p);
         }
-
-        let (mut wlo, mut whi) = (Vec3::broadcast(f32::MAX), Vec3::broadcast(f32::MIN));
-        for corner in 0..8 {
-            let local = Vec3::new(
-                if corner & 1 == 0 { lo.x } else { hi.x },
-                if corner & 2 == 0 { lo.y } else { hi.y },
-                if corner & 4 == 0 { lo.z } else { hi.z },
-            );
-            let p = mesh.transform.transform_point3(local);
-            wlo = wlo.min_by_component(p);
-            whi = whi.max_by_component(p);
+        match ray_aabb((local_origin, local_dir), lo, hi) {
+            Some(t) if best.as_ref().is_none_or(|b| t < b.t) => {}
+            _ => continue,
         }
 
-        if let Some(t) = ray_aabb(ray, wlo, whi)
-            && best.is_none_or(|(bt, _)| t < bt)
-        {
-            best = Some((t, node));
+        for tri in mesh.indices.as_chunks::<3>().0 {
+            let [a, b, c] = tri.map(|i| Vec3::from(mesh.vertices[i as usize].position));
+            let Some(t) = ray_triangle((local_origin, local_dir), a, b, c) else { continue };
+            if best.as_ref().is_some_and(|b| t >= b.t) {
+                continue;
+            }
+            let normal = mesh.transform.transform_vec3(b - a).cross(mesh.transform.transform_vec3(c - a)).normalized();
+            let normal = if normal.dot(dir) > 0.0 { -normal } else { normal };
+            best = Some(Hit { t, point: origin + dir * t, normal, owner: Some(owner.clone()) });
         }
     }
-    best.map(|(_, node)| node)
+    best
+}
+
+/// Möller–Trumbore, both faces. `t` in units of `dir`.
+fn ray_triangle((origin, dir): (Vec3, Vec3), a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let (e1, e2) = (b - a, c - a);
+    let p = dir.cross(e2);
+    let det = e1.dot(p);
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let s = origin - a;
+    let u = s.dot(p) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = s.cross(e1);
+    let v = dir.dot(q) * inv;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = e2.dot(q) * inv;
+    (t > 1e-5).then_some(t)
 }
 
 fn ray_aabb((origin, dir): (Vec3, Vec3), lo: Vec3, hi: Vec3) -> Option<f32> {

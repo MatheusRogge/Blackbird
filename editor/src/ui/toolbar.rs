@@ -7,6 +7,11 @@ use crate::state::{CameraSettings, EditorState};
 
 const SAVE_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
 const GRID_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::G);
+const UNDO_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
+const REDO_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Y);
+const REDO_ALT_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT), egui::Key::Z);
+const DELETE_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Delete);
 
 pub fn draw(root: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<RenderDebugFlags>) {
     let can_save = state.document.is_some();
@@ -17,6 +22,18 @@ pub fn draw(root: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<RenderD
     if !typing && root.ctx().input_mut(|i| i.consume_shortcut(&GRID_SHORTCUT)) {
         let mut flags = debug_flags.write().expect("debug_flags poisoned");
         flags.show_grid = !flags.show_grid;
+    }
+    // While typing, these belong to the text field (its own undo, deleting characters).
+    if !typing {
+        // Ctrl+Shift+Z first: Ctrl+Z would also match it.
+        if root.ctx().input_mut(|i| i.consume_shortcut(&REDO_ALT_SHORTCUT) || i.consume_shortcut(&REDO_SHORTCUT)) {
+            state.redo();
+        } else if root.ctx().input_mut(|i| i.consume_shortcut(&UNDO_SHORTCUT)) {
+            state.undo();
+        }
+        if root.ctx().input_mut(|i| i.consume_shortcut(&DELETE_SHORTCUT)) {
+            state.delete_selected();
+        }
     }
 
     egui::Panel::top("toolbar").show(root, |ui| {
@@ -65,6 +82,24 @@ pub fn draw(root: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<RenderD
                 }
             });
 
+            ui.menu_button("Edit", |ui| {
+                let undo = egui::Button::new("Undo").shortcut_text(ui.ctx().format_shortcut(&UNDO_SHORTCUT));
+                if ui.add_enabled(state.history.can_undo(), undo).clicked() {
+                    state.undo();
+                    ui.close();
+                }
+                let redo = egui::Button::new("Redo").shortcut_text(ui.ctx().format_shortcut(&REDO_SHORTCUT));
+                if ui.add_enabled(state.history.can_redo(), redo).clicked() {
+                    state.redo();
+                    ui.close();
+                }
+                ui.separator();
+                let delete = egui::Button::new("Delete").shortcut_text(ui.ctx().format_shortcut(&DELETE_SHORTCUT));
+                if ui.add_enabled(state.selected.is_some(), delete).clicked() {
+                    state.delete_selected();
+                    ui.close();
+                }
+            });
             ui.add_enabled_ui(state.project.is_some(), |ui| {
                 ui.menu_button("Project", |ui| draw_project_menu(ui, state));
             });
@@ -80,6 +115,11 @@ pub fn draw(root: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<RenderD
         ui.horizontal(|ui| {
             if state.build.running.is_some() {
                 ui.spinner();
+            }
+            if state.is_dirty() {
+                ui.label(egui::RichText::new("● Unsaved changes").color(ui.visuals().warn_fg_color))
+                    .on_hover_text("Auto-save keeps a recovery copy a minute after a change; Save (Ctrl+S) writes the scene.");
+                ui.separator();
             }
             ui.label(&state.status);
         });

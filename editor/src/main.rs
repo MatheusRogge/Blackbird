@@ -1,6 +1,7 @@
 mod asset_browser;
 mod camera;
 mod export;
+mod history;
 mod import;
 mod lights;
 mod math;
@@ -31,6 +32,7 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let shared_state = EditorState::new();
+    let close_guard = shared_state.lock().expect("editor state mutex poisoned").close_guard.clone();
 
     let gbuffer_shader   = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/gbuffer.wgsl"));
     let cluster_shader   = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/cluster_assignment.wgsl"));
@@ -65,6 +67,7 @@ fn main() -> anyhow::Result<()> {
 
     WindowedApplication::new(render_graph)
         .with_title("Blackbird Editor")
+        .with_close_guard(close_guard)
         .add_plugin(EditorPlugin::new(shared_state.clone()))
         .add_ui_layer(EditorUiLayer::new(shared_state, debug_flags))
         .run()?;
