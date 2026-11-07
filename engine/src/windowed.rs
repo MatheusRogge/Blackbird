@@ -438,7 +438,14 @@ impl<B: RenderGraphBuilder> ApplicationHandler for WindowedApplication<B> {
                 }
                 if let Some(tx) = &self.game_tx {
                     let inputs = mem::take(&mut self.pending_inputs);
-                    let _ = tx.try_send(GameMsg::Tick { inputs });
+                    // A busy game thread skips the frame, not the input: a click's press or
+                    // release lost here would never reach the game or egui.
+                    if let Err(mpsc::TrySendError::Full(GameMsg::Tick { mut inputs })) =
+                        tx.try_send(GameMsg::Tick { inputs })
+                    {
+                        inputs.append(&mut self.pending_inputs);
+                        self.pending_inputs = inputs;
+                    }
                 }
             }
             _ => {}
