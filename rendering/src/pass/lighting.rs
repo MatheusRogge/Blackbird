@@ -394,6 +394,7 @@ pub struct LightingPass {
     normal_id: ResourceId,
     material_id: ResourceId,
     emissive_id: ResourceId,
+    transmission_id: ResourceId,
     depth_id: ResourceId,
 
     lit_id: ResourceId,
@@ -457,6 +458,7 @@ impl LightingPass {
                 normal_id: gbuffer.normal_id,
                 material_id: gbuffer.material_id,
                 emissive_id: gbuffer.emissive_id,
+                transmission_id: gbuffer.transmission_id,
                 depth_id: gbuffer.depth_id,
                 lit_id,
                 specular_weight_id,
@@ -486,7 +488,7 @@ impl PassDesc for LightingPass {
     }
 
     fn reads(&self) -> Vec<ResourceId> {
-        let mut reads = vec![self.albedo_id, self.normal_id, self.material_id, self.emissive_id, self.depth_id];
+        let mut reads = vec![self.albedo_id, self.normal_id, self.material_id, self.emissive_id, self.transmission_id, self.depth_id];
         reads.extend(self.bindings.reads());
         reads
     }
@@ -523,6 +525,7 @@ impl Pass for LightingPass {
             self.material_id,
             self.depth_id,
             self.emissive_id,
+            self.transmission_id,
         ]
         .map(|id| ctx.views.get(&id).copied());
         let [
@@ -534,6 +537,7 @@ impl Pass for LightingPass {
             Some(material_view),
             Some(depth_view),
             Some(emissive_view),
+            Some(transmission_view),
         ] = views
         else {
             return;
@@ -567,6 +571,7 @@ impl Pass for LightingPass {
                         count: None,
                     },
                     texture_entry(5, wgpu::TextureViewDimension::D2, FILTERABLE),
+                    texture_entry(15, wgpu::TextureViewDimension::D2, FILTERABLE),
                 ],
             });
 
@@ -641,6 +646,10 @@ impl Pass for LightingPass {
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(sampler) },
                     wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(emissive_view) },
+                    wgpu::BindGroupEntry {
+                        binding: 15,
+                        resource: wgpu::BindingResource::TextureView(transmission_view),
+                    },
                 ],
             }));
             self.cached_albedo_ptr = albedo_ptr;

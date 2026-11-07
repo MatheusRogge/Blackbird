@@ -15,6 +15,7 @@ doctest = false
 [dependencies]
 gltf = { version = "1.4.1", features = [
   "extras",
+  "extensions",
   "names",
   "import",
   "utils",

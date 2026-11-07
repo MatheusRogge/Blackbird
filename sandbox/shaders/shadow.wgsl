@@ -17,6 +17,8 @@ struct Model {
     transmission: vec4<f32>,
     // rgb: volume attenuation color.
     attenuation: vec4<f32>,
+    // rgb: diffuse transmission color, a: diffuse transmission factor.
+    diffuse_transmission: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> light: LightUniform;

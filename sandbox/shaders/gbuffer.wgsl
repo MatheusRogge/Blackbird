@@ -30,6 +30,8 @@ struct Model {
     transmission: vec4<f32>,
     // rgb: volume attenuation color.
     attenuation: vec4<f32>,
+    // rgb: diffuse transmission color, a: diffuse transmission factor.
+    diffuse_transmission: vec4<f32>,
 };
 
 @group(2) @binding(0)
@@ -52,6 +54,7 @@ struct VertexOutput {
     @location(4) @interpolate(flat) material: vec4<f32>,
     @location(5) @interpolate(flat) base_color: vec4<f32>,
     @location(6) @interpolate(flat) emissive: vec3<f32>,
+    @location(7) @interpolate(flat) diffuse_transmission: vec4<f32>,
 };
 
 struct GBufferOutput {
@@ -59,6 +62,8 @@ struct GBufferOutput {
     @location(1) normal: vec4<f32>,
     @location(2) material: vec4<f32>,
     @location(3) emissive: vec4<f32>,
+    // rgb: diffuse transmission color, a: factor.
+    @location(4) transmission: vec4<f32>,
 };
 
 @vertex
@@ -74,6 +79,7 @@ fn vs_main(in: VertexInput, @builtin(instance_index) instance: u32) -> VertexOut
     out.material = m.material;
     out.base_color = m.base_color;
     out.emissive = m.emissive.rgb;
+    out.diffuse_transmission = m.diffuse_transmission;
 
     return out;
 }
@@ -107,6 +113,7 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> GBuff
     let metallic = metallic_roughness.b * in.material.z;
     out.material = vec4<f32>(roughness, metallic, 1.0, 0.0);
     out.emissive = vec4<f32>(emissive, 1.0);
+    out.transmission = in.diffuse_transmission;
 
     return out;
 }

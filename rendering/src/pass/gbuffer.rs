@@ -17,6 +17,8 @@ pub struct GBufferOutputs {
     pub material_id: ResourceId,
     /// Rgba16Float, linear emitted radiance (texture × factor × strength), not yet exposed.
     pub emissive_id: ResourceId,
+    /// Rgba8Unorm, rgb: diffuse transmission color, a: diffuse transmission factor (0 = none).
+    pub transmission_id: ResourceId,
     pub depth_id: ResourceId,
 }
 
@@ -38,6 +40,7 @@ pub struct GBufferPass {
     normal_id: ResourceId,
     material_id: ResourceId,
     emissive_id: ResourceId,
+    transmission_id: ResourceId,
     depth_id: ResourceId,
 }
 
@@ -69,6 +72,11 @@ impl GBufferPass {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         });
 
+        let transmission_id = graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        });
+
         let depth_id = graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
             format: wgpu::TextureFormat::Depth32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
@@ -79,6 +87,7 @@ impl GBufferPass {
             normal_id,
             material_id,
             emissive_id,
+            transmission_id,
             depth_id,
         };
 
@@ -98,6 +107,7 @@ impl GBufferPass {
                 normal_id,
                 material_id,
                 emissive_id,
+                transmission_id,
                 depth_id,
             },
             outputs,
@@ -120,6 +130,7 @@ impl PassDesc for GBufferPass {
             self.normal_id,
             self.material_id,
             self.emissive_id,
+            self.transmission_id,
             self.depth_id,
         ]
     }
@@ -247,6 +258,7 @@ impl Pass for GBufferPass {
         let normal_view = ctx.views[&self.normal_id];
         let material_view = ctx.views[&self.material_id];
         let emissive_view = ctx.views[&self.emissive_id];
+        let transmission_view = ctx.views[&self.transmission_id];
 
         if self.pipeline.is_none() {
             let shader_module = self
@@ -312,6 +324,11 @@ impl Pass for GBufferPass {
                             }),
                             Some(wgpu::ColorTargetState {
                                 format: wgpu::TextureFormat::Rgba16Float,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                            Some(wgpu::ColorTargetState {
+                                format: wgpu::TextureFormat::Rgba8Unorm,
                                 blend: None,
                                 write_mask: wgpu::ColorWrites::ALL,
                             }),
@@ -400,6 +417,15 @@ impl Pass for GBufferPass {
                     ops: wgpu::Operations {
                         store: wgpu::StoreOp::Store,
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: transmission_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        store: wgpu::StoreOp::Store,
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                     },
                 }),
             ],

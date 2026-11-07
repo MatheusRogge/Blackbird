@@ -269,6 +269,7 @@ fn build_mesh_primitives(
             thickness: volume.as_ref().map_or(0.0, |v| v.thickness_factor()),
             attenuation_color: volume.as_ref().map_or([1.0; 3], |v| v.attenuation_color()),
             attenuation_distance: volume.as_ref().map_or(f32::INFINITY, |v| v.attenuation_distance()),
+            ..diffuse_transmission(&material)
         };
 
         let alpha_mode = match material.alpha_mode() {
@@ -285,6 +286,25 @@ fn build_mesh_primitives(
     }
 
     out
+}
+
+/// `KHR_materials_diffuse_transmission`'s factors, which the `gltf` crate doesn't parse. Its
+/// textures are ignored.
+fn diffuse_transmission(material: &gltf::Material<'_>) -> MaterialFactors {
+    let ext = material.extension_value("KHR_materials_diffuse_transmission");
+    let factor = ext.and_then(|e| e.get("diffuseTransmissionFactor")?.as_f64()).unwrap_or(0.0);
+    let color = ext
+        .and_then(|e| e.get("diffuseTransmissionColorFactor")?.as_array())
+        .and_then(|c| match c.as_slice() {
+            [r, g, b] => Some([r.as_f64()?, g.as_f64()?, b.as_f64()?].map(|v| v as f32)),
+            _ => None,
+        })
+        .unwrap_or([1.0; 3]);
+    MaterialFactors {
+        diffuse_transmission: (factor as f32).clamp(0.0, 1.0),
+        diffuse_transmission_color: color,
+        ..MaterialFactors::default()
+    }
 }
 
 /// Matrix of a node's own transform, relative to its parent.

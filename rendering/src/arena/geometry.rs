@@ -35,6 +35,8 @@ pub struct GpuModel {
     pub transmission: [f32; 4],
     /// rgb: volume attenuation color, w: unused.
     pub attenuation: [f32; 4],
+    /// rgb: diffuse transmission color, w: diffuse transmission factor.
+    pub diffuse_transmission: [f32; 4],
 }
 
 /// Where a mesh lives inside the shared geometry buffers. `instance` indexes
@@ -232,6 +234,10 @@ impl GeometryArena {
                     attenuation: {
                         let [r, g, b] = mesh.material.attenuation_color;
                         [r, g, b, 0.0]
+                    },
+                    diffuse_transmission: {
+                        let [r, g, b] = mesh.material.diffuse_transmission_color;
+                        [r, g, b, mesh.material.diffuse_transmission]
                     },
                 };
             }

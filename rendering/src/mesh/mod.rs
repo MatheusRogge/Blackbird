@@ -51,6 +51,10 @@ pub struct MaterialFactors {
     /// `attenuation_distance` (world units) inside the volume. Infinite means no absorption.
     pub attenuation_color: [f32; 3],
     pub attenuation_distance: f32,
+    /// `KHR_materials_diffuse_transmission`: the fraction of diffuse light that passes through
+    /// the surface (thin foliage) instead of being reflected, tinted by `diffuse_transmission_color`.
+    pub diffuse_transmission: f32,
+    pub diffuse_transmission_color: [f32; 3],
 }
 
 impl Default for MaterialFactors {
@@ -66,6 +70,8 @@ impl Default for MaterialFactors {
             thickness: 0.0,
             attenuation_color: [1.0; 3],
             attenuation_distance: f32::INFINITY,
+            diffuse_transmission: 0.0,
+            diffuse_transmission_color: [1.0; 3],
         }
     }
 }

@@ -6,6 +6,8 @@
 @group(0) @binding(4) var s_linear:   sampler;
 // Emitted radiance (texture × factor × strength), not yet exposed.
 @group(0) @binding(5) var t_emissive: texture_2d<f32>;
+// rgb: diffuse transmission color, a: diffuse transmission factor.
+@group(0) @binding(15) var t_transmission: texture_2d<f32>;
 
 // Probe atlases + params
 const PROBES_PER_ROW: u32 = 30u;
@@ -345,6 +347,9 @@ struct Surface {
     f0: vec3<f32>,
     // GGX alpha (perceptual roughness squared).
     alpha: f32,
+    // Diffuse transmission (KHR_materials_diffuse_transmission, color × factor): Lambertian light
+    // arriving from behind the surface, for thin foliage.
+    transmission: vec3<f32>,
 }
 
 // `v_dot_h` can round to just above 1 when L is tiny (a point on an area light's rectangle), and
@@ -383,7 +388,16 @@ fn diffuse_brdf(s: Surface, L: vec3<f32>) -> vec3<f32> {
     let n_dot_l = max(dot(s.N, L), 0.0);
     let H = normalize(s.V + L);
     let F = select(fresnel_schlick(s.f0, max(dot(s.V, H), 0.0)), vec3f(0.0), debug.disable_specular != 0u);
-    return (1.0 - F) * s.diffuse_color / PI * n_dot_l;
+    return (1.0 - F) * s.diffuse_color / PI * n_dot_l + s.transmission / PI * max(-dot(s.N, L), 0.0);
+}
+
+// The normal to offset shadow lookups along: toward the light, which is behind transmissive surfaces.
+fn shadow_normal(N: vec3<f32>, N_vs: vec3<f32>, to_light_vs: vec3<f32>) -> vec3<f32> {
+    return select(N, -N, dot(N_vs, to_light_vs) < 0.0);
+}
+
+fn diffuse_transmission(t: vec4<f32>, metallic: f32) -> vec3<f32> {
+    return t.rgb * t.a * (1.0 - metallic);
 }
 
 fn brdf(s: Surface, L: vec3<f32>) -> vec3<f32> {
@@ -641,7 +655,7 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
             continue;
         }
 
-        let vis = local_shadow_of(light.shadow_slot, pos_ws, N, pixel);
+        let vis = local_shadow_of(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel);
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
         color += sphere_light_brdf(surf_vs, to_light, dist, light.source_radius) * light.color * vis
             * (light.intensity * falloff);
@@ -659,7 +673,7 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let L  = to_light / dist;
         let cd = dot(-L, normalize(light.direction_vs));
         let t  = clamp((cd - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
-        let vis = local_shadow_of(light.shadow_slot, pos_ws, N, pixel);
+        let vis = local_shadow_of(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel);
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
         color += sphere_light_brdf(surf_vs, to_light, dist, light.source_radius) * light.color * vis
             * (light.intensity * t * t * falloff);
@@ -690,7 +704,8 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
 
         let area     = 4.0 * half_r * half_u;
         let normal   = normalize(cross(r_dir, u_dir));
-        let radiance = light.color * light.intensity * local_shadow_of(light.shadow_slot, pos_ws, N, pixel);
+        let radiance = light.color * light.intensity
+            * local_shadow_of(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel);
         let facing   = area_facing(light, -L, normal);
         color += diffuse_brdf(surf_vs, L) * radiance * (facing * area / (dist2 + area));
 
@@ -856,6 +871,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
     let roughness  = max(material.r, MIN_ROUGHNESS);
     let metallic   = material.g;
     let emissive   = textureSample(t_emissive, s_linear, in.uv).rgb;
+    let transmission_raw = textureSample(t_transmission, s_linear, in.uv);
 
     // Reconstruct view-space depth from reversed-Z depth buffer value.
     // z_view_pos = z_near * z_far / (depth * (z_far - z_near) + z_near)
@@ -892,17 +908,21 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
     let cam_pos  = camera.inv_view[3].xyz;
     let view_dir = normalize(cam_pos - pos_ws);
 
-    let diffuse_color = albedo * (1.0 - metallic);
+    let diffuse_color = albedo * (1.0 - metallic) * (1.0 - transmission_raw.a);
+    let transmission = diffuse_transmission(transmission_raw, metallic);
     let f0 = mix(vec3f(0.04), albedo, metallic);
     let alpha = roughness * roughness;
     // Local lights are shaded in view space, sky lights and probes in world space.
-    let surf_vs = Surface(N_vs, normalize(-pos_vs), diffuse_color, f0, alpha);
-    let surf_ws = Surface(N, view_dir, diffuse_color, f0, alpha);
+    let surf_vs = Surface(N_vs, normalize(-pos_vs), diffuse_color, f0, alpha, transmission);
+    let surf_ws = Surface(N, view_dir, diffuse_color, f0, alpha, transmission);
 
     var color = vec3f(0.0);
     var out: LightingOutput;
     if debug.disable_indirect == 0u {
         color = diffuse_color * sample_probe_irradiance(pos_ws, N, N, view_dir);
+        if any(transmission > vec3f(0.0)) {
+            color += transmission * sample_probe_irradiance(pos_ws, -N, -N, view_dir);
+        }
 
         // Reflections are added by the composite pass: SSR where it hits, else probe irradiance
         // around the reflection vector, leaning toward N as roughness grows (Filament's dominant
@@ -943,6 +963,8 @@ struct Model {
     transmission: vec4<f32>,
     // rgb: volume attenuation color.
     attenuation: vec4<f32>,
+    // rgb: diffuse transmission color, a: diffuse transmission factor.
+    diffuse_transmission: vec4<f32>,
 }
 
 // The composited opaque scene (exposed HDR).
@@ -1189,9 +1211,10 @@ fn fs_forward(in: ForwardVertex, @builtin(front_facing) front_facing: bool) -> @
     let N_vs = normalize(N * rot);
     let view_dir = normalize(cam_pos - pos_ws);
 
-    let diffuse_color = albedo * (1.0 - metallic) * (1.0 - transmission) * coverage;
-    let surf_vs = Surface(N_vs, normalize(-pos_vs), diffuse_color, f0, alpha);
-    let surf_ws = Surface(N, view_dir, diffuse_color, f0, alpha);
+    let diffuse_color = albedo * (1.0 - metallic) * (1.0 - transmission) * (1.0 - m.diffuse_transmission.a) * coverage;
+    let back_lit = diffuse_transmission(m.diffuse_transmission, metallic) * (1.0 - transmission) * coverage;
+    let surf_vs = Surface(N_vs, normalize(-pos_vs), diffuse_color, f0, alpha, back_lit);
+    let surf_ws = Surface(N, view_dir, diffuse_color, f0, alpha, back_lit);
 
     let n_dot_v = max(dot(N, view_dir), 1e-4);
     let reflectance = select(env_brdf_approx(f0, roughness, n_dot_v), vec3f(0.0), debug.disable_specular != 0u);
@@ -1204,6 +1227,9 @@ fn fs_forward(in: ForwardVertex, @builtin(front_facing) front_facing: bool) -> @
     var reflected = vec3f(0.0);
     if debug.disable_indirect == 0u {
         color += diffuse_color * sample_probe_irradiance(pos_ws, N, N, view_dir);
+        if any(back_lit > vec3f(0.0)) {
+            color += back_lit * sample_probe_irradiance(pos_ws, -N, -N, view_dir);
+        }
         if debug.disable_reflections == 0u && any(reflectance > vec3f(0.0)) {
             let R = normalize(mix(reflect(-view_dir, N), N, alpha));
             reflected = reflected_radiance(pos_ws, N, R, view_dir, roughness) * cp.exposure;
@@ -1323,7 +1349,8 @@ fn shade_probe(in: ForwardVertex, front_facing: bool, m: Model, base: vec4<f32>)
     let metallic = mr.b * m.material.z;
     let f0 = mix(vec3f(0.04), albedo, metallic);
     let alpha = roughness * roughness;
-    let diffuse_color = albedo * (1.0 - metallic);
+    let diffuse_color = albedo * (1.0 - metallic) * (1.0 - m.diffuse_transmission.a);
+    let transmission = diffuse_transmission(m.diffuse_transmission, metallic);
 
     // Lights are in the camera's view space; the viewer is the probe center.
     let cam_pos = camera.inv_view[3].xyz;
@@ -1332,8 +1359,8 @@ fn shade_probe(in: ForwardVertex, front_facing: bool, m: Model, base: vec4<f32>)
     let pos_vs = (pos_ws - cam_pos) * rot;
     let center = probe_capture.center.xyz;
     let view_dir = normalize(center - pos_ws);
-    let surf_vs = Surface(normalize(N * rot), normalize(view_dir * rot), diffuse_color, f0, alpha);
-    let surf_ws = Surface(N, view_dir, diffuse_color, f0, alpha);
+    let surf_vs = Surface(normalize(N * rot), normalize(view_dir * rot), diffuse_color, f0, alpha, transmission);
+    let surf_ws = Surface(N, view_dir, diffuse_color, f0, alpha, transmission);
 
     var color = emissive;
     if debug.disable_direct == 0u {
@@ -1341,6 +1368,9 @@ fn shade_probe(in: ForwardVertex, front_facing: bool, m: Model, base: vec4<f32>)
     }
     if debug.disable_indirect == 0u {
         color += diffuse_color * sample_probe_irradiance(pos_ws, N, N, view_dir);
+        if any(transmission > vec3f(0.0)) {
+            color += transmission * sample_probe_irradiance(pos_ws, -N, -N, view_dir);
+        }
         let n_dot_v = max(dot(N, view_dir), 1e-4);
         let R = normalize(mix(reflect(-view_dir, N), N, alpha));
         color += env_brdf_approx(f0, roughness, n_dot_v) * sample_probe_irradiance(pos_ws, N, R, view_dir);
