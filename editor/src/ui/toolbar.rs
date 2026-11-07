@@ -159,6 +159,9 @@ fn draw_view_menu(ui: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<Ren
     if ui.add_enabled(flags.reflections, probe).clicked() {
         flags.reflection_probe = !flags.reflection_probe;
     }
+    if ui.add(egui::Button::selectable(flags.particles, "Particles")).clicked() {
+        flags.particles = !flags.particles;
+    }
     ui.menu_button("G-buffer view", |ui| {
         for view in GBufferView::ALL {
             ui.radio_value(&mut flags.view, view, view.label());

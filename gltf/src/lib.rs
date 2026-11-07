@@ -1,6 +1,7 @@
 pub mod camera;
 pub mod lights;
 pub mod objects;
+pub mod particles;
 
 use assets::{Asset, AssetError, AssetResolver, LoadContext};
 use engine_core::{entity::EntityKey, world::World};
@@ -338,6 +339,7 @@ pub struct GltfScene {
     textures: TextureCache,
     node_entities: HashMap<usize, Vec<EntityKey>>,
     node_cameras: HashMap<usize, EntityKey>,
+    node_emitters: HashMap<usize, EntityKey>,
 }
 
 impl GltfScene {
@@ -351,6 +353,7 @@ impl GltfScene {
             textures: TextureCache::default(),
             node_entities: HashMap::new(),
             node_cameras: HashMap::new(),
+            node_emitters: HashMap::new(),
         }
     }
 
@@ -379,6 +382,12 @@ impl GltfScene {
         &self.node_cameras
     }
 
+    /// `ParticleEmitter` entities keyed by glTF node index (`particles`). Created by the first
+    /// `load_batch`.
+    pub fn node_emitters(&self) -> &HashMap<usize, EntityKey> {
+        &self.node_emitters
+    }
+
     /// The camera entity of the node the scene marks as its main camera.
     pub fn main_camera(&self) -> Option<EntityKey> {
         let document = &self.asset.document;
@@ -391,6 +400,7 @@ impl GltfScene {
     pub fn load_batch(&mut self, world: &mut World, count: usize) -> bool {
         if !self.cameras_loaded {
             self.node_cameras = load_cameras(&self.asset.document, self.root, world);
+            self.node_emitters = load_emitters(&self.asset.document, self.root, world);
             self.cameras_loaded = true;
         }
 
@@ -410,6 +420,16 @@ impl GltfScene {
 
         !self.is_complete()
     }
+}
+
+fn load_emitters(document: &gltf::Document, root: Mat4, world: &mut World) -> HashMap<usize, EntityKey> {
+    let mut emitters = HashMap::new();
+    visit_scene(document, |node, transform| {
+        let Some(data) = particles::ParticleData::read(&node) else { return };
+        let seed = node.index() as u32;
+        emitters.insert(node.index(), world.add_entity(data.emitter(root * transform, seed)));
+    });
+    emitters
 }
 
 /// Each perspective camera node becomes a `Camera` looking down the node's −Z. Exposure is

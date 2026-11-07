@@ -59,6 +59,8 @@ pub struct RenderDebugFlags {
     /// The camera-following reflection probe (`reflection_probe` pass): with this off, reflections
     /// SSR misses fall back to DDGI irradiance around the reflection vector.
     pub reflection_probe: bool,
+    /// Particle emitters (`particle_sim` + `particles`).
+    pub particles: bool,
     pub view:     GBufferView,
 
     pub show_bvh:        bool,
@@ -86,6 +88,7 @@ impl Default for RenderDebugFlags {
             reflections: true,
             ssr: true,
             reflection_probe: true,
+            particles: true,
             view:     GBufferView::Lit,
 
             show_bvh:        false,

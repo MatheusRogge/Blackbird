@@ -8,6 +8,8 @@
 
 use egui::{Color32, Id, LayerId, Order, Pos2, Rect, Sense, Shape, Stroke};
 use engine::gltf::objects::PLAYER_EYE_HEIGHT;
+use engine::gltf::particles::ParticleData;
+use engine::rendering::particles::EmitterShape;
 use engine::rendering::camera::Camera;
 use engine::rendering::mesh::Mesh;
 use engine_core::world::World;
@@ -41,6 +43,7 @@ const AXIS_COLORS: [Color32; 3] = [
     Color32::from_rgb(70, 120, 240),
 ];
 const ACTIVE_COLOR: Color32 = Color32::from_rgb(255, 210, 60);
+const EMITTER_VOLUME_COLOR: Color32 = Color32::from_rgb(140, 200, 255);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Handle {
@@ -198,6 +201,7 @@ pub fn draw(ctx: &egui::Context, state: &mut EditorState, world: &World, viewpor
         .with_clip_rect(viewport);
     let mut markers = paint_light_markers(&painter, &view, state);
     markers.extend(paint_player_starts(&painter, &view, state));
+    markers.extend(paint_emitters(&painter, &view, state));
 
     let mut hovered = None;
     if let Some(target) = target
@@ -522,6 +526,73 @@ fn paint_player_starts(painter: &egui::Painter, view: &View, state: &EditorState
     }
     marks.paint(painter);
     markers
+}
+
+/// Draws a marker at every particle emitter node, and the selected one's spawn volume.
+fn paint_emitters(painter: &egui::Painter, view: &View, state: &EditorState) -> Vec<(Selection, Pos2)> {
+    let mut markers = Vec::new();
+    let mut marks = Marks::default();
+    let mut nodes: Vec<_> = state
+        .node_edits
+        .iter()
+        .filter_map(|(&node, edit)| Some((node, edit.particles.as_ref()?)))
+        .filter(|&(node, _)| !state.is_node_deleted(node))
+        .collect();
+    nodes.sort_unstable_by_key(|&(node, _)| node);
+    for (node, data) in nodes {
+        let selected = state.selected == Some(Selection::GltfNode(node));
+        if !state.show_gizmos && !selected {
+            continue;
+        }
+        let outline = if selected { ACTIVE_COLOR } else { Color32::from_gray(230) };
+        let world = state.node_world(node);
+        let Some(center) = view.project(world.extract_translation()) else { continue };
+        if selected {
+            emitter_volume_marks(&mut marks, view, world, data);
+        }
+        marks.0.push(Mark::Disc(center, MARKER_RADIUS_PX, color32(data.color), outline));
+        markers.push((Selection::GltfNode(node), center));
+    }
+    marks.paint(painter);
+    markers
+}
+
+/// Outline of where an emitter spawns: the (sheared) box's edges, or three great circles of the sphere.
+fn emitter_volume_marks(marks: &mut Marks, view: &View, world: Mat4, data: &ParticleData) {
+    let color = EMITTER_VOLUME_COLOR;
+    let to_screen = |local: Vec3| view.project(world.transform_point3(local));
+    match data.emitter(Mat4::identity(), 0).shape {
+        EmitterShape::Box { half_extents: h, shear } => {
+            let corner = |i: usize| {
+                let sign = |bit: usize| if i & bit != 0 { 1.0 } else { -1.0 };
+                let y = sign(2) * h.y;
+                Vec3::new(sign(1) * h.x + shear.x * y, y, sign(4) * h.z + shear.y * y)
+            };
+            for a in 0..8 {
+                for bit in [1, 2, 4] {
+                    let b = a | bit;
+                    if b != a
+                        && let (Some(pa), Some(pb)) = (to_screen(corner(a)), to_screen(corner(b)))
+                    {
+                        marks.0.push(Mark::Line(vec![pa, pb], color));
+                    }
+                }
+            }
+        }
+        EmitterShape::Sphere { radius } => {
+            for (u, v) in [(Vec3::unit_x(), Vec3::unit_y()), (Vec3::unit_y(), Vec3::unit_z()), (Vec3::unit_z(), Vec3::unit_x())] {
+                let circle: Option<Vec<Pos2>> = (0..RING_SEGMENTS)
+                    .map(|i| {
+                        let angle = i as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+                        to_screen((u * angle.cos() + v * angle.sin()) * radius)
+                    })
+                    .collect();
+                if let Some(circle) = circle {
+                    marks.0.push(Mark::Loop(circle, color));
+                }
+            }
+        }
+    }
 }
 
 /// Draws a marker for every positioned light and returns their screen positions for picking.

@@ -8,6 +8,8 @@ pub mod light_upload;
 pub mod lighting;
 pub mod material;
 pub mod mipmap;
+pub mod particle_sim;
+pub mod particles;
 pub mod present;
 pub mod probe_atlas;
 pub mod probe_trace;

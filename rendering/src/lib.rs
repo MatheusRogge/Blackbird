@@ -12,6 +12,7 @@ pub mod camera_controller;
 pub mod graph;
 pub mod light;
 pub mod mesh;
+pub mod particles;
 pub mod pass;
 pub mod pbr;
 pub mod profiler;

@@ -118,6 +118,7 @@ fn draw_node(
             format!("⏶ {} [{mesh}]", node.name),
         (NodeKind::Mesh(_), _) => format!("⏶ {}", node.name),
         (NodeKind::Camera, _)  => format!("📷 {}", node.name),
+        (NodeKind::Particles, _) => format!("✨ {}", node.name),
         (NodeKind::Light | NodeKind::Empty, _) => format!("○ {}", node.name),
     };
     let target = match light {

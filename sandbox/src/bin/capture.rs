@@ -8,7 +8,7 @@
 //!   --eye x,y,z          camera position (default: the scene's main camera)
 //!   --target x,y,z       point the camera looks at
 //!   --exposure E         linear exposure override
-//!   --no-specular --no-reflections --no-ssr --no-reflection-probe --no-emissive-lights --no-indirect --no-direct --no-shadows
+//!   --no-specular --no-reflections --no-ssr --no-reflection-probe --no-emissive-lights --no-indirect --no-direct --no-shadows --no-particles
 //!   --view lit|albedo|normal|material|emissive|shadows
 //!   --point x,y,z,I[,r]  add a white point light of I candela (range 10), source radius r (default 0)
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
@@ -28,9 +28,13 @@ use engine::rendering::shader::ShaderAsset;
 use engine::rendering::renderer::Renderer;
 use engine::rendering::light::{AreaLight, PointLight, SkyLight, SpotLight};
 use engine::rendering::mesh::Mesh;
+use engine::rendering::particles::ParticleEmitter;
 use engine::world::World;
 use engine::{Entity, EntityKey};
 use ultraviolet::Vec3;
+
+/// Simulated time per rendered frame (particles), so a capture is the same on any machine.
+const CAPTURE_FRAME_TIME: f32 = 1.0 / 60.0;
 
 struct Options {
     root: PathBuf,
@@ -106,6 +110,7 @@ fn parse_args() -> Result<Options> {
             "--no-indirect" => flags.indirect = false,
             "--no-direct" => flags.direct = false,
             "--no-shadows" => flags.shadows = false,
+            "--no-particles" => flags.particles = false,
             "--view" => {
                 flags.view = match value()?.as_str() {
                     "lit" => GBufferView::Lit,
@@ -227,6 +232,7 @@ fn clear_scene(world: &mut World) {
     remove::<SpotLight>(world);
     remove::<AreaLight>(world);
     remove::<SkyLight>(world);
+    remove::<ParticleEmitter>(world);
 }
 
 fn shader(name: &str) -> Result<ShaderAsset> {
@@ -254,6 +260,7 @@ fn main() -> Result<()> {
         shader("ssr.wgsl")?,
         shader("composite.wgsl")?,
         shader("ssr_temporal.wgsl")?,
+        shader("particle_sim.wgsl")?,
     )
     .with_debug_flags(flags);
 
@@ -267,6 +274,7 @@ fn main() -> Result<()> {
         load_scene(&options, &mut world)?;
     }
     for _ in 0..options.frames {
+        world.tick_all(CAPTURE_FRAME_TIME);
         renderer.render(&world, None);
         if options.stats {
             eprintln!("{}", renderer.frame_stats());

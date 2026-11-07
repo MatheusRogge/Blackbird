@@ -13,6 +13,7 @@ pub use project::CameraSettings;
 
 use crate::asset_browser::AssetBrowserState;
 use crate::history::History;
+use engine::gltf::particles::ParticleData;
 use engine::windowed::CloseGuard;
 use crate::math;
 use build_tool::BuildKind;
@@ -35,6 +36,8 @@ pub enum NodeKind {
     Camera,
     /// Carries a `KHR_lights_punctual` light, which is edited as a `SceneLight`.
     Light,
+    /// Carries a particle emitter (`blackbird_particles` in its `extras`), edited through `NodeEdit::particles`.
+    Particles,
     Empty,
 }
 
@@ -50,6 +53,8 @@ pub struct NodeEdit {
     pub roughness_factor: Option<f32>,
     pub emissive_factor: Option<[f32; 3]>,
     pub camera: Option<CameraEdit>,
+    /// The node's particle emitter, if it has one.
+    pub particles: Option<ParticleData>,
 }
 
 /// A perspective camera's glTF settings plus its Blackbird `extras`.
@@ -77,6 +82,7 @@ impl Default for NodeEdit {
             roughness_factor: None,
             emissive_factor: None,
             camera: None,
+            particles: None,
         }
     }
 }
@@ -409,6 +415,7 @@ impl EditorState {
                 edit.roughness_factor = Some(pbr.roughness_factor());
                 edit.emissive_factor = Some(mat.emissive_factor());
             }
+            edit.particles = ParticleData::read(&node);
             if let Some(cam) = node.camera()
                 && let gltf_api::camera::Projection::Perspective(p) = cam.projection()
             {

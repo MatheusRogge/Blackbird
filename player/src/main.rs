@@ -108,6 +108,7 @@ fn main() -> Result<()> {
         ShaderAsset::from_raw(include_str!("../../sandbox/shaders/ssr.wgsl")),
         ShaderAsset::from_raw(include_str!("../../sandbox/shaders/composite.wgsl")),
         ShaderAsset::from_raw(include_str!("../../sandbox/shaders/ssr_temporal.wgsl")),
+        ShaderAsset::from_raw(include_str!("../../sandbox/shaders/particle_sim.wgsl")),
     );
 
     #[cfg(feature = "dev")]

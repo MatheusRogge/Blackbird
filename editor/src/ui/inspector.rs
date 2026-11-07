@@ -3,6 +3,8 @@ use egui::Ui;
 use std::path::Path;
 
 use engine::gltf::objects::PLAYER_EYE_HEIGHT;
+use engine::gltf::particles::{Lighting, ParticleData, ShapeKind};
+use engine::rendering::pass::particle_sim::MAX_PARTICLES;
 
 use crate::state::{
     CameraEdit, EditorObject, EditorState, LightData, LightDataExt, NodeEdit, NodeKind, ObjectKind, PhysicalCamera,
@@ -65,6 +67,9 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                             draw_transform(ui, &mut edit.translation, &mut edit.rotation, &mut edit.scale);
                             if let Some(NodeKind::Mesh(_)) = &node_kind {
                                 draw_material(ui, edit);
+                            }
+                            if let Some(particles) = &mut edit.particles {
+                                draw_particles(ui, particles);
                             }
                             if let Some(camera) = &mut edit.camera {
                                 let mut is_main = state.main_camera == Some(idx);
@@ -265,6 +270,126 @@ fn draw_object(ui: &mut egui::Ui, object: &mut EditorObject, project_dir: Option
     draw_transform(ui, &mut data.translation, &mut data.rotation, &mut data.scale);
     if let ObjectKind::Shape { material, .. } = &mut data.kind {
         draw_shape_material(ui, material);
+    }
+}
+
+fn draw_particles(ui: &mut egui::Ui, data: &mut ParticleData) {
+    egui::CollapsingHeader::new("Particles").default_open(true).show(ui, |ui| {
+        egui::Grid::new("particles_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            ui.label("Shape");
+            egui::ComboBox::from_id_salt("particle_shape")
+                .selected_text(match data.shape {
+                    ShapeKind::Box => "Box",
+                    ShapeKind::Sphere => "Sphere",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut data.shape, ShapeKind::Box, "Box");
+                    ui.selectable_value(&mut data.shape, ShapeKind::Sphere, "Sphere");
+                });
+            ui.end_row();
+
+            match data.shape {
+                ShapeKind::Box => {
+                    ui.label("Half extents").on_hover_text("Half the box's size along the node's X, Y and Z, in meters.");
+                    vec3_drag(ui, &mut data.half_extents, 0.01, 0.0..=f32::MAX, " m");
+                    ui.end_row();
+
+                    let mut slanted = data.shear_along.is_some();
+                    ui.checkbox(&mut slanted, "Slant along").on_hover_text(
+                        "Shears the box so its horizontal slices follow this direction, e.g. a light shaft.",
+                    );
+                    if slanted {
+                        let direction = data.shear_along.get_or_insert([0.0, -1.0, 0.0]);
+                        vec3_drag(ui, direction, 0.01, -1.0..=1.0, "");
+                    } else {
+                        data.shear_along = None;
+                    }
+                    ui.end_row();
+                }
+                ShapeKind::Sphere => {
+                    ui.label("Radius");
+                    ui.add(egui::DragValue::new(&mut data.radius).speed(0.01).range(0.0..=f32::MAX).suffix(" m"));
+                    ui.end_row();
+                }
+            }
+
+            ui.label("Max particles").on_hover_text("Particles alive at once. Shared budget across all emitters.");
+            ui.add(egui::DragValue::new(&mut data.count).speed(10.0).range(1..=MAX_PARTICLES));
+            ui.end_row();
+
+            ui.label("Spawn rate");
+            ui.add(egui::DragValue::new(&mut data.spawn_rate).speed(1.0).range(0.0..=f32::MAX).suffix(" /s"));
+            ui.end_row();
+
+            ui.label("Lifetime");
+            range_drag(ui, &mut data.lifetime, 0.1, 1.0, " s");
+            ui.end_row();
+
+            ui.label("Size").on_hover_text("Diameter, min and max.");
+            range_drag(ui, &mut data.size, 0.1, 1000.0, " mm");
+            ui.end_row();
+
+            ui.label("Velocity").on_hover_text("World-space drift, m/s.");
+            vec3_drag(ui, &mut data.velocity, 0.001, f32::MIN..=f32::MAX, "");
+            ui.end_row();
+
+            ui.label("Turbulence").on_hover_text("Speed of the swirling motion added to the drift.");
+            ui.add(egui::DragValue::new(&mut data.turbulence).speed(0.001).range(0.0..=f32::MAX).suffix(" m/s"));
+            ui.end_row();
+
+            ui.label("Color").on_hover_text("Scattering albedo when lit, emitted radiance when unlit.");
+            ui.color_edit_button_rgb(&mut data.color);
+            ui.end_row();
+
+            ui.label("Opacity");
+            ui.add(egui::Slider::new(&mut data.opacity, 0.0..=1.0));
+            ui.end_row();
+
+            ui.label("Lighting");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut data.lighting, Lighting::Lit, "Lit");
+                ui.selectable_value(&mut data.lighting, Lighting::Unlit, "Unlit");
+            });
+            ui.end_row();
+
+            ui.label("");
+            ui.add_enabled(data.lighting == Lighting::Lit, egui::Checkbox::new(&mut data.visible_in_light_only, "Direct light only"))
+                .on_hover_text("Ignore bounced light, so particles only show where a light reaches them (e.g. a light shaft).");
+            ui.end_row();
+        });
+
+        let mean_life = (data.lifetime[0] + data.lifetime[1]) * 0.5;
+        let steady = data.spawn_rate * mean_life;
+        let text = if steady > data.count as f32 * 1.05 {
+            format!("Spawning {steady:.0} per lifetime: capped at {}, so particles are recycled early.", data.count)
+        } else {
+            format!("≈ {steady:.0} alive once settled.")
+        };
+        ui.label(egui::RichText::new(text).weak());
+    });
+}
+
+fn vec3_drag(ui: &mut egui::Ui, v: &mut [f32; 3], speed: f64, range: std::ops::RangeInclusive<f32>, suffix: &str) {
+    ui.horizontal(|ui| {
+        for (value, axis) in v.iter_mut().zip(["X ", "Y ", "Z "]) {
+            ui.add(egui::DragValue::new(value).speed(speed).range(range.clone()).prefix(axis).suffix(suffix));
+        }
+    });
+}
+
+/// A min–max pair shown × `scale` (e.g. meters as millimeters). Min stays at or below max.
+fn range_drag(ui: &mut egui::Ui, pair: &mut [f32; 2], speed: f64, scale: f32, suffix: &str) {
+    let shown = pair.map(|v| v * scale);
+    let [mut lo, mut hi] = shown;
+    ui.horizontal(|ui| {
+        ui.add(egui::DragValue::new(&mut lo).speed(speed).range(0.0..=hi).suffix(suffix));
+        ui.label("–");
+        ui.add(egui::DragValue::new(&mut hi).speed(speed).range(lo..=f32::MAX).suffix(suffix));
+    });
+    // Only write back on an edit: dividing the shown values back out can change the last bit,
+    // which would read as an unsaved change.
+    if [lo, hi] != shown {
+        *pair = [lo / scale, hi / scale];
     }
 }
 

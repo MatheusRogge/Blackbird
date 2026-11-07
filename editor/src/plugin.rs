@@ -12,6 +12,8 @@ use engine::gltf::{GLTFAsset, GltfScene};
 use engine::plugin::{EnginePluginError, Plugin};
 use engine::rendering::camera::Camera;
 use engine::rendering::mesh::Mesh;
+use engine::gltf::particles::ParticleData;
+use engine::rendering::particles::ParticleEmitter;
 use ultraviolet::{Mat4, Vec3};
 
 use build_tool::{BuildKind, BuildOptions, BuildOutput};
@@ -73,6 +75,8 @@ struct ObjectEntities {
     source: ObjectSource,
     /// Each mesh entity with its transform relative to the object.
     meshes: Vec<(EntityKey, Mat4)>,
+    /// A model's particle emitters, each with its transform relative to the object.
+    emitters: Vec<(EntityKey, Mat4)>,
     /// Streams a model's meshes in.
     scene: Option<GltfScene>,
     /// The object as last written to its entities.
@@ -81,11 +85,11 @@ struct ObjectEntities {
 
 impl ObjectEntities {
     fn new(source: ObjectSource) -> Self {
-        Self { source, meshes: Vec::new(), scene: None, applied: None }
+        Self { source, meshes: Vec::new(), emitters: Vec::new(), scene: None, applied: None }
     }
 
     fn despawn(&self, world: &mut engine::world::World) {
-        for &(key, _) in &self.meshes {
+        for &(key, _) in self.meshes.iter().chain(&self.emitters) {
             world.remove_entity(key);
         }
     }
@@ -213,6 +217,7 @@ impl Plugin for EditorPlugin {
             }
         }
         self.apply_node_transforms(engine);
+        self.apply_particle_edits(engine);
 
         let (in_camera_preview, mut settings) = {
             let s = self.state.lock().expect("editor state mutex poisoned");
@@ -626,6 +631,11 @@ impl EditorPlugin {
                         .or_else(|| doc.scenes().next())
                         .and_then(|scene| engine::gltf::camera::main_camera(&scene));
                     s.scene_nodes = nodes;
+                    // Emitter nodes have no mesh to click, so the viewport marks them from their
+                    // edits: seed one for each up front (it matches its baseline, so it's no change).
+                    for node in doc.nodes().filter(|node| ParticleData::read(node).is_some()) {
+                        s.ensure_node_edit(node.index());
+                    }
                     s.node_parents = doc
                         .nodes()
                         .flat_map(|parent| parent.children().map(move |child| (child.index(), parent.index())))
@@ -769,7 +779,7 @@ impl EditorPlugin {
                 changed = true;
             }
 
-            let spawned = entities.meshes.len();
+            let spawned = entities.meshes.len() + entities.emitters.len();
             match &object.data.kind {
                 ObjectKind::Shape { shape, material } if entities.meshes.is_empty() => {
                     let key = world.add_entity(shape.mesh(material));
@@ -797,11 +807,18 @@ impl EditorPlugin {
                                 entities.meshes.push((key, mesh.transform));
                             }
                         }
+                        if entities.emitters.is_empty() {
+                            entities.emitters = scene
+                                .node_emitters()
+                                .values()
+                                .filter_map(|&key| Some((key, world.get_entity::<ParticleEmitter>(key)?.transform)))
+                                .collect();
+                        }
                     }
                 }
                 _ => {}
             }
-            if entities.meshes.len() != spawned {
+            if entities.meshes.len() + entities.emitters.len() != spawned {
                 changed = true;
                 entities.applied = None;
             }
@@ -820,6 +837,11 @@ impl EditorPlugin {
                     if let Some(material) = material {
                         mesh.material = material;
                     }
+                }
+            }
+            for &(key, base) in &entities.emitters {
+                if let Some(emitter) = world.get_entity_mut::<ParticleEmitter>(key) {
+                    emitter.transform = matrix * base;
                 }
             }
             entities.applied = Some(object.clone());
@@ -869,6 +891,35 @@ impl EditorPlugin {
         }
     }
 
+    /// Rebuilds a node's emitter from its edited `ParticleData` when they differ, keeping the
+    /// emitter's placement, seed, visibility and clock.
+    fn apply_particle_edits(&mut self, engine: &mut Engine) {
+        let Some(scene) = &self.scene else { return };
+        if scene.node_emitters().is_empty() {
+            return;
+        }
+        let s = self.state.lock().expect("editor state mutex poisoned");
+        let edits: Vec<(EntityKey, ParticleData)> = scene
+            .node_emitters()
+            .iter()
+            .filter_map(|(node, &key)| Some((key, s.node_edits.get(node)?.particles.clone()?)))
+            .collect();
+        drop(s);
+
+        let mut world = engine.world();
+        for (key, data) in edits {
+            let Some(emitter) = world.get_entity_mut::<ParticleEmitter>(key) else { continue };
+            let edited = ParticleEmitter {
+                time: emitter.time,
+                enabled: emitter.enabled,
+                ..data.emitter(emitter.transform, emitter.seed)
+            };
+            if *emitter != edited {
+                *emitter = edited;
+            }
+        }
+    }
+
     /// Pushes node world transforms into their mesh entities whenever a node
     /// edit changes or new meshes have streamed in.
     fn apply_node_transforms(&mut self, engine: &mut Engine) {
@@ -913,6 +964,11 @@ impl EditorPlugin {
                 (node, world)
             })
             .collect();
+        let emitters: Vec<(EntityKey, Mat4, bool)> = scene
+            .node_emitters()
+            .iter()
+            .map(|(&node, &key)| (key, s.node_world(node), !s.is_node_deleted(node)))
+            .collect();
         drop(s);
 
         let mut world = engine.world();
@@ -921,6 +977,12 @@ impl EditorPlugin {
                 if let Some(mesh) = world.get_entity_mut::<Mesh>(key) {
                     mesh.transform = worlds[node];
                 }
+            }
+        }
+        for (key, transform, enabled) in emitters {
+            if let Some(emitter) = world.get_entity_mut::<ParticleEmitter>(key) {
+                emitter.transform = transform;
+                emitter.enabled = enabled;
             }
         }
 
@@ -1185,6 +1247,8 @@ fn node_snapshot(node: &gltf_api::Node) -> SceneNode {
             NodeKind::Camera
         } else if node.light().is_some() {
             NodeKind::Light
+        } else if ParticleData::read(node).is_some() {
+            NodeKind::Particles
         } else {
             NodeKind::Empty
         },

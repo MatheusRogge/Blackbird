@@ -20,6 +20,7 @@ scene.with_root(Mat4) -> GltfScene        // place the whole scene under a trans
 scene.load_batch(&mut World, count) -> bool   // true while more mesh nodes remain
 scene.is_complete() -> bool
 scene.node_entities() -> &HashMap<usize, Vec<EntityKey>>   // glTF node index → its mesh entities
+scene.node_emitters() -> &HashMap<usize, EntityKey>        // glTF node index → its ParticleEmitter
 gltf::local_matrix(&node) -> Mat4             // node transform relative to its parent
 ```
 
@@ -31,6 +32,9 @@ Camera settings in `extras`: `PhysicalCamera { aperture, shutter_speed (s), iso 
 ### `lights.rs`
 `LightData` (serde, tagged `type`: sky/point/spot/area) in physical units. `read_lights(doc)` returns `KHR_lights_punctual` node lights (world position/direction, missing `range` → cutoff radius; point/spot `source_radius` from the light's own `extras.blackbird_source_radius` (`SOURCE_RADIUS_KEY`), default 0) plus area lights from root `extras.blackbird_lights`. `LightData::spawn(world)` and `apply(world, key)` create and update the matching `rendering::light` entity. The editor writes lights back in `editor/src/lights.rs`. Keep both sides of the format in step.
 
+### `particles.rs`
+`ParticleData` (serde): a node's `extras.blackbird_particles` (`EXTRAS_KEY`): `shape` (`box` with `half_extents` and optional `shear_along` direction, or `sphere` with `radius`), `count`, `spawn_rate`, `lifetime` / `size` ranges, `velocity`, `turbulence`, `color`, `opacity`, `blend` (only `additive`), `lighting` (`lit` / `unlit`), `visible_in_light_only`; unknown keys (`notes`) are ignored, an invalid object is logged and skipped. `ParticleData::read(node)`, `emitter(transform, seed)` → `rendering::particles::ParticleEmitter` (shear becomes XZ per unit Y, ranges are sorted). The editor keeps these extras on save because it never rewrites node `extras`.
+
 ### `objects.rs`
 Objects the editor places besides glTF nodes, as root `extras.blackbird_objects` (`EXTRAS_KEY`): a list of `SceneObject { name, translation, rotation ([x, y, z, w]), scale, kind }` (serde; `kind` flattened, tagged `type`):
 - `shape` (`Shape`: cube / sphere / plane / cylinder, unit-sized and centered, the plane in XZ facing +Y, plus a `ShapeMaterial`). Geometry isn't stored: `Shape::mesh(&material)` generates it (counter-clockwise outward triangles, UVs and tangents; unit-tested), so player and editor build the same mesh.
@@ -41,7 +45,7 @@ Objects the editor places besides glTF nodes, as root `extras.blackbird_objects`
 
 ## Scene loading
 `GltfScene` spreads the work across frames so a large scene doesn't stall the game thread:
-1. On the first `load_batch`, every perspective camera node in the scene becomes a `rendering::camera::Camera` at the node's world transform, looking down its −Z with +Y up. A missing aspect ratio follows the viewport, a missing `zfar` becomes `camera::INFINITE_FAR`, and exposure comes from the camera's physical settings (else 1). `node_cameras()` maps node index → camera entity, and `main_camera()` resolves the scene's marked camera.
+1. On the first `load_batch`, every node with `blackbird_particles` becomes a `ParticleEmitter` at its world transform (× the root; seeded by node index), and every perspective camera node in the scene becomes a `rendering::camera::Camera` at the node's world transform, looking down its −Z with +Y up. A missing aspect ratio follows the viewport, a missing `zfar` becomes `camera::INFINITE_FAR`, and exposure comes from the camera's physical settings (else 1). `node_cameras()` maps node index → camera entity, and `main_camera()` resolves the scene's marked camera.
 2. `GltfScene::new` walks the default scene (or the first scene, or every root node if there are no scenes) depth-first and records each node that has a mesh, together with its **world matrix** (parent × local).
 3. Each call converts the meshes of up to `count` of those nodes. **Each primitive becomes one `rendering::mesh::Mesh` entity** with `transform` set to the node's world matrix. Vertices stay in mesh-local space. A mesh used by several nodes is created once per node.
 

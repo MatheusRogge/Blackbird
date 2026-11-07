@@ -1366,3 +1366,236 @@ fn fs_probe_sky(in: ProbeSkyVertex) -> @location(0) vec4<f32> {
     let dir = normalize(probe_capture.forward.xyz + in.ndc.x * probe_capture.right.xyz + in.ndc.y * probe_capture.up.xyz);
     return vec4f(min(sky_color(dir), vec3f(PROBE_MAX_RADIANCE)), PROBE_SKY_DISTANCE);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Particles (rendering::pass::particles), simulated by `particle_sim.wgsl`: camera-facing discs
+// drawn additively over the finished HDR image. Group 0 holds the G-buffer depth (binding 3, for
+// soft fades), the particle slots (12) and the emitters (13); groups 1–4 are the usual lighting
+// bindings. Particles scatter light with a Henyey–Greenstein phase function.
+
+// Mirrors rendering::pass::particle_sim::MAX_EMITTERS (and particle_sim.wgsl).
+const MAX_EMITTERS: u32 = 16u;
+const PARTICLE_FLAG_LIGHT_ONLY: u32 = 2u;
+const PARTICLE_FLAG_UNLIT: u32 = 4u;
+// Particles smaller than this (radius, pixels) are drawn at this size with their energy scaled
+// down to match, so sub-pixel dust doesn't flicker as it crosses pixel centers.
+const MIN_PARTICLE_RADIUS_PX: f32 = 1.0;
+// Distance (m) over which a particle fades out as it nears the surface behind it.
+const PARTICLE_SOFT_DISTANCE: f32 = 0.05;
+// Forward scattering of dust: brighter looking toward the light.
+const PARTICLE_PHASE_G: f32 = 0.4;
+
+// Mirrors `Particle` in particle_sim.wgsl.
+struct Particle {
+    pos:  vec3<f32>,
+    age:  f32,
+    size: f32,
+    life: f32,
+    rand: f32,
+    _pad: f32,
+}
+
+// Mirrors rendering::pass::particle_sim::GpuEmitter (and particle_sim.wgsl).
+struct GpuEmitter {
+    transform: mat4x4<f32>,
+    extent:   vec4<f32>,
+    shear:    vec4<f32>,
+    velocity: vec4<f32>,
+    // rgb: scattering albedo (lit) or radiance (unlit); a: opacity.
+    color:    vec4<f32>,
+    ranges:   vec4<f32>,
+    slots:    vec4<u32>,
+    step:     vec4<f32>,
+    info:     vec4<u32>,
+}
+
+struct ParticleParams {
+    // Emitter count, slots in use.
+    counts:   vec4<u32>,
+    // Surface width, height, projection y scale (1 / tan(fovy / 2)).
+    screen:   vec4<f32>,
+    emitters: array<GpuEmitter, MAX_EMITTERS>,
+}
+
+@group(0) @binding(12) var<storage, read> particle_slots: array<Particle>;
+@group(0) @binding(13) var<uniform> particle_params: ParticleParams;
+
+struct ParticleVertex {
+    @builtin(position) pos: vec4<f32>,
+    // Position on the unit disc.
+    @location(0) corner: vec2<f32>,
+    @location(1) @interpolate(flat) center: vec3<f32>,
+    // Opacity × lifetime fade × the energy kept by the minimum size.
+    @location(2) @interpolate(flat) weight: f32,
+    @location(3) @interpolate(flat) emitter: u32,
+    // View-space distance along −Z.
+    @location(4) @interpolate(flat) depth: f32,
+}
+
+// Henyey–Greenstein, normalized so an isotropic scatterer gives 1.
+fn particle_phase(cos_theta: f32) -> f32 {
+    let g = PARTICLE_PHASE_G;
+    let denom = 1.0 + g * g - 2.0 * g * cos_theta;
+    return (1.0 - g * g) / (denom * sqrt(denom));
+}
+
+// Visibility of sky light `L` (world, toward the light) at a point, from the camera's cascades.
+fn particle_sky_shadow(pos_vs: vec3<f32>, depth_vs: f32) -> vec3<f32> {
+    if debug.disable_shadows != 0u { return vec3f(1.0); }
+    let cascade = select_cascade(depth_vs);
+    let clip = sp.view_to_shadow[cascade] * vec4f(pos_vs, 1.0);
+    let ndc = clip.xyz / clip.w;
+    let uv = ndc.xy * vec2f(0.5, -0.5) + 0.5;
+    let ref_depth = ndc.z - sp.bias;
+    if any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || ref_depth < 0.0 || ref_depth > 1.0 {
+        return vec3f(1.0);
+    }
+    var lit = 0.0;
+    for (var sy: i32 = -1; sy <= 1; sy += 1) {
+        for (var sx: i32 = -1; sx <= 1; sx += 1) {
+            let off = vec2f(f32(sx), f32(sy)) * sp.inv_shadow_map_size;
+            lit += textureSampleCompareLevel(t_shadow, s_shadow, uv + off, i32(cascade), ref_depth);
+        }
+    }
+    return lit / 9.0 * glass_tint(t_glass_tint, uv, cascade, ref_depth);
+}
+
+// Illuminance from every light at a particle, each weighted by the phase function toward the
+// camera (`view_dir`, world). Same lights, falloffs and shadows as `direct_lighting`; shadow
+// lookups offset toward the light instead of along a normal.
+fn particle_direct(pos_vs: vec3<f32>, pos_ws: vec3<f32>, view_dir: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
+    let rot = mat3x3<f32>(camera.inv_view[0].xyz, camera.inv_view[1].xyz, camera.inv_view[2].xyz);
+    let V_vs = normalize(view_dir * rot);
+    let depth_vs = -pos_vs.z;
+    var color = vec3f(0.0);
+
+    let cluster_idx = cluster_index(pixel, depth_vs);
+    for (var i = 0u; i < light_grid[cluster_idx]; i++) {
+        let light = point_lights[light_indices[cluster_idx * MAX_LIGHTS_PER_CLUSTER + i]];
+        let to_light = light.position_vs - pos_vs;
+        let dist = length(to_light);
+        if dist >= light.radius { continue; }
+        let L = to_light / dist;
+        let vis = local_shadow_of(light.shadow_slot, pos_ws, rot * L, pixel);
+        let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
+        color += light.color * vis * (light.intensity * falloff * particle_phase(dot(-L, V_vs)));
+    }
+
+    for (var i = 0u; i < light_counts.num_spot; i++) {
+        let light = spot_lights[i];
+        let to_light = light.position_vs - pos_vs;
+        let dist = length(to_light);
+        if dist >= light.radius { continue; }
+        let L = to_light / dist;
+        let cd = dot(-L, normalize(light.direction_vs));
+        let t = clamp((cd - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
+        let vis = local_shadow_of(light.shadow_slot, pos_ws, rot * L, pixel);
+        let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
+        color += light.color * vis * (light.intensity * t * t * falloff * particle_phase(dot(-L, V_vs)));
+    }
+
+    for (var i = 0u; i < light_counts.num_area; i++) {
+        let light = area_lights[i];
+        let half_r = length(light.right_vs);
+        let half_u = length(light.up_vs);
+        if half_r <= 0.0 || half_u <= 0.0 { continue; }
+        let r_dir = light.right_vs / half_r;
+        let u_dir = light.up_vs / half_u;
+        let rel = pos_vs - light.position_vs;
+        let closest = light.position_vs
+            + r_dir * clamp(dot(rel, r_dir), -half_r, half_r)
+            + u_dir * clamp(dot(rel, u_dir), -half_u, half_u);
+        let to_light = closest - pos_vs;
+        let dist2 = max(dot(to_light, to_light), 1e-4);
+        let L = to_light * inverseSqrt(dist2);
+        let area = 4.0 * half_r * half_u;
+        let facing = area_facing(light, -L, normalize(cross(r_dir, u_dir)));
+        if facing <= 0.0 { continue; }
+        let vis = local_shadow_of(light.shadow_slot, pos_ws, rot * L, pixel);
+        color += light.color * vis
+            * (light.intensity * facing * area / (dist2 + area) * particle_phase(dot(-L, V_vs)));
+    }
+
+    for (var i = 0u; i < cp.num_sky_lights; i++) {
+        let sky = sky_lights[i];
+        let L = normalize((camera.inv_view * vec4f(-sky.direction_vs, 0.0)).xyz);
+        if L.y < 0.0 { continue; }
+        color += sky.color * particle_sky_shadow(pos_vs, depth_vs) * (sky.intensity * particle_phase(dot(-L, view_dir)));
+    }
+
+    return color;
+}
+
+@vertex
+fn vs_particle(@builtin(vertex_index) vi: u32, @builtin(instance_index) slot: u32) -> ParticleVertex {
+    var out: ParticleVertex;
+    // Outside the clip volume: dead or behind-the-camera particles draw nothing.
+    out.pos = vec4f(2.0, 2.0, 2.0, 1.0);
+    let p = particle_slots[slot];
+    if p.age >= p.life { return out; }
+
+    var ei = 0u;
+    for (var k = 0u; k < particle_params.counts.x; k++) {
+        let s = particle_params.emitters[k].slots;
+        if slot >= s.x && slot < s.x + s.y { ei = k; break; }
+    }
+    let e = particle_params.emitters[ei];
+
+    let clip = camera.view_proj * vec4f(p.pos, 1.0);
+    if clip.w <= camera.depth_params.x { return out; }
+
+    let screen = particle_params.screen;
+    let radius_px = 0.5 * p.size * screen.z * 0.5 * screen.y / clip.w;
+    let drawn_px = max(radius_px, MIN_PARTICLE_RADIUS_PX);
+    let t = p.age / p.life;
+    let fade = smoothstep(0.0, 0.1, t) * (1.0 - smoothstep(0.85, 1.0, t));
+
+    var corners = array<vec2<f32>, 6>(
+        vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0),
+        vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0),
+    );
+    let corner = corners[vi];
+    out.pos = clip + vec4f(corner * (2.0 * drawn_px / screen.xy) * clip.w, 0.0, 0.0);
+    out.corner = corner;
+    out.center = p.pos;
+    out.weight = e.color.a * fade * (radius_px / drawn_px) * (radius_px / drawn_px);
+    out.emitter = ei;
+    out.depth = clip.w;
+    return out;
+}
+
+// Additive: rgb is added to the scene, alpha leaves it unchanged.
+@fragment
+fn fs_particle(in: ParticleVertex) -> @location(0) vec4<f32> {
+    let r2 = dot(in.corner, in.corner);
+    if r2 >= 1.0 { discard; }
+    // A soft disc that integrates to the disc's area: 3 (1 − r²)² over the unit disc gives π.
+    let shape = 3.0 * (1.0 - r2) * (1.0 - r2);
+
+    let d = textureLoad(t_depth, vec2<i32>(in.pos.xy), 0);
+    let n = camera.depth_params.x;
+    let f = camera.depth_params.y;
+    let scene = select(n * f / (d * (f - n) + n), 1e30, d <= 0.0);
+    let soft = saturate((scene - in.depth) / PARTICLE_SOFT_DISTANCE);
+    if soft <= 0.0 { discard; }
+
+    let e = particle_params.emitters[in.emitter];
+    var radiance = e.color.rgb;
+    if (e.info.y & PARTICLE_FLAG_UNLIT) == 0u {
+        let cam_pos = camera.inv_view[3].xyz;
+        let rot = mat3x3<f32>(camera.inv_view[0].xyz, camera.inv_view[1].xyz, camera.inv_view[2].xyz);
+        let pos_vs = (in.center - cam_pos) * rot;
+        let view_dir = normalize(cam_pos - in.center);
+        var light = vec3f(0.0);
+        if debug.disable_direct == 0u {
+            light += particle_direct(pos_vs, in.center, view_dir, in.pos.xy) / PI;
+        }
+        if debug.disable_indirect == 0u && (e.info.y & PARTICLE_FLAG_LIGHT_ONLY) == 0u {
+            // DDGI is irradiance per hemisphere: a mote sees both, toward and away from the camera.
+            light += 0.5 * (sample_probe_irradiance(in.center, view_dir, view_dir, view_dir)
+                + sample_probe_irradiance(in.center, -view_dir, -view_dir, view_dir));
+        }
+        radiance *= light;
+    }
+    return vec4f(radiance * (cp.exposure * in.weight * shape * soft), 0.0);
+}

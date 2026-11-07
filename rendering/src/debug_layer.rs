@@ -110,6 +110,7 @@ impl UiLayer for DebugLayer {
                             ui.checkbox(&mut flags.reflection_probe, "Reflection probe");
                         });
                     });
+                    ui.checkbox(&mut flags.particles, "Particles");
                     egui::ComboBox::from_label("View")
                         .selected_text(flags.view.label())
                         .show_ui(ui, |ui| {

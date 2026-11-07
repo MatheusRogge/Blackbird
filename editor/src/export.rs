@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use engine::gltf::camera::{MAIN_CAMERA_KEY, PHYSICAL_KEY};
+use engine::gltf::particles::{self, ParticleData};
 use gltf_api::json::camera::Perspective;
 use gltf_api::json::extras::Extras;
 use gltf_api::json::material::{EmissiveFactor, PbrBaseColorFactor, StrengthFactor};
@@ -25,6 +26,10 @@ pub fn write_gltf(state: &EditorState, path: &Path) -> Result<()> {
         node.rotation = Some(UnitQuaternion(edit.rotation));
         node.scale = Some(edit.scale);
         node.matrix = None;
+
+        if let Some(particles) = &edit.particles {
+            write_particles(&mut node.extras, particles)?;
+        }
 
         let cam_idx = node.camera.as_ref().map(|c| c.value());
         let mesh_idx = node.mesh.as_ref().map(|m| m.value());
@@ -69,6 +74,28 @@ pub fn write_gltf(state: &EditorState, path: &Path) -> Result<()> {
     let json = serde_json::to_string_pretty(&root).context("JSON serialization failed")?;
     std::fs::write(path, json).context("writing file")?;
     Ok(())
+}
+
+/// Writes `data` over the node's `blackbird_particles`, keeping keys the editor doesn't model
+/// (e.g. `notes`). A field `data` leaves unset (`null`) is removed.
+fn write_particles(extras: &mut Extras, data: &ParticleData) -> Result<()> {
+    let existing = extras
+        .as_ref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw.get()).ok())
+        .and_then(|mut v| v.get_mut(particles::EXTRAS_KEY).map(Value::take));
+    let mut merged = match existing {
+        Some(Value::Object(map)) => map,
+        _ => Map::new(),
+    };
+    let Value::Object(fields) = serde_json::to_value(data)? else { anyhow::bail!("particle data isn't an object") };
+    for (key, value) in fields {
+        if value.is_null() {
+            merged.remove(&key);
+        } else {
+            merged.insert(key, value);
+        }
+    }
+    set_extra(extras, particles::EXTRAS_KEY, Some(Value::Object(merged)))
 }
 
 /// Takes deleted nodes out of every scene and parent. They stay in the node list (removing them
@@ -201,6 +228,41 @@ mod tests {
         let objects = engine::gltf::objects::read_objects(&saved).unwrap();
         assert_eq!(objects.len(), 2);
         assert_eq!(objects[1].model_uri(), Some("../assets/models/chair.gltf"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_writes_particle_edits_and_keeps_unknown_keys() {
+        let json = r#"{
+            "asset": { "version": "2.0" },
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "name": "Dust", "extras": { "other": 1, "blackbird_particles": {
+                "shape": "box", "shear_along": [0.2, -0.9, 0.3], "count": 10, "spawn_rate": 1.0,
+                "lifetime": [1.0, 2.0], "size": [0.01, 0.02], "notes": "keep me" } } }]
+        }"#;
+        let doc = gltf_api::Gltf::from_slice(json.as_bytes()).unwrap().document;
+        let dir = std::env::temp_dir().join(format!("blackbird_particles_test_{}", std::process::id()));
+        let scene_path = dir.join("level.gltf");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let shared = EditorState::new();
+        let mut state = shared.lock().unwrap();
+        state.document = Some(doc);
+        state.ensure_node_edit(0);
+        let edit = state.node_edits.get_mut(&0).unwrap();
+        let particles = edit.particles.as_mut().expect("node has an emitter");
+        particles.count = 42;
+        particles.shear_along = None;
+        write_gltf(&state, &scene_path).unwrap();
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&scene_path).unwrap()).unwrap();
+        let extras = &saved["nodes"][0]["extras"];
+        assert_eq!(extras["other"], 1);
+        let written = &extras[particles::EXTRAS_KEY];
+        assert_eq!(written["count"], 42);
+        assert_eq!(written["notes"], "keep me");
+        assert!(written.get("shear_along").is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

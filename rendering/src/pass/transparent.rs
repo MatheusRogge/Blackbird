@@ -198,7 +198,9 @@ impl TransparentPass {
     ) -> (Self, ResourceId) {
         let output_id = graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
             format: FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
         });
         let pass = Self {
             node_id: None,

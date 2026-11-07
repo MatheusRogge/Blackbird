@@ -13,6 +13,8 @@ use crate::{
         gbuffer::GBufferPass,
         light_upload::LightUploadPass,
         lighting::LightingPass,
+        particle_sim::ParticleSimPass,
+        particles::ParticlesPass,
         present::PresentPass,
         probe_atlas::{ProbeAtlasPass, ProbeGridConfig},
         probe_trace::ProbeTracePass,
@@ -41,6 +43,7 @@ pub struct RenderGraphPBRBuilder {
     ssr_shader:            ShaderAsset,
     composite_shader:      ShaderAsset,
     ssr_temporal_shader:   ShaderAsset,
+    particle_sim_shader:   ShaderAsset,
     debug_flags:           Option<Arc<RwLock<RenderDebugFlags>>>,
 }
 
@@ -58,6 +61,7 @@ impl RenderGraphPBRBuilder {
         ssr_shader:           ShaderAsset,
         composite_shader:     ShaderAsset,
         ssr_temporal_shader:  ShaderAsset,
+        particle_sim_shader:  ShaderAsset,
     ) -> Self {
         Self {
             gbuffer_shader,
@@ -71,6 +75,7 @@ impl RenderGraphPBRBuilder {
             ssr_shader,
             composite_shader,
             ssr_temporal_shader,
+            particle_sim_shader,
             debug_flags: None,
         }
     }
@@ -226,10 +231,31 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             &probe_atlas_outputs,
             camera_buffer_id,
             &reflection_outputs,
-            self.lighting_shader,
+            self.lighting_shader.clone(),
             Arc::clone(&debug_flags),
         );
         graph.add_pass(device, transparent_pass);
+
+        let (particle_sim_pass, particle_outputs) =
+            ParticleSimPass::new(&mut graph, self.particle_sim_shader, Arc::clone(&debug_flags));
+        graph.add_pass(device, particle_sim_pass);
+
+        let (particles_pass, particles_id) = ParticlesPass::new(
+            &mut graph,
+            transparent_id,
+            &particle_outputs,
+            &gbuffer_outputs,
+            &lighting_outputs,
+            &cluster_outputs,
+            &light_buffers,
+            &shadow_outputs,
+            &probe_atlas_outputs,
+            camera_buffer_id,
+            &reflection_outputs,
+            self.lighting_shader,
+            Arc::clone(&debug_flags),
+        );
+        graph.add_pass(device, particles_pass);
 
         let (debug_overlay_pass, debug_overlay_outputs) = DebugOverlayPass::new(
             &mut graph,
@@ -244,7 +270,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         graph.add_pass(device, debug_overlay_pass);
 
         let present_pass = PresentPass::new(
-            transparent_id,
+            particles_id,
             debug_overlay_outputs.debug_overlay_id,
             surface_view_id,
             surface_config.format,
