@@ -52,6 +52,33 @@ impl TextureAsset {
         let [r, g, b] = rgb.map(|c| (c / alpha) as f32);
         [r, g, b, (alpha / count as f64) as f32]
     }
+
+    /// Fraction of the triangle with texture coordinates `uv` whose alpha is at least `cutoff`
+    /// (0–1), sampled on a grid of `COVERAGE_GRID`² / 2 points, nearest texel, repeating.
+    pub fn coverage(&self, uv: [[f32; 2]; 3], cutoff: f32) -> f32 {
+        const COVERAGE_GRID: u32 = 12;
+        if self.width == 0 || self.height == 0 {
+            return 1.0;
+        }
+        if cutoff > 1.0 {
+            return 0.0;
+        }
+        let threshold = (cutoff * 255.0).ceil() as u8;
+        let (mut inside, mut total) = (0u32, 0u32);
+        for i in 0..COVERAGE_GRID {
+            for j in 0..COVERAGE_GRID - i {
+                let a = (i as f32 + 1.0 / 3.0) / COVERAGE_GRID as f32;
+                let b = (j as f32 + 1.0 / 3.0) / COVERAGE_GRID as f32;
+                let c = 1.0 - a - b;
+                let [u, v] = std::array::from_fn(|k| uv[0][k] * a + uv[1][k] * b + uv[2][k] * c);
+                let x = ((u.rem_euclid(1.0) * self.width as f32) as u32).min(self.width - 1);
+                let y = ((v.rem_euclid(1.0) * self.height as f32) as u32).min(self.height - 1);
+                inside += u32::from(self.data[((y * self.width + x) * 4 + 3) as usize] >= threshold);
+                total += 1;
+            }
+        }
+        inside as f32 / total as f32
+    }
 }
 
 fn srgb_to_linear(c: f32) -> f32 {
@@ -68,6 +95,18 @@ mod tests {
     fn mean_ignores_transparent_texels() {
         let texture = TextureAsset::new(2, 1, vec![255, 0, 0, 255, 0, 255, 0, 0]);
         assert_eq!(texture.mean(false), [1.0, 0.0, 0.0, 0.5]);
+    }
+
+    #[test]
+    fn coverage_counts_texels_passing_the_cutoff() {
+        // Left column opaque, right column transparent.
+        let texture = TextureAsset::new(2, 1, vec![0, 0, 0, 255, 0, 0, 0, 0]);
+        let left = [[0.0, 0.0], [0.5, 0.0], [0.0, 1.0]];
+        assert_eq!(texture.coverage(left, 0.5), 1.0);
+        let whole = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let c = texture.coverage(whole, 0.5);
+        assert!((c - 0.75).abs() < 0.1, "{c}");
+        assert_eq!(texture.coverage(whole, 0.0), 1.0);
     }
 
     #[test]

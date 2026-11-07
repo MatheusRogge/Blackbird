@@ -171,6 +171,8 @@ impl Pass for BvhUploadPass {
             let world_pos = |i: usize| -> [f32; 3] {
                 mesh.transform.transform_point3(Vec3::from(mesh.vertices[i].position)).into()
             };
+            // Cut-out texels pass `alpha × base color alpha >= cutoff`.
+            let cutout = mesh.alpha_cutoff().map(|cutoff| (cutoff, mesh.material.base_color[3]));
             let verts = &mesh.vertices;
             for chunk in mesh.indices.chunks(3) {
                 if chunk.len() < 3 { continue; }
@@ -178,8 +180,18 @@ impl Pass for BvhUploadPass {
                 if i0 >= verts.len() || i1 >= verts.len() || i2 >= verts.len() { continue; }
                 let (v0, v1, v2) = (world_pos(i0), world_pos(i1), world_pos(i2));
                 let color = |c: usize| (verts[i0].color[c] + verts[i1].color[c] + verts[i2].color[c]) / 3.0;
+                let coverage = match cutout {
+                    None => 1.0,
+                    Some((_, base_alpha)) if base_alpha <= 0.0 => 0.0,
+                    Some((cutoff, base_alpha)) => mesh.albedo_texture.as_ref().map_or(
+                        if base_alpha >= cutoff { 1.0 } else { 0.0 },
+                        |texture| texture.coverage([i0, i1, i2].map(|i| verts[i].uv), cutoff / base_alpha),
+                    ),
+                };
+                if coverage <= 0.0 { continue; }
                 let albedo_metallic = pack_unorm4x8([albedo[0] * color(0), albedo[1] * color(1), albedo[2] * color(2), metallic]);
-                gpu_tris.push(GpuTriangle { v0, albedo_metallic, v1, roughness, v2, emissive });
+                let roughness_coverage = pack_unorm4x8([roughness, coverage, 0.0, 0.0]);
+                gpu_tris.push(GpuTriangle { v0, albedo_metallic, v1, roughness_coverage, v2, emissive });
             }
         }
 

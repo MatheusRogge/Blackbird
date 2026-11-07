@@ -13,7 +13,7 @@ struct BvhNode {
 // Mirrors rendering::bvh::GpuTriangle.
 struct BvhTriangle {
     v0: vec3<f32>, albedo_metallic: u32,  // linear albedo rgb + metallic, unorm8
-    v1: vec3<f32>, roughness: f32,
+    v1: vec3<f32>, roughness_coverage: u32, // unorm8 x: roughness, y: alpha coverage
     v2: vec3<f32>, emissive: u32,          // unorm8 rgb × 2^(a·255 − 128), 0 = none
 }
 
@@ -161,6 +161,24 @@ fn ray_tri_hit(ro: vec3<f32>, rd: vec3<f32>, v0: vec3<f32>, v1: vec3<f32>, v2: v
 
 // ── Iterative BVH traversal ───────────────────────────────────────────────────
 
+// Seeded per ray in `main`, advanced by every cut-out test.
+var<private> rng_state: u32;
+
+fn next_random() -> f32 {
+    rng_state = rng_state * 747796405u + 2891336453u;
+    var word = ((rng_state >> ((rng_state >> 28u) + 4u)) ^ rng_state) * 277803737u;
+    word = (word >> 22u) ^ word;
+    return f32(word >> 8u) / 16777216.0;
+}
+
+// Alpha-tested (cut-out) triangles store the fraction of their area that is solid. A ray passes
+// through the rest with that probability; the probes' temporal blend averages it into partial
+// occlusion.
+fn passes_cutout(tri: BvhTriangle) -> bool {
+    let coverage = unpack4x8unorm(tri.roughness_coverage).y;
+    return coverage < 1.0 && next_random() >= coverage;
+}
+
 // With `any_hit`, returns at the first hit closer than `max_dist` (for shadow rays), without the
 // closest-hit position, normal or triangle.
 fn bvh_trace(ro: vec3<f32>, rd: vec3<f32>, max_dist: f32, any_hit: bool) -> TraceResult {
@@ -186,7 +204,7 @@ fn bvh_trace(ro: vec3<f32>, rd: vec3<f32>, max_dist: f32, any_hit: bool) -> Trac
             for (var i = 0u; i < count; i++) {
                 let tri = bvh_tris[first + i];
                 let t = ray_tri_hit(ro, rd, tri.v0, tri.v1, tri.v2);
-                if t > 0.0 && t < result.dist {
+                if t > 0.0 && t < result.dist && !passes_cutout(tri) {
                     result.hit    = true;
                     result.dist   = t;
                     if any_hit { return result; }
@@ -261,7 +279,8 @@ fn shade_hit(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>, tri: BvhTri
     let material  = unpack4x8unorm(tri.albedo_metallic);
     let metallic  = material.a;
     let f0        = mix(vec3f(0.04), material.rgb, metallic);
-    let specular  = env_brdf_approx(f0, tri.roughness, max(dot(normal, to_probe), 1e-4));
+    let roughness = unpack4x8unorm(tri.roughness_coverage).x;
+    let specular  = env_brdf_approx(f0, roughness, max(dot(normal, to_probe), 1e-4));
     let albedo    = material.rgb * (1.0 - metallic) * (1.0 - specular) + specular;
     let brdf      = albedo / PI;
     // Local-light shadow rays also stop `bias` short, so a light touching its fixture or emitter
@@ -354,6 +373,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if probe_index >= probe_params.probe_count    { return; }
 
     let out_idx = probe_index * probe_params.rays_per_probe + ray_index;
+    rng_state = out_idx * 1973u + frame.frame_index * 9277u + 26699u;
+    next_random();
 
     if bvh_info.enabled == 0u {
         ray_radiance[out_idx]  = vec4f(0.0, 0.0, 0.0, probe_params.max_ray_distance);

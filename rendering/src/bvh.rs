@@ -25,7 +25,9 @@ pub struct GpuTriangle {
     /// Linear albedo RGB + metallic, packed unorm8 (`unpack4x8unorm`).
     pub albedo_metallic: u32,
     pub v1: [f32; 3],
-    pub roughness: f32,
+    /// Roughness and alpha coverage (the fraction of the triangle that isn't cut out), packed
+    /// unorm8 in x and y.
+    pub roughness_coverage: u32,
     pub v2: [f32; 3],
     /// Emitted radiance: unorm8 RGB scaled by `2^(A − 128)` (see `pack_emissive`). 0 = none.
     pub emissive: u32,
