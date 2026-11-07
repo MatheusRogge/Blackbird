@@ -1,7 +1,7 @@
 //! Particle emitters in glTF: a node's `extras.blackbird_particles` describes one emitter placed
 //! at the node. `GltfScene` spawns them (`node_emitters`).
 
-use rendering::particles::{EmitterShape, ParticleEmitter, ParticleLighting};
+use rendering::particles::{EmitterShape, ParticleCollision, ParticleEmitter, ParticleLighting};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ultraviolet::{Mat4, Vec2, Vec3};
@@ -26,6 +26,15 @@ pub enum Blend {
 pub enum Lighting {
     Lit,
     Unlit,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Collision {
+    #[default]
+    None,
+    /// Particles come to rest on visible surfaces (`ParticleCollision::Settle`).
+    Settle,
 }
 
 /// The `blackbird_particles` object. Unknown keys (e.g. `notes`) are ignored.
@@ -59,6 +68,8 @@ pub struct ParticleData {
     pub lighting: Lighting,
     #[serde(default)]
     pub visible_in_light_only: bool,
+    #[serde(default)]
+    pub collision: Collision,
 }
 
 fn one() -> f32 {
@@ -121,6 +132,10 @@ impl ParticleData {
                 Lighting::Unlit => ParticleLighting::Unlit,
             },
             light_only: self.visible_in_light_only,
+            collision: match self.collision {
+                Collision::None => ParticleCollision::None,
+                Collision::Settle => ParticleCollision::Settle,
+            },
             seed,
             ..ParticleEmitter::default()
         }

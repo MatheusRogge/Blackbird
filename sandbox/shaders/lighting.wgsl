@@ -1370,7 +1370,7 @@ fn fs_probe_sky(in: ProbeSkyVertex) -> @location(0) vec4<f32> {
 // ---------------------------------------------------------------------------------------------
 // Particles (rendering::pass::particles), simulated by `particle_sim.wgsl`: camera-facing discs
 // drawn additively over the finished HDR image. Group 0 holds the G-buffer depth (binding 3, for
-// soft fades), the particle slots (12) and the emitters (13); groups 1–4 are the usual lighting
+// soft fades), the particle slots (12), the emitters (13) and the draw list (14); groups 1–4 are the usual lighting
 // bindings. Particles scatter light with a Henyey–Greenstein phase function.
 
 // Mirrors rendering::pass::particle_sim::MAX_EMITTERS (and particle_sim.wgsl).
@@ -1384,6 +1384,10 @@ const MIN_PARTICLE_RADIUS_PX: f32 = 1.0;
 const PARTICLE_SOFT_DISTANCE: f32 = 0.05;
 // Forward scattering of dust: brighter looking toward the light.
 const PARTICLE_PHASE_G: f32 = 0.4;
+// Particle::flags bit set by particle_sim.wgsl when a particle settles on a surface.
+const PARTICLE_RESTING: u32 = 1u;
+// A settled particle stays visible until the surface in front of it is this much (m) nearer.
+const PARTICLE_REST_TOLERANCE: f32 = 0.02;
 
 // Mirrors `Particle` in particle_sim.wgsl.
 struct Particle {
@@ -1392,7 +1396,8 @@ struct Particle {
     size: f32,
     life: f32,
     rand: f32,
-    _pad: f32,
+    // Bit 0: resting on a surface (settled).
+    flags: u32,
 }
 
 // Mirrors rendering::pass::particle_sim::GpuEmitter (and particle_sim.wgsl).
@@ -1419,6 +1424,8 @@ struct ParticleParams {
 
 @group(0) @binding(12) var<storage, read> particle_slots: array<Particle>;
 @group(0) @binding(13) var<uniform> particle_params: ParticleParams;
+// Slots of the live particles, one per instance (particle_sim.wgsl's draw list).
+@group(0) @binding(14) var<storage, read> particle_draw_list: array<u32>;
 
 struct ParticleVertex {
     @builtin(position) pos: vec4<f32>,
@@ -1430,6 +1437,8 @@ struct ParticleVertex {
     @location(3) @interpolate(flat) emitter: u32,
     // View-space distance along −Z.
     @location(4) @interpolate(flat) depth: f32,
+    // Settled on a surface: no soft fade, which would hide it.
+    @location(5) @interpolate(flat) resting: u32,
 }
 
 // Henyey–Greenstein, normalized so an isotropic scatterer gives 1.
@@ -1527,12 +1536,12 @@ fn particle_direct(pos_vs: vec3<f32>, pos_ws: vec3<f32>, view_dir: vec3<f32>, pi
 }
 
 @vertex
-fn vs_particle(@builtin(vertex_index) vi: u32, @builtin(instance_index) slot: u32) -> ParticleVertex {
+fn vs_particle(@builtin(vertex_index) vi: u32, @builtin(instance_index) instance: u32) -> ParticleVertex {
     var out: ParticleVertex;
-    // Outside the clip volume: dead or behind-the-camera particles draw nothing.
+    // Outside the clip volume: particles behind the camera draw nothing.
     out.pos = vec4f(2.0, 2.0, 2.0, 1.0);
+    let slot = particle_draw_list[instance];
     let p = particle_slots[slot];
-    if p.age >= p.life { return out; }
 
     var ei = 0u;
     for (var k = 0u; k < particle_params.counts.x; k++) {
@@ -1561,6 +1570,7 @@ fn vs_particle(@builtin(vertex_index) vi: u32, @builtin(instance_index) slot: u3
     out.weight = e.color.a * fade * (radius_px / drawn_px) * (radius_px / drawn_px);
     out.emitter = ei;
     out.depth = clip.w;
+    out.resting = p.flags & PARTICLE_RESTING;
     return out;
 }
 
@@ -1576,7 +1586,10 @@ fn fs_particle(in: ParticleVertex) -> @location(0) vec4<f32> {
     let n = camera.depth_params.x;
     let f = camera.depth_params.y;
     let scene = select(n * f / (d * (f - n) + n), 1e30, d <= 0.0);
-    let soft = saturate((scene - in.depth) / PARTICLE_SOFT_DISTANCE);
+    var soft = saturate((scene - in.depth) / PARTICLE_SOFT_DISTANCE);
+    if in.resting != 0u {
+        soft = select(0.0, 1.0, scene - in.depth > -PARTICLE_REST_TOLERANCE);
+    }
     if soft <= 0.0 { discard; }
 
     let e = particle_params.emitters[in.emitter];

@@ -24,7 +24,8 @@ use crate::{
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// Draws the particles `particle_sim` simulated over the finished HDR scene: copies `scene` into
-/// its own target, then draws every live particle as an additive camera-facing disc
+/// its own target, then draws every live particle (an indirect draw over `particle_sim`'s draw
+/// list, so expired slots cost nothing) as an additive camera-facing disc
 /// (`lighting.wgsl`'s `vs_particle` / `fs_particle`), lit with the same bindings as `lighting`.
 /// No depth attachment: the fragment shader fades particles out against the G-buffer depth itself
 /// (soft particles). Particles draw over glass. Skipped in G-buffer debug views.
@@ -36,12 +37,14 @@ pub struct ParticlesPass {
     particle_bg: Option<(usize, wgpu::BindGroup)>,
     bindings: LightingBindings,
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
-    draw_count: Arc<AtomicU32>,
+    slots_in_use: Arc<AtomicU32>,
 
     scene_id: ResourceId,
     depth_id: ResourceId,
     particles_id: ResourceId,
     params_id: ResourceId,
+    state_id: ResourceId,
+    draw_list_id: ResourceId,
     debug_flags_id: ResourceId,
     output_id: ResourceId,
 }
@@ -84,11 +87,13 @@ impl ParticlesPass {
                 reflection,
             ),
             debug_flags,
-            draw_count: Arc::clone(&particles.draw_count),
+            slots_in_use: Arc::clone(&particles.slots_in_use),
             scene_id,
             depth_id: gbuffer.depth_id,
             particles_id: particles.particles_id,
             params_id: particles.params_id,
+            state_id: particles.state_id,
+            draw_list_id: particles.draw_list_id,
             debug_flags_id: lighting.debug_flags_id,
             output_id,
         };
@@ -113,6 +118,16 @@ impl ParticlesPass {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 12,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
                     visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -186,7 +201,15 @@ impl PassDesc for ParticlesPass {
     }
 
     fn reads(&self) -> Vec<ResourceId> {
-        let mut reads = vec![self.scene_id, self.depth_id, self.particles_id, self.params_id, self.debug_flags_id];
+        let mut reads = vec![
+            self.scene_id,
+            self.depth_id,
+            self.particles_id,
+            self.params_id,
+            self.state_id,
+            self.draw_list_id,
+            self.debug_flags_id,
+        ];
         reads.extend(self.bindings.reads());
         reads
     }
@@ -228,13 +251,17 @@ impl Pass for ParticlesPass {
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
 
-        let count = self.draw_count.load(Ordering::Relaxed);
         let lit_view = self.debug_flags.read().expect("debug_flags poisoned").view == GBufferView::Lit;
-        if count == 0 || !lit_view {
+        if self.slots_in_use.load(Ordering::Relaxed) == 0 || !lit_view {
             return;
         }
-        let (Some(&particles), Some(&params)) = (ctx.buffers.get(&self.particles_id), ctx.buffers.get(&self.params_id))
-        else {
+        let buffer = |id| ctx.buffers.get(id).copied();
+        let (Some(particles), Some(params), Some(state), Some(draw_list)) = (
+            buffer(&self.particles_id),
+            buffer(&self.params_id),
+            buffer(&self.state_id),
+            buffer(&self.draw_list_id),
+        ) else {
             return;
         };
 
@@ -251,6 +278,7 @@ impl Pass for ParticlesPass {
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
                     wgpu::BindGroupEntry { binding: 12, resource: particles.binding() },
                     wgpu::BindGroupEntry { binding: 13, resource: params.binding() },
+                    wgpu::BindGroupEntry { binding: 14, resource: draw_list.binding() },
                 ],
             });
             self.particle_bg = Some((depth_key, bind_group));
@@ -273,6 +301,6 @@ impl Pass for ParticlesPass {
         for (i, bind_group) in lighting_bgs.into_iter().enumerate() {
             pass.set_bind_group(i as u32 + 1, bind_group, &[]);
         }
-        pass.draw(0..6, 0..count);
+        pass.draw_indirect(state.buffer, state.offset);
     }
 }

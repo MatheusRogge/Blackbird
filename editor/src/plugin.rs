@@ -898,7 +898,11 @@ impl EditorPlugin {
         if scene.node_emitters().is_empty() {
             return;
         }
-        let s = self.state.lock().expect("editor state mutex poisoned");
+        let mut s = self.state.lock().expect("editor state mutex poisoned");
+        let bursts: Vec<(EntityKey, u32)> = std::mem::take(&mut s.particle_bursts)
+            .into_iter()
+            .filter_map(|(node, count)| Some((*scene.node_emitters().get(&node)?, count)))
+            .collect();
         let edits: Vec<(EntityKey, ParticleData)> = scene
             .node_emitters()
             .iter()
@@ -911,11 +915,17 @@ impl EditorPlugin {
             let Some(emitter) = world.get_entity_mut::<ParticleEmitter>(key) else { continue };
             let edited = ParticleEmitter {
                 time: emitter.time,
+                bursts: emitter.bursts,
                 enabled: emitter.enabled,
                 ..data.emitter(emitter.transform, emitter.seed)
             };
             if *emitter != edited {
                 *emitter = edited;
+            }
+        }
+        for (key, count) in bursts {
+            if let Some(emitter) = world.get_entity_mut::<ParticleEmitter>(key) {
+                emitter.burst(count);
             }
         }
     }

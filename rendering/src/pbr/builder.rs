@@ -237,7 +237,14 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         graph.add_pass(device, transparent_pass);
 
         let (particle_sim_pass, particle_outputs) =
-            ParticleSimPass::new(&mut graph, self.particle_sim_shader, Arc::clone(&debug_flags));
+            ParticleSimPass::new(
+                &mut graph,
+                gbuffer_outputs.depth_id,
+                gbuffer_outputs.normal_id,
+                camera_buffer_id,
+                self.particle_sim_shader,
+                Arc::clone(&debug_flags),
+            );
         graph.add_pass(device, particle_sim_pass);
 
         let (particles_pass, particles_id) = ParticlesPass::new(

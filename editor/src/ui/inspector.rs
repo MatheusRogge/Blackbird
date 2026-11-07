@@ -3,7 +3,7 @@ use egui::Ui;
 use std::path::Path;
 
 use engine::gltf::objects::PLAYER_EYE_HEIGHT;
-use engine::gltf::particles::{Lighting, ParticleData, ShapeKind};
+use engine::gltf::particles::{Collision, Lighting, ParticleData, ShapeKind};
 use engine::rendering::pass::particle_sim::MAX_PARTICLES;
 
 use crate::state::{
@@ -70,6 +70,12 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                             }
                             if let Some(particles) = &mut edit.particles {
                                 draw_particles(ui, particles);
+                                ui.horizontal(|ui| {
+                                    if ui.button("Burst").on_hover_text("Spawn this many particles at once (not saved).").clicked() {
+                                        state.particle_bursts.push((idx, state.burst_size));
+                                    }
+                                    ui.add(egui::DragValue::new(&mut state.burst_size).speed(10.0).range(1..=MAX_PARTICLES));
+                                });
                             }
                             if let Some(camera) = &mut edit.camera {
                                 let mut is_main = state.main_camera == Some(idx);
@@ -355,6 +361,14 @@ fn draw_particles(ui: &mut egui::Ui, data: &mut ParticleData) {
             ui.label("");
             ui.add_enabled(data.lighting == Lighting::Lit, egui::Checkbox::new(&mut data.visible_in_light_only, "Direct light only"))
                 .on_hover_text("Ignore bounced light, so particles only show where a light reaches them (e.g. a light shaft).");
+            ui.end_row();
+
+            ui.label("Collision");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut data.collision, Collision::None, "None");
+                ui.selectable_value(&mut data.collision, Collision::Settle, "Settle")
+                    .on_hover_text("Particles come to rest on surfaces they fall onto. Only surfaces visible on screen count.");
+            });
             ui.end_row();
         });
 

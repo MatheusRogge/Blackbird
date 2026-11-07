@@ -12,6 +12,7 @@
 //!   --view lit|albedo|normal|material|emissive|shadows
 //!   --point x,y,z,I[,r]  add a white point light of I candela (range 10), source radius r (default 0)
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
+//!   --burst N            every particle emitter bursts N particles on the second frame
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -46,6 +47,7 @@ struct Options {
     target: Option<Vec3>,
     exposure: Option<f32>,
     reloads: u32,
+    burst: u32,
     points: Vec<(Vec3, f32, f32)>,
     stats: bool,
     flags: RenderDebugFlags,
@@ -73,6 +75,7 @@ fn parse_args() -> Result<Options> {
         target: None,
         exposure: None,
         reloads: 0,
+        burst: 0,
         points: Vec::new(),
         stats: false,
         flags: RenderDebugFlags::default(),
@@ -93,6 +96,7 @@ fn parse_args() -> Result<Options> {
             "--target" => options.target = Some(parse_vec3(&value()?)?),
             "--exposure" => options.exposure = Some(value()?.parse()?),
             "--reloads" => options.reloads = value()?.parse()?,
+            "--burst" => options.burst = value()?.parse()?,
             "--point" => {
                 let v = value()?;
                 let parts: Vec<&str> = v.split(',').collect();
@@ -273,8 +277,13 @@ fn main() -> Result<()> {
         clear_scene(&mut world);
         load_scene(&options, &mut world)?;
     }
-    for _ in 0..options.frames {
+    for frame in 0..options.frames {
         world.tick_all(CAPTURE_FRAME_TIME);
+        if frame == 1 && options.burst > 0 {
+            for emitter in world.get_entities_mut::<ParticleEmitter>() {
+                emitter.burst(options.burst);
+            }
+        }
         renderer.render(&world, None);
         if options.stats {
             eprintln!("{}", renderer.frame_stats());

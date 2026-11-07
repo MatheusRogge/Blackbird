@@ -322,6 +322,10 @@ pub struct EditorState {
     pub camera_preview_node: Option<usize>,
     /// Node whose camera the player renders from, saved in the scene's `extras`.
     pub main_camera: Option<usize>,
+    /// Inspector "Burst" requests (emitter node, particle count), drained by the plugin.
+    pub particle_bursts: Vec<(usize, u32)>,
+    /// Particles the inspector's Burst button spawns.
+    pub burst_size: u32,
 
     pub new_project_requested: bool,
     pub open_project_requested: bool,
@@ -362,6 +366,8 @@ impl EditorState {
             show_gizmos: true,
             camera_preview_node: None,
             main_camera: None,
+            particle_bursts: Vec::new(),
+            burst_size: 100,
             editor_camera_key: None,
             camera_settings: CameraSettings::default(),
             lights: Vec::new(),
