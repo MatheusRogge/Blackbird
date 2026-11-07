@@ -135,7 +135,8 @@ fn ray_aabb_hit(ro: vec3<f32>, inv_rd: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>, 
     let t_near = max(max(min(t1.x, t2.x), min(t1.y, t2.y)), min(t1.z, t2.z));
     let t_far  = min(min(max(t1.x, t2.x), max(t1.y, t2.y)), max(t1.z, t2.z));
     if t_near > t_far || t_far < 0.0 || t_near > t_max { return -1.0; }
-    return t_near;
+    // A ray starting inside the box (always the case for the root) has a negative t_near.
+    return max(t_near, 0.0);
 }
 
 // ── Möller–Trumbore ray–triangle intersection ─────────────────────────────────
