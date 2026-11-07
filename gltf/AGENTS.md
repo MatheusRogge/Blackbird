@@ -1,6 +1,6 @@
 # gltf
 
-glTF 2.0 / GLB support. Converts documents into `rendering` entities in an `engine_core::World`. `src/lib.rs` handles loading and scenes, `src/lights.rs` handles scene lights. Wraps the upstream `gltf` crate (same name, so it's referenced as `::gltf` inside).
+glTF 2.0 / GLB support. Converts documents into `rendering` entities in an `engine_core::World`. `src/lib.rs` handles loading and scenes, `src/lights.rs` handles scene lights, `src/objects.rs` the editor's placed objects. Wraps the upstream `gltf` crate (same name, so it's referenced as `::gltf` inside).
 
 Depends on `assets`, `engine_core`, `rendering`, plus `image`, `urlencoding` and `serde_json`.
 
@@ -10,12 +10,13 @@ Depends on `assets`, `engine_core`, `rendering`, plus `image`, `urlencoding` and
 pub struct GLTFAsset { pub document: gltf::Document, pub buffers: Vec<buffer::Data>, pub images: Vec<image::Data> }
 impl Asset for GLTFAsset {}
 
-pub struct GLTFAssetResolver;            // AssetResolver<Asset = GLTFAsset>, reports buffer/image URIs as dependencies
+pub struct GLTFAssetResolver;            // AssetResolver<Asset = GLTFAsset>, reports buffer/image URIs and placed-model URIs as dependencies
 pub enum GLTFAssetError { Asset, DocumentError, Image }   // Asset passes through, others -> AssetError::Other
 gltf::external_uri(uri) -> Option<Cow<str>>   // percent-decoded relative URI, None for data: URIs
 
 pub struct GltfScene;
 GltfScene::new(Arc<GLTFAsset>)
+scene.with_root(Mat4) -> GltfScene        // place the whole scene under a transform (a placed model)
 scene.load_batch(&mut World, count) -> bool   // true while more mesh nodes remain
 scene.is_complete() -> bool
 scene.node_entities() -> &HashMap<usize, Vec<EntityKey>>   // glTF node index → its mesh entities
@@ -29,6 +30,14 @@ Camera settings in `extras`: `PhysicalCamera { aperture, shutter_speed (s), iso 
 
 ### `lights.rs`
 `LightData` (serde, tagged `type`: sky/point/spot/area) in physical units. `read_lights(doc)` returns `KHR_lights_punctual` node lights (world position/direction, missing `range` → cutoff radius; point/spot `source_radius` from the light's own `extras.blackbird_source_radius` (`SOURCE_RADIUS_KEY`), default 0) plus area lights from root `extras.blackbird_lights`. `LightData::spawn(world)` and `apply(world, key)` create and update the matching `rendering::light` entity. The editor writes lights back in `editor/src/lights.rs`. Keep both sides of the format in step.
+
+### `objects.rs`
+Objects the editor places besides glTF nodes, as root `extras.blackbird_objects` (`EXTRAS_KEY`): a list of `SceneObject { name, translation, rotation ([x, y, z, w]), scale, kind }` (serde; `kind` flattened, tagged `type`):
+- `shape` (`Shape`: cube / sphere / plane / cylinder, unit-sized and centered, the plane in XZ facing +Y, plus a `ShapeMaterial`). Geometry isn't stored: `Shape::mesh(&material)` generates it (counter-clockwise outward triangles, UVs and tangents; unit-tested), so player and editor build the same mesh.
+- `model { uri }`: another glTF file's default scene placed under the object's transform, URI relative to the scene file like a buffer. The resolver reports these URIs as dependencies, so `collect` ships each model and, transitively, its buffers and images. One level: a placed model's own objects aren't loaded.
+- `player_start`: where the player stands (feet) and faces (local −Z heading); `PLAYER_EYE_HEIGHT` (1.7 m) above it.
+
+`read_objects(doc)`, `SceneObject::matrix()`, `objects::trs`. The editor writes them in `editor/src/export.rs`; the player and `capture` spawn them. Keep both sides in step.
 
 ## Scene loading
 `GltfScene` spreads the work across frames so a large scene doesn't stall the game thread:

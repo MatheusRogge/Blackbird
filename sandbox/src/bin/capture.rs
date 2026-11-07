@@ -14,11 +14,12 @@
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, bail};
 use engine::assets::{AssetManager, DirectorySource};
+use engine::gltf::objects::{self, ObjectKind, PLAYER_EYE_HEIGHT};
 use engine::gltf::{GLTFAsset, GltfScene, lights};
 use engine::rendering::camera::Camera;
 use engine::rendering::debug_flags::{GBufferView, RenderDebugFlags};
@@ -122,8 +123,9 @@ fn parse_args() -> Result<Options> {
     Ok(options)
 }
 
-/// Loads the scene like the player does: lights, every mesh, and only the main camera. Each call
-/// reads the file again, so its textures are new allocations.
+/// Loads the scene like the player does: lights, every mesh, the editor's objects (shapes, placed
+/// models), and only the main camera, or one at the player start. Each call reads the file again,
+/// so its textures are new allocations.
 fn load_scene(options: &Options, world: &mut World) -> Result<()> {
     let mut assets = AssetManager::default();
     assets.set_source(Arc::new(DirectorySource::new(&options.root)));
@@ -142,6 +144,44 @@ fn load_scene(options: &Options, world: &mut World) -> Result<()> {
         for &key in scene.node_cameras().values().filter(|&&key| key != main) {
             world.remove_entity(key);
         }
+    }
+
+    let mut player_start = None;
+    for object in objects::read_objects(&asset.document)? {
+        match &object.kind {
+            ObjectKind::Shape { shape, material } => {
+                world.add_entity(shape.mesh(material).with_transform(object.matrix()));
+            }
+            ObjectKind::Model { uri } => {
+                let uri = engine::gltf::external_uri(uri).map_or_else(|| uri.clone(), |u| u.into_owned());
+                let path = engine::assets::path::resolve_relative(Path::new(&options.scene), &uri);
+                let model: Arc<GLTFAsset> = assets.load_asset(path.to_string_lossy().replace('\\', "/"))?;
+                let mut placed = GltfScene::new(model).with_root(object.matrix());
+                while placed.load_batch(world, 1000) {}
+                for &key in placed.node_cameras().values() {
+                    world.remove_entity(key);
+                }
+            }
+            ObjectKind::PlayerStart => player_start = player_start.or(Some(object)),
+        }
+    }
+    if let Some(start) = player_start {
+        let cameras: Vec<_> = world.get_entity_handles::<Camera>().iter().map(|h| h.id).collect();
+        for key in cameras {
+            world.remove_entity(key);
+        }
+        let eye = Vec3::from(start.translation) + Vec3::unit_y() * PLAYER_EYE_HEIGHT;
+        let forward = start.matrix().transform_vec3(-Vec3::unit_z());
+        world.add_entity(Camera {
+            up: Vec3::unit_y(),
+            eye,
+            target: eye + Vec3::new(forward.x, 0.0, forward.z),
+            aspect: None,
+            fovy: 60.0_f32.to_radians(),
+            near: 0.01,
+            far: 10_000.0,
+            exposure: 1.0,
+        });
     }
 
     if world.get_entities::<Camera>().is_empty() {

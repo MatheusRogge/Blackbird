@@ -1,5 +1,6 @@
 pub mod camera;
 pub mod lights;
+pub mod objects;
 
 use assets::{Asset, AssetError, AssetResolver, LoadContext};
 use engine_core::{entity::EntityKey, world::World};
@@ -123,7 +124,14 @@ impl AssetResolver for GLTFAssetResolver {
             image::Source::Uri { uri, .. } => external_uri(uri),
             image::Source::View { .. } => None,
         });
-        Ok(buffers.chain(images).map(Cow::into_owned).collect())
+        // Placed models (`objects`) load as their own assets, so builds must ship them too.
+        let objects = objects::read_objects(&document).unwrap_or_else(|e| {
+            log::warn!("{}: invalid {}: {e}", ctx.path().display(), objects::EXTRAS_KEY);
+            Vec::new()
+        });
+        let models: Vec<Cow<'_, str>> =
+            objects.iter().filter_map(|o| o.model_uri().and_then(external_uri).map(|u| Cow::Owned(u.into_owned()))).collect();
+        Ok(buffers.chain(images).chain(models).map(Cow::into_owned).collect())
     }
 }
 
@@ -322,6 +330,8 @@ fn mesh_nodes(document: &gltf::Document) -> Vec<(usize, Mat4)> {
 
 pub struct GltfScene {
     asset: Arc<GLTFAsset>,
+    /// Applied on top of every node's world transform (`with_root`).
+    root: Mat4,
     pending: Vec<(usize, Mat4)>,
     next_node: usize,
     cameras_loaded: bool,
@@ -334,6 +344,7 @@ impl GltfScene {
     pub fn new(asset: Arc<GLTFAsset>) -> Self {
         Self {
             pending: mesh_nodes(&asset.document),
+            root: Mat4::identity(),
             asset,
             next_node: 0,
             cameras_loaded: false,
@@ -341,6 +352,12 @@ impl GltfScene {
             node_entities: HashMap::new(),
             node_cameras: HashMap::new(),
         }
+    }
+
+    /// Places the whole scene under `root`, e.g. a model placed by a scene object.
+    pub fn with_root(mut self, root: Mat4) -> Self {
+        self.root = root;
+        self
     }
 
     pub fn document(&self) -> &gltf::Document {
@@ -373,7 +390,7 @@ impl GltfScene {
     /// node's world transform. Returns `true` if more remain.
     pub fn load_batch(&mut self, world: &mut World, count: usize) -> bool {
         if !self.cameras_loaded {
-            self.node_cameras = load_cameras(&self.asset.document, world);
+            self.node_cameras = load_cameras(&self.asset.document, self.root, world);
             self.cameras_loaded = true;
         }
 
@@ -386,7 +403,7 @@ impl GltfScene {
                 build_mesh_primitives(&mesh, &self.asset.buffers, &self.asset.images, &mut self.textures);
             let keys = self.node_entities.entry(node_index).or_default();
             for entity in primitives {
-                keys.push(world.add_entity(entity.with_transform(transform)));
+                keys.push(world.add_entity(entity.with_transform(self.root * transform)));
             }
         }
         self.next_node = end;
@@ -397,9 +414,10 @@ impl GltfScene {
 
 /// Each perspective camera node becomes a `Camera` looking down the node's −Z. Exposure is
 /// 1 unless the camera has physical settings.
-fn load_cameras(document: &gltf::Document, world: &mut World) -> HashMap<usize, EntityKey> {
+fn load_cameras(document: &gltf::Document, root: Mat4, world: &mut World) -> HashMap<usize, EntityKey> {
     let mut cameras = HashMap::new();
     visit_scene(document, |node, transform| {
+        let transform = root * transform;
         let Some(camera) = node.camera() else { return };
         let gltf::camera::Projection::Perspective(perspective) = camera.projection() else { return };
         let eye = transform.cols[3].xyz();
