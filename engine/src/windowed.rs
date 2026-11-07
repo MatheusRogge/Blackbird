@@ -1,4 +1,5 @@
 use std::mem;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Instant;
@@ -39,6 +40,37 @@ impl rendering::renderer::OverlayPass for EguiOverlay {
     }
 }
 
+/// Lets an application intercept the window's close button, e.g. to ask about unsaved work.
+/// Cheap to clone; every clone shares the same state, so it can live in the app's own state and
+/// be used from any thread.
+#[derive(Clone, Default)]
+pub struct CloseGuard(Arc<CloseGuardState>);
+
+#[derive(Default)]
+struct CloseGuardState {
+    veto: AtomicBool,
+    requested: AtomicBool,
+    exit: AtomicBool,
+}
+
+impl CloseGuard {
+    /// While vetoed, the close button only records a request (`take_close_request`) instead of
+    /// exiting.
+    pub fn set_veto(&self, veto: bool) {
+        self.0.veto.store(veto, Ordering::Relaxed);
+    }
+
+    /// Whether the close button was pressed while vetoed since the last call.
+    pub fn take_close_request(&self) -> bool {
+        self.0.requested.swap(false, Ordering::Relaxed)
+    }
+
+    /// Closes the application, regardless of the veto.
+    pub fn exit(&self) {
+        self.0.exit.store(true, Ordering::Relaxed);
+    }
+}
+
 enum GameMsg {
     Tick { inputs: Vec<InputEvent> },
     Shutdown,
@@ -58,6 +90,7 @@ pub struct WindowedApplication<B: RenderGraphBuilder> {
     resize_tx: Option<mpsc::SyncSender<ResizeMsg>>,
     window: Option<Arc<Window>>,
     window_title: Option<String>,
+    close_guard: CloseGuard,
     game_thread: Option<thread::JoinHandle<()>>,
     render_thread: Option<thread::JoinHandle<()>>,
 
@@ -76,6 +109,7 @@ impl<B: RenderGraphBuilder> WindowedApplication<B> {
             resize_tx: None,
             window: None,
             window_title: None,
+            close_guard: CloseGuard::default(),
             game_thread: None,
             render_thread: None,
             #[cfg(feature = "ui")]
@@ -86,6 +120,19 @@ impl<B: RenderGraphBuilder> WindowedApplication<B> {
     pub fn add_plugin(mut self, plugin: impl Plugin) -> Self {
         self.inner = self.inner.add_plugin(plugin);
         self
+    }
+
+    /// Routes the close button through `guard` (see `CloseGuard`).
+    pub fn with_close_guard(mut self, guard: CloseGuard) -> Self {
+        self.close_guard = guard;
+        self
+    }
+
+    fn shutdown(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(tx) = self.game_tx.take() {
+            let _ = tx.send(GameMsg::Shutdown);
+        }
+        event_loop.exit();
     }
 
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
@@ -378,12 +425,17 @@ impl<B: RenderGraphBuilder> ApplicationHandler for WindowedApplication<B> {
                 }
             }
             WindowEvent::CloseRequested => {
-                if let Some(tx) = self.game_tx.take() {
-                    let _ = tx.send(GameMsg::Shutdown);
+                if self.close_guard.0.veto.load(Ordering::Relaxed) {
+                    self.close_guard.0.requested.store(true, Ordering::Relaxed);
+                } else {
+                    self.shutdown(event_loop);
                 }
-                event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
+                if self.close_guard.0.exit.load(Ordering::Relaxed) {
+                    self.shutdown(event_loop);
+                    return;
+                }
                 if let Some(tx) = &self.game_tx {
                     let inputs = mem::take(&mut self.pending_inputs);
                     let _ = tx.try_send(GameMsg::Tick { inputs });

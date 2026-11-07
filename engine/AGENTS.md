@@ -57,8 +57,10 @@ WindowedApplication::new(render_graph_builder)
     .with_title("My Game")
     .add_plugin(MyGame::default())
     .add_ui_layer(MyLayer)                       // feature "ui"
+    .with_close_guard(guard.clone())             // optional: intercept the close button
     .run()?;
 ```
+`CloseGuard` (cloneable, shared state, usable from any thread): while `set_veto(true)`, the window's close button only records a request (`take_close_request()`) instead of shutting down, so the app can ask first; `exit()` shuts down regardless (checked on the next redraw). Without a guard, closing exits at once. The editor vetoes while there are unsaved changes.
 On winit `resumed` it creates the window, builds the `Renderer` (blocking on `pollster`), takes `Engine` and the plugins out of the inner `HeadlessApplication`, and spawns the **game** and **render** threads (see the root `AGENTS.md` for the thread model). Plugin setup already ran on the main thread at `add_plugin` time, before any window exists.
 
 Per game tick: inputs → `InputBuffer`, `World::tick_all`, `Plugin::tick` for each plugin in order, then the input batch goes to the render thread for egui.
