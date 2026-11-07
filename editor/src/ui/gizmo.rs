@@ -63,6 +63,17 @@ struct AddMenu {
     placement: Placement,
 }
 
+/// A right press that the cursor never leaves by more than this (points) opens the Add menu on
+/// release, however long it was held; anything further is a camera orbit.
+const RIGHT_CLICK_SLOP: f32 = 12.0;
+
+/// A right press in the viewport that may still become an Add menu.
+#[derive(Clone, Copy)]
+struct RightPress {
+    origin: Pos2,
+    farthest: f32,
+}
+
 /// Placement when nothing is hit and the ray misses the ground: this far along it.
 const FALLBACK_DISTANCE: f32 = 5.0;
 const PLAYER_START_COLOR: Color32 = Color32::from_rgb(80, 220, 120);
@@ -176,7 +187,10 @@ pub fn draw(ctx: &egui::Context, state: &mut EditorState, world: &World, viewpor
     let pointer = ctx.input(|i| i.pointer.hover_pos());
     let gizmo_layer = LayerId::new(Order::Middle, Id::unique("gizmo_input"));
     let pointer_free = pointer.is_some_and(|p| {
-        viewport.contains(p) && ctx.layer_id_at(p).is_none_or(|layer| layer == gizmo_layer)
+        // The root Ui is a background layer spanning the window; `viewport` already excludes
+        // its panels.
+        viewport.contains(p)
+            && ctx.layer_id_at(p).is_none_or(|layer| layer == gizmo_layer || layer.order == Order::Background)
     });
 
     let painter = ctx
@@ -267,13 +281,38 @@ pub fn draw(ctx: &egui::Context, state: &mut EditorState, world: &World, viewpor
 /// the new light or object where the click ray meets the scene.
 fn draw_add_menu(ctx: &egui::Context, state: &mut EditorState, world: &World, view: &View, pointer: Option<Pos2>, pointer_free: bool) {
     let menu_id = Id::unique("viewport_add_menu");
-    if pointer_free
-        && !ctx.is_pointer_over_egui()
-        && ctx.input(|i| i.pointer.secondary_clicked())
-        && let Some(p) = pointer
-    {
+    let press_id = Id::unique("viewport_right_press");
+    let (pressed, released) = ctx.input(|i| {
+        (
+            i.pointer.button_pressed(egui::PointerButton::Secondary),
+            i.pointer.button_released(egui::PointerButton::Secondary),
+        )
+    });
+    // egui's own click detection gives up after a short hold or a few points of jitter, which a
+    // right press that also nudges the orbit camera easily exceeds.
+    let mut press = ctx.data(|d| d.get_temp::<RightPress>(press_id));
+    if pressed {
+        press = (pointer_free && !ctx.is_pointer_over_egui())
+            .then_some(pointer)
+            .flatten()
+            .map(|origin| RightPress { origin, farthest: 0.0 });
+    }
+    if let (Some(press), Some(p)) = (press.as_mut(), pointer) {
+        press.farthest = press.farthest.max(press.origin.distance(p));
+    }
+    let clicked = released && press.is_some_and(|press| press.farthest <= RIGHT_CLICK_SLOP);
+    ctx.data_mut(|d| match press.filter(|_| !released) {
+        Some(press) => {
+            d.insert_temp(press_id, press);
+        }
+        None => d.remove::<RightPress>(press_id),
+    });
+
+    let mut opened = false;
+    if clicked && let Some(p) = pointer {
         let menu = AddMenu { pos: p, placement: placement(world, state, view, p) };
         ctx.data_mut(|d| d.insert_temp(menu_id, menu));
+        opened = true;
     }
     let Some(menu) = ctx.data(|d| d.get_temp::<AddMenu>(menu_id)) else { return };
 
@@ -286,8 +325,10 @@ fn draw_add_menu(ctx: &egui::Context, state: &mut EditorState, world: &World, vi
         });
     });
 
-    // Menus and their submenus live on foreground layers; a press anywhere else closes it.
-    let pressed_elsewhere = ctx.input(|i| i.pointer.any_pressed())
+    // Menus and their submenus live on foreground layers; a press anywhere else closes it. Not
+    // on the opening frame: a quick click's press and release often arrive in the same frame.
+    let pressed_elsewhere = !opened
+        && ctx.input(|i| i.pointer.any_pressed())
         && pointer.is_some_and(|p| ctx.layer_id_at(p).is_none_or(|layer| layer.order != Order::Foreground));
     let chose = picked.is_some();
     if let Some(kind) = picked {
