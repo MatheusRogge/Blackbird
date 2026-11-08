@@ -15,7 +15,9 @@ use crate::{
         MAX_AREA_LIGHTS, MAX_POINT_LIGHTS, MAX_SKY_LIGHTS, MAX_SPOT_LIGHTS, PointLight, SkyLight,
         SpotLight, SHADOW_KIND_AREA, SHADOW_KIND_POINT, SHADOW_KIND_SPOT, SHADOW_SLOT_NONE, ShadowedLights,
         SharedShadowCasters, SpotShadow,
+        shadow_lod::{FaceShape, ViewSamples, face_coverage},
         shadow_slots::{ShadowCandidate, ShadowSlots},
+        MAX_SHADOWED_LIGHTS,
     },
     mesh::Mesh,
     pass::{PassContext, Pass, PassDesc},
@@ -283,7 +285,7 @@ impl Pass for LightUploadPass {
         let mut area_lights: Vec<GpuAreaLight> = areas.iter().map(to_gpu).collect();
 
         // The lights most likely to matter on screen: flux over squared distance to the camera.
-        let candidate = |kind: u32, i: usize, position: ultraviolet::Vec3, origin, range: f32, flux: f32, half_size, spot| {
+        let candidate = |kind: u32, i: usize, position: ultraviolet::Vec3, origin, range: f32, flux: f32, half_size, spot, front| {
             let distance = (position - camera.eye).mag();
             ShadowCandidate {
                 score: flux / (distance * distance + 1.0),
@@ -292,7 +294,8 @@ impl Pass for LightUploadPass {
                 range,
                 spot,
                 half_size,
-                coverage: range / distance.max(1e-3),
+                front,
+                coverage: [0.0; 6],
             }
         };
         let four_pi = 4.0 * std::f32::consts::PI;
@@ -301,7 +304,7 @@ impl Pass for LightUploadPass {
             .take(MAX_POINT_LIGHTS)
             .enumerate()
             .map(|(i, l)| {
-                candidate(SHADOW_KIND_POINT, i, l.position, l.position, l.radius, four_pi * l.intensity, l.source_radius, None)
+                candidate(SHADOW_KIND_POINT, i, l.position, l.position, l.radius, four_pi * l.intensity, l.source_radius, None, None)
             })
             .chain(spots.iter().take(MAX_SPOT_LIGHTS).enumerate().map(|(i, l)| {
                 let spot = (l.outer_angle <= MAX_SPOT_SHADOW_ANGLE).then(|| SpotShadow {
@@ -309,7 +312,7 @@ impl Pass for LightUploadPass {
                     tan_half_fov: (l.outer_angle + SPOT_SHADOW_MARGIN).tan(),
                 });
                 let flux = four_pi * l.intensity;
-                candidate(SHADOW_KIND_SPOT, i, l.position, l.position, l.radius, flux, l.source_radius, spot)
+                candidate(SHADOW_KIND_SPOT, i, l.position, l.position, l.radius, flux, l.source_radius, spot, None)
             }))
             .chain(areas.iter().enumerate().map(|(i, l)| {
                 let sides = if l.two_sided { 2.0 } else { 1.0 };
@@ -318,19 +321,20 @@ impl Pass for LightUploadPass {
                 // Where its illuminance (≈ L·A / d²) falls below MIN_SHADOW_ILLUMINANCE.
                 let range = (l.intensity * area / MIN_SHADOW_ILLUMINANCE).sqrt().clamp(1.0, MAX_AREA_SHADOW_RANGE);
                 // One-sided lights shadow from just in front, so their own emitter mesh isn't a caster.
-                let origin = if l.two_sided {
-                    l.position
-                } else {
-                    l.position + l.right.cross(l.up).normalized() * AREA_SHADOW_OFFSET
-                };
+                let front = (!l.two_sided).then(|| l.right.cross(l.up).normalized());
+                let origin = l.position + front.unwrap_or_default() * AREA_SHADOW_OFFSET;
                 let half_size = l.right.mag().max(l.up.mag());
-                candidate(SHADOW_KIND_AREA, i, l.position, origin, range, flux, half_size, None)
+                candidate(SHADOW_KIND_AREA, i, l.position, origin, range, flux, half_size, None, front)
             }))
             .filter(|c| c.score > 0.0)
             .collect();
         candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
         if !shadows {
             candidates.clear();
+        }
+        let samples = ViewSamples::new(camera, ctx.surface_size);
+        for c in candidates.iter_mut().take(MAX_SHADOWED_LIGHTS) {
+            c.coverage = face_coverage(&samples, &FaceShape { origin: c.origin, range: c.range, spot: c.spot, front: c.front });
         }
 
         let slots = self.shadow_slots.update(&candidates);

@@ -84,8 +84,8 @@ const CUBE_FACES: [(Vec3, Vec3); 6] = [
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct LocalShadowFace {
     pub view_proj: [[f32; 4]; 4],
-    /// `Tile::rect`: atlas UV offset (xy) and scale (z), tile size in texels (w). w = 0 on a slot's
-    /// first face: its map isn't rendered yet, so the light is unshadowed.
+    /// `Tile::rect`: atlas UV offset (xy) and scale (z), tile size in texels (w). w = 0: no map
+    /// (not rendered yet, or a face behind a one-sided light), so the face is unshadowed.
     pub rect: [f32; 4],
     /// Shadow origin in world space (xyz), light half size (w).
     pub light: [f32; 4],
@@ -93,10 +93,10 @@ pub struct LocalShadowFace {
     pub shape: [f32; 4],
 }
 
-/// Most atlas texels re-rendered per frame (two 512² cubes). Lights whose maps are new come first
+/// Most atlas texels re-rendered per frame (two 2048² faces). Lights whose maps are new come first
 /// by rank, then stale ones (moved, or nearby geometry moved) by rank over frames waited, so none
 /// starves. At least one light renders per frame however big.
-const LOCAL_SHADOW_TEXEL_BUDGET: u64 = 2 * 6 * 512 * 512;
+const LOCAL_SHADOW_TEXEL_BUDGET: u64 = 2 * 2048 * 2048;
 
 /// What a slot's maps were last rendered for.
 #[derive(Copy, Clone)]
@@ -459,7 +459,7 @@ impl ShadowPass {
         for (slot, caster) in casters.iter().enumerate() {
             let Some(caster) = caster else {
                 self.rendered[slot] = None;
-                self.local_params.faces[slot * 6].rect = [0.0; 4];
+                clear_faces(&mut self.local_params.faces, slot);
                 continue;
             };
             let geometry = signature(caster);
@@ -475,7 +475,7 @@ impl ShadowPass {
                 _ => {
                     // The tiles hold nothing of this light yet: unshadowed until rendered.
                     self.rendered[slot] = None;
-                    self.local_params.faces[slot * 6].rect = [0.0; 4];
+                    clear_faces(&mut self.local_params.faces, slot);
                     pending.push((caster.rank as f32 / MAX_SHADOWED_LIGHTS as f32, slot, geometry));
                 }
             }
@@ -516,7 +516,11 @@ impl ShadowPass {
                 let index = slot * 6 + face;
                 let cols = vp.cols;
                 let view_proj: [[f32; 4]; 4] = [cols[0].into(), cols[1].into(), cols[2].into(), cols[3].into()];
-                self.local_params.faces[index] = LocalShadowFace { view_proj, rect: tile.rect(), light, shape };
+                let rect = if tile.size > 0 { tile.rect() } else { [0.0; 4] };
+                self.local_params.faces[index] = LocalShadowFace { view_proj, rect, light, shape };
+                if tile.size == 0 {
+                    continue;
+                }
                 let view = ShadowView { view_proj, light: [caster.origin.x, caster.origin.y, caster.origin.z, 1.0] };
                 vp_buf.write_at(queue, CASCADE_VP_STRIDE * index as u64, bytemuck::bytes_of(&view));
                 faces.push((index, tile, vp));
@@ -607,6 +611,13 @@ impl ShadowPass {
                 pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
             }
         }
+    }
+}
+
+/// Marks every face of `slot` as having no map.
+fn clear_faces(faces: &mut [LocalShadowFace], slot: usize) {
+    for face in &mut faces[slot * 6..slot * 6 + 6] {
+        face.rect = [0.0; 4];
     }
 }
 

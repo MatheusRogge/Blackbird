@@ -110,9 +110,6 @@ const POISSON: array<vec2<f32>, 12> = array<vec2<f32>, 12>(
 fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
     // Origin and shape as the maps were rendered, which can lag the light by a few frames.
     let first = local_shadow.faces[slot * 6u];
-    if first.rect.w == 0.0 {
-        return vec3f(1.0);
-    }
     let light = first.light;
     let shape = first.shape;
     let d = pos - light.xyz;
@@ -129,6 +126,10 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> ve
         }
     }
     let f = local_shadow.faces[slot * 6u + face];
+    // No map: not rendered yet, or behind a one-sided light (which gives no light there anyway).
+    if f.rect.w == 0.0 {
+        return vec3f(1.0);
+    }
     let size = f.rect.w;
     let tan_half = shape.y;
 

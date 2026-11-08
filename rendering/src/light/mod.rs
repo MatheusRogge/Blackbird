@@ -2,6 +2,7 @@ pub mod emissive;
 mod entity;
 mod gpu;
 pub mod shadow_atlas;
+pub mod shadow_lod;
 pub mod shadow_slots;
 
 pub use entity::{AreaLight, PointLight, SkyLight, SpotLight};

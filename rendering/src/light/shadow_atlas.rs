@@ -4,7 +4,7 @@
 /// Side of the atlas in texels. The depth atlas and the glass tint atlas share this layout.
 pub const ATLAS_SIZE: u32 = 4096;
 /// Largest tile a light face gets.
-pub const MAX_TILE: u32 = 512;
+pub const MAX_TILE: u32 = 2048;
 /// Smallest tile a light face gets.
 pub const MIN_TILE: u32 = 128;
 
