@@ -311,14 +311,15 @@ pub fn load_clips(doc: &gltf::Document, buffers: &[gltf::buffer::Data]) -> Vec<P
     build_clips(doc, buffers, &read_clip_data(doc))
 }
 
-/// `data`'s clips (plus the standard channels they include), then each standard animation of `doc`
-/// none of them includes.
+/// `data`'s clips (plus the standard channels they include, except those a track of the clip
+/// overrides), then each standard animation of `doc` none of them includes.
 pub fn build_clips(doc: &gltf::Document, buffers: &[gltf::buffer::Data], data: &[ClipData]) -> Vec<PlayingClip> {
     let mut clips = Vec::new();
     for clip in data {
         let mut tracks: Vec<(Target, Curve)> = clip.tracks.iter().filter_map(TrackData::curve).collect();
         if let Some(animation) = clip.animation.and_then(|i| doc.animations().nth(i)) {
-            tracks.extend(standard_tracks(&animation, buffers));
+            let overridden: HashSet<Target> = tracks.iter().map(|(t, _)| *t).collect();
+            tracks.extend(standard_tracks(&animation, buffers).into_iter().filter(|(t, _)| !overridden.contains(t)));
         }
         clips.push(PlayingClip {
             clip: Clip { name: clip.name.clone(), tracks, wrap: if clip.looping { Wrap::Loop } else { Wrap::Once } },
@@ -342,7 +343,7 @@ pub fn build_clips(doc: &gltf::Document, buffers: &[gltf::buffer::Data], data: &
 }
 
 /// The translation / rotation / scale channels of a standard glTF animation.
-fn standard_tracks(animation: &gltf::Animation<'_>, buffers: &[gltf::buffer::Data]) -> Vec<(Target, Curve)> {
+pub fn standard_tracks(animation: &gltf::Animation<'_>, buffers: &[gltf::buffer::Data]) -> Vec<(Target, Curve)> {
     use gltf::animation::{Interpolation as Gltf, util::ReadOutputs};
     let mut tracks = Vec::new();
     for channel in animation.channels() {
@@ -396,10 +397,17 @@ impl GltfScene {
     }
 
     /// Sets the light entities light targets resolve to, by `KHR_lights_punctual` index and by
-    /// `blackbird_lights` index, replacing what `bind_lights` set.
-    pub fn set_light_bindings(&mut self, punctual: HashMap<usize, EntityKey>, area: HashMap<usize, EntityKey>) {
+    /// `blackbird_lights` index, and the punctual lights that follow each node, replacing what
+    /// `bind_lights` set.
+    pub fn set_light_bindings(
+        &mut self,
+        punctual: HashMap<usize, EntityKey>,
+        area: HashMap<usize, EntityKey>,
+        nodes: HashMap<usize, EntityKey>,
+    ) {
         self.punctual_lights = punctual;
         self.area_lights = area;
+        self.node_lights = nodes;
     }
 
     /// Applies clip `index` at clip-local `time`, without touching any clip's playback.
@@ -747,6 +755,38 @@ mod tests {
         scene.reset_animation(&mut world);
         let camera = world.get_entities::<Camera>()[0];
         assert_eq!((camera.eye.z, camera.fovy), (0.0, 1.0));
+    }
+
+    /// A glTF animation moving node 0 from the origin to y = 2 over a second.
+    const RISE: &str = r#"{
+        "asset": { "version": "2.0" },
+        "buffers": [{ "byteLength": 32, "uri": "data:application/octet-stream;base64,AAAAAAAAgD8AAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAA=" }],
+        "bufferViews": [{ "buffer": 0, "byteLength": 8 }, { "buffer": 0, "byteOffset": 8, "byteLength": 24 }],
+        "accessors": [
+            { "bufferView": 0, "componentType": 5126, "count": 2, "type": "SCALAR", "min": [0], "max": [1] },
+            { "bufferView": 1, "componentType": 5126, "count": 2, "type": "VEC3" }],
+        "animations": [{ "name": "Rise", "channels": [{ "sampler": 0, "target": { "node": 0, "path": "translation" } }],
+            "samplers": [{ "input": 0, "output": 1 }] }],
+        "scene": 0,
+        "scenes": [{ "nodes": [0] }],
+        "nodes": [{ "name": "Box" }]
+    }"#;
+
+    #[test]
+    fn a_track_overrides_the_standard_channel_it_targets() {
+        let (doc, buffers, _) = gltf::import_slice(RISE.as_bytes()).expect("valid glTF");
+        let standard = build_clips(&doc, &buffers, &[]);
+        assert_eq!(standard[0].clip.sample(0.5).next().map(|(_, v)| v[1]), Some(1.0));
+
+        let lowered = TrackData::from_curve(
+            Target::Translation(0),
+            &Curve::new(3, vec![Key::new(0.0, [0.0; 4], Interpolation::Linear), Key::new(1.0, [0.0, -2.0, 0.0, 0.0], Interpolation::Linear)]),
+        );
+        let data = ClipData { animation: Some(0), tracks: vec![lowered], ..serde_json::from_str(r#"{ "name": "Rise" }"#).unwrap() };
+        let clips = build_clips(&doc, &buffers, &[data]);
+        assert_eq!(clips.len(), 1, "the clip includes the animation, so it isn't listed twice");
+        let values: Vec<f32> = clips[0].clip.sample(0.5).map(|(_, v)| v[1]).collect();
+        assert_eq!(values, [-1.0]);
     }
 
     #[test]

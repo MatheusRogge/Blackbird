@@ -654,7 +654,7 @@ impl EditorPlugin {
                         .into_iter()
                         .map(|(node, data)| SceneLight { id: s.new_id(), data, node })
                         .collect();
-                    s.clips = crate::animation::load_clips(&doc, &s.lights);
+                    s.clips = crate::animation::load_clips(&doc, &asset.buffers, &s.lights);
                     s.timeline.clamp(&[]);
                     let scene_file = s.file_path.clone().unwrap_or_default();
                     s.objects = objects
@@ -964,6 +964,13 @@ impl EditorPlugin {
                 if is_area { area.insert(index, key) } else { punctual.insert(index, key) };
             }
         }
+        // `sync_lights` re-applies every light before this, so a posed node's light moves with it
+        // only while previewing.
+        let nodes: HashMap<usize, EntityKey> = s
+            .lights
+            .iter()
+            .filter_map(|l| Some((l.node?, *self.light_entities.get(&l.id)?)))
+            .collect();
         let state = &mut *s;
         let pose = match (state.timeline.preview, state.timeline.clip.and_then(|c| state.clips.get(c))) {
             (true, Some(clip)) => {
@@ -977,7 +984,7 @@ impl EditorPlugin {
         drop(s);
 
         let mut world = engine.world();
-        scene.set_light_bindings(punctual, area);
+        scene.set_light_bindings(punctual, area, nodes);
         let switched = pose.map(|(clip, _)| clip) != self.previewed_clip;
         // A clip that changed may no longer animate something it did.
         if (switched || edited) && self.previewed_clip.is_some() {

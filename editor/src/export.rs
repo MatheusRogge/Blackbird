@@ -285,7 +285,7 @@ mod tests {
 
         let shared = EditorState::new();
         let mut state = shared.lock().unwrap();
-        state.clips = crate::animation::load_clips(&doc, &state.lights);
+        state.clips = crate::animation::load_clips(&doc, &[], &state.lights);
         state.document = Some(doc);
         write_gltf(&state, &scene_path).unwrap();
 

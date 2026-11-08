@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use engine::gltf::animation::{
-    ClipData, LightProperty, ParticleProperty, Target, TrackData, read_clip_data,
+    ClipData, LightProperty, ParticleProperty, Target, TrackData, read_clip_data, standard_tracks,
 };
 use engine_core::animation::{Curve, Interpolation, Key, Value};
 use gltf_api::Document;
@@ -26,6 +26,15 @@ pub enum EditorTarget {
 pub struct EditorTrack {
     pub target: EditorTarget,
     pub curve: Curve,
+    /// The channel of the clip's standard glTF animation this track shows. Saved (as an override)
+    /// only once `curve` differs from it.
+    pub standard: Option<Curve>,
+}
+
+impl EditorTrack {
+    pub fn edited(&self) -> bool {
+        self.standard.as_ref() != Some(&self.curve)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,7 +43,7 @@ pub struct EditorClip {
     pub looping: bool,
     pub autoplay: bool,
     pub speed: f32,
-    /// A standard glTF animation the clip also plays (read-only here).
+    /// A standard glTF animation the clip also plays. Its channels are tracks with `standard` set.
     pub animation: Option<usize>,
     pub tracks: Vec<EditorTrack>,
 }
@@ -60,7 +69,7 @@ impl EditorClip {
                 } else {
                     Curve::new(components, Vec::new())
                 };
-                self.tracks.push(EditorTrack { target, curve });
+                self.tracks.push(EditorTrack { target, curve, standard: None });
                 self.tracks.len() - 1
             }
         };
@@ -151,8 +160,9 @@ pub fn light_indices(lights: &[SceneLight]) -> HashMap<u64, (bool, usize)> {
 }
 
 /// The scene's clips: `blackbird_animations`, then a clip for each standard animation none of
-/// them includes (so it stays listed and playable).
-pub fn load_clips(doc: &Document, lights: &[SceneLight]) -> Vec<EditorClip> {
+/// them includes (so it stays listed and playable). A clip's standard channels become tracks,
+/// paired with the clip's own track for the same node property if it has one (an override).
+pub fn load_clips(doc: &Document, buffers: &[gltf_api::buffer::Data], lights: &[SceneLight]) -> Vec<EditorClip> {
     let punctual: HashMap<usize, u64> = lights
         .iter()
         .filter_map(|l| Some((doc.nodes().nth(l.node?)?.light()?.index(), l.id)))
@@ -178,7 +188,7 @@ pub fn load_clips(doc: &Document, lights: &[SceneLight]) -> Vec<EditorClip> {
                         Target::AreaLight(i, p) => EditorTarget::Light(*area.get(i)?, p),
                         other => EditorTarget::Scene(other),
                     };
-                    Some(EditorTrack { target, curve })
+                    Some(EditorTrack { target, curve, standard: None })
                 })
                 .collect(),
         })
@@ -190,11 +200,22 @@ pub fn load_clips(doc: &Document, lights: &[SceneLight]) -> Vec<EditorClip> {
         let name = animation.name().map_or_else(|| format!("Animation {}", animation.index()), str::to_string);
         clips.push(EditorClip { animation: Some(animation.index()), ..EditorClip::new(name) });
     }
+    for clip in &mut clips {
+        let Some(animation) = clip.animation.and_then(|i| doc.animations().nth(i)) else { continue };
+        for (target, curve) in standard_tracks(&animation, buffers) {
+            let target = EditorTarget::Scene(target);
+            match clip.tracks.iter_mut().find(|t| t.target == target) {
+                Some(track) => track.standard = Some(curve),
+                None => clip.tracks.push(EditorTrack { target, curve: curve.clone(), standard: Some(curve) }),
+            }
+        }
+    }
     clips
 }
 
 /// `clips` as saved, with light tracks pointing at the lights' indices in `lights`' order. Tracks
-/// of deleted lights are dropped.
+/// of deleted lights are dropped, and so are standard channels nobody edited (the glTF animation
+/// still plays them).
 pub fn to_clip_data(clips: &[EditorClip], lights: &[SceneLight]) -> Vec<ClipData> {
     let indices = light_indices(lights);
     clips
@@ -208,6 +229,7 @@ pub fn to_clip_data(clips: &[EditorClip], lights: &[SceneLight]) -> Vec<ClipData
             tracks: clip
                 .tracks
                 .iter()
+                .filter(|track| track.edited())
                 .filter_map(|track| {
                     let target = match track.target {
                         EditorTarget::Scene(target) => target,
@@ -497,7 +519,7 @@ mod tests {
             .enumerate()
             .map(|(i, (node, data))| SceneLight { id: i as u64 + 10, data, node })
             .collect();
-        let clips = load_clips(&doc, &lights);
+        let clips = load_clips(&doc, &[], &lights);
         let spot = lights.iter().find(|l| l.node == Some(0)).unwrap().id;
         assert_eq!(clips[0].tracks[0].target, EditorTarget::Light(spot, LightProperty::Intensity));
         assert!(!clips[0].looping);
@@ -525,6 +547,49 @@ mod tests {
         for c in 0..4 {
             assert!((back[c] - previous[c]).abs() < 1e-4, "{back:?} vs {previous:?}");
         }
+    }
+
+    /// A glTF animation moving node 0 from the origin to y = 2 over a second.
+    const RISE: &str = r#"{
+        "asset": { "version": "2.0" },
+        "buffers": [{ "byteLength": 32, "uri": "data:application/octet-stream;base64,AAAAAAAAgD8AAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAA=" }],
+        "bufferViews": [{ "buffer": 0, "byteLength": 8 }, { "buffer": 0, "byteOffset": 8, "byteLength": 24 }],
+        "accessors": [
+            { "bufferView": 0, "componentType": 5126, "count": 2, "type": "SCALAR", "min": [0], "max": [1] },
+            { "bufferView": 1, "componentType": 5126, "count": 2, "type": "VEC3" }],
+        "animations": [{ "name": "Rise", "channels": [{ "sampler": 0, "target": { "node": 0, "path": "translation" } }],
+            "samplers": [{ "input": 0, "output": 1 }] }],
+        "scene": 0,
+        "scenes": [{ "nodes": [0] }],
+        "nodes": [{ "name": "Box" }]
+    }"#;
+
+    #[test]
+    fn standard_channels_are_saved_only_once_edited() {
+        let (doc, buffers, _) = gltf_api::import_slice(RISE.as_bytes()).unwrap();
+        let mut clips = load_clips(&doc, &buffers, &[]);
+        let target = EditorTarget::Scene(Target::Translation(0));
+        assert_eq!(clips[0].tracks.len(), 1);
+        assert_eq!(clips[0].tracks[0].target, target);
+        assert_eq!(clips[0].tracks[0].curve.keys[1].value[1], 2.0);
+        assert!(to_clip_data(&clips, &[])[0].tracks.is_empty());
+
+        clips[0].set_key(target, 1.0, [0.0, 3.0, 0.0, 0.0]);
+        let saved = to_clip_data(&clips, &[]);
+        assert_eq!((saved[0].animation, saved[0].tracks.len()), (Some(0), 1));
+
+        // Reloaded, the override pairs up with its channel instead of adding a second track.
+        let reloaded = load_clips_from(&doc, &buffers, &saved);
+        assert_eq!(reloaded[0].tracks.len(), 1);
+        assert!(reloaded[0].tracks[0].edited());
+    }
+
+    fn load_clips_from(doc: &Document, buffers: &[gltf_api::buffer::Data], data: &[ClipData]) -> Vec<EditorClip> {
+        let mut json: serde_json::Value = serde_json::from_str(RISE).unwrap();
+        json["extras"] = serde_json::json!({ engine::gltf::animation::EXTRAS_KEY: data });
+        let doc2 = gltf_api::Gltf::from_slice(json.to_string().as_bytes()).unwrap().document;
+        assert_eq!(doc2.animations().count(), doc.animations().count());
+        load_clips(&doc2, buffers, &[])
     }
 
     #[test]

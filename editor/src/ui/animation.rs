@@ -113,7 +113,8 @@ fn draw_header(ui: &mut Ui, state: &mut EditorState) {
         ui.checkbox(&mut clip.autoplay, "Autoplay").on_hover_text("Starts playing when the game loads the scene.");
         ui.add(egui::DragValue::new(&mut clip.speed).speed(0.01).range(0.0..=10.0).prefix("Speed ×"));
         if let Some(standard) = clip.animation {
-            ui.label(egui::RichText::new(format!("+ glTF animation {standard} (read-only)")).weak());
+            ui.label(egui::RichText::new(format!("+ glTF animation {standard}")).weak())
+                .on_hover_text("Its channels are the tracks marked glTF. Edited ones are saved as overrides; the rest play from the glTF.");
         }
         if ui.button("🗑").on_hover_text("Delete clip").clicked() {
             state.clips.remove(index);
@@ -154,19 +155,42 @@ fn draw_tracks(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
     });
     egui::ScrollArea::vertical().show(ui, |ui| {
         let mut delete = None;
+        let mut revert = None;
         for (i, target) in tracked.iter().enumerate() {
             ui.horizontal(|ui| {
                 let label = animation::label(state, *target);
-                let keys = state.clips[clip_index].tracks[i].curve.keys.len();
-                if ui.selectable_label(state.timeline.track == Some(i), format!("{label} ({keys})")).clicked() {
+                let track = &state.clips[clip_index].tracks[i];
+                let keys = track.curve.keys.len();
+                let (standard, edited) = (track.standard.is_some(), track.edited());
+                let text = match (standard, edited) {
+                    (true, true) => format!("{label} ({keys}) · glTF, edited"),
+                    (true, false) => format!("{label} ({keys}) · glTF"),
+                    _ => format!("{label} ({keys})"),
+                };
+                if ui.selectable_label(state.timeline.track == Some(i), text).clicked() {
                     state.timeline.track = Some(i);
                     state.timeline.key = None;
                     state.timeline.view_values = None;
                 }
-                if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
+                if standard {
+                    if ui.add_enabled(edited, egui::Button::new("↺").small())
+                        .on_hover_text("Revert to the glTF animation's channel")
+                        .on_disabled_hover_text("Unchanged from the glTF animation")
+                        .clicked()
+                    {
+                        revert = Some(i);
+                    }
+                } else if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
                     delete = Some(i);
                 }
             });
+        }
+        if let Some(i) = revert {
+            let track = &mut state.clips[clip_index].tracks[i];
+            if let Some(standard) = track.standard.clone() {
+                track.curve = standard;
+            }
+            state.timeline.key = None;
         }
         if let Some(i) = delete {
             state.clips[clip_index].tracks.remove(i);
