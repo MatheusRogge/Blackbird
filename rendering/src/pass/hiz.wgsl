@@ -1,8 +1,10 @@
 // Hi-Z depth pyramid for SSR (rendering::pass::ssr). Reversed-Z: each texel holds the maximum, i.e.
 // the nearest depth, of the level-0 texels it covers, so a ray in front of it is in front of all of them.
+// Level 0 is the nearer of the G-buffer depth and the `ao` pass's glass depth.
 
 @group(0) @binding(0) var t_depth: texture_depth_2d;
 @group(0) @binding(1) var t_prev: texture_2d<f32>;
+@group(0) @binding(2) var t_glass_depth: texture_depth_2d;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
@@ -12,7 +14,8 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
 
 @fragment
 fn fs_copy(@builtin(position) pos: vec4<f32>) -> @location(0) f32 {
-    return textureLoad(t_depth, vec2<i32>(pos.xy), 0);
+    let pixel = vec2<i32>(pos.xy);
+    return max(textureLoad(t_depth, pixel, 0), textureLoad(t_glass_depth, pixel, 0));
 }
 
 // 2×2 max of the level above. When that level has an odd size, the last row / column also takes

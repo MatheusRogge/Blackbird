@@ -193,6 +193,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         graph.add_pass(device, lighting_pass);
 
         let prev_frame = FrameHistory::default();
+        let prev_glass_frame = FrameHistory::default();
         let (ssr_pass, ssr_id) = SsrPass::new(
             &mut graph,
             SsrInputs {
@@ -203,6 +204,8 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
                 camera_buffer_id,
                 debug_flags_id: lighting_outputs.debug_flags_id,
                 prev_frame: prev_frame.clone(),
+                glass_depth_id: ao_outputs.glass_depth_id,
+                prev_glass_frame: prev_glass_frame.clone(),
             },
             self.ssr_shader,
         );
@@ -251,6 +254,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             Arc::clone(&debug_flags),
         );
         graph.add_pass(device, transparent_pass);
+        graph.add_pass(device, PrevFramePass::new(transparent_id, wgpu::TextureFormat::Rgba16Float, prev_glass_frame));
 
         let (particle_sim_pass, particle_outputs) =
             ParticleSimPass::new(

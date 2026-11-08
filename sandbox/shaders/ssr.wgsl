@@ -3,9 +3,11 @@
 // confidence the composite pass blends with. `ssr_temporal` accumulates it over frames. The color
 // comes from last frame's composite output where the hit was on screen then, so reflected surfaces
 // show their own reflections (each frame adds a bounce); otherwise from this frame's `lit`.
+// Glass (the `ao` pass's glass depth, folded into the Hi-Z) is hit too, and takes its color from
+// last frame's `transparent` output.
 
-// Hi-Z pyramid: level 0 is the G-buffer depth (reversed-Z), each further level the max (nearest)
-// of the texels it covers.
+// Hi-Z pyramid: level 0 is the nearer of the G-buffer and glass depths (reversed-Z), each further
+// level the max (nearest) of the texels it covers.
 @group(0) @binding(0) var t_hiz:             texture_2d<f32>;
 @group(0) @binding(1) var t_normal:          texture_2d<f32>;
 @group(0) @binding(2) var t_lit:             texture_2d<f32>;
@@ -16,6 +18,10 @@
 @group(0) @binding(6) var s_linear:          sampler;
 // Last frame's composite output (rendering::pass::prev_frame); `lit` on the first frame.
 @group(0) @binding(7) var t_prev:            texture_2d<f32>;
+// The G-buffer depth alone: the receiver, and opaque surfaces behind glass.
+@group(0) @binding(8) var t_depth:           texture_depth_2d;
+// Last frame's `transparent` output (glass included); `lit` on the first frame.
+@group(0) @binding(9) var t_prev_glass:      texture_2d<f32>;
 
 // Mirrors rendering::debug_flags::DebugFlagsGpu.
 struct DebugFlags {
@@ -76,9 +82,9 @@ fn clip_to_pixel(h: vec4<f32>, dims: vec2<f32>) -> vec2<f32> {
 // Hi-Z traversal in screen space, where NDC depth is linear along the ray. `p0` / `dir` are
 // (pixel x, pixel y, NDC depth) at t = 0 and the change up to t = 1. A cell whose nearest depth is
 // behind the ray over the whole stretch the ray spends in it is skipped and the next one is
-// tested a level up; otherwise the trace descends, down to single pixels. Returns the hit's t, or
-// −1 for a miss.
-fn trace_hiz(p0: vec3<f32>, dir: vec3<f32>, t_end: f32, t_start: f32) -> f32 {
+// tested a level up; otherwise the trace descends, down to single pixels. Returns the hit's t (−1
+// for a miss), its depth, and 1 in z if it hit glass.
+fn trace_hiz(p0: vec3<f32>, dir: vec3<f32>, t_end: f32, t_start: f32) -> vec3<f32> {
     let max_level = i32(textureNumLevels(t_hiz)) - 1;
     let eps = 0.01 / max(length(dir.xy), 1.0);
     let step_up = select(vec2f(0.0), vec2f(1.0), dir.xy > vec2f(0.0));
@@ -109,26 +115,33 @@ fn trace_hiz(p0: vec3<f32>, dir: vec3<f32>, t_end: f32, t_start: f32) -> f32 {
             continue;
         }
         // Level 0: the ray reaches this pixel's surface. Accept it if the ray isn't too far behind
-        // (a thin object it passed behind), else keep walking.
-        if nearest > 0.0 {
-            let surface_w = linear_depth(nearest);
-            if linear_depth(z_far) - surface_w < THICKNESS * surface_w {
-                let t_surface = select(t, (nearest - p0.z) / dir.z, abs(dir.z) > 1e-9);
-                return clamp(t_surface, t, t_exit);
+        // (a thin object it passed behind), else keep walking. Past glass, the opaque surface
+        // behind it gets the same test.
+        let opaque = textureLoad(t_depth, cell, 0);
+        for (var s = 0u; s < select(1u, 2u, opaque != nearest); s++) {
+            let surface = select(nearest, opaque, s == 1u);
+            if surface > 0.0 && z_far <= surface {
+                let surface_w = linear_depth(surface);
+                if linear_depth(z_far) - surface_w < THICKNESS * surface_w {
+                    let t_surface = select(t, (surface - p0.z) / dir.z, abs(dir.z) > 1e-9);
+                    return vec3f(clamp(t_surface, t, t_exit), surface, f32(s == 0u && nearest != opaque));
+                }
             }
         }
         t = t_exit + eps;
     }
-    return -1.0;
+    return vec3f(-1.0, 0.0, 0.0);
 }
 
-fn hit_color(hit_px: vec2<f32>, hit_uv: vec2<f32>) -> vec3<f32> {
-    let hit_depth = textureLoad(t_hiz, vec2<i32>(hit_px), 0).r;
+fn hit_color(hit_px: vec2<f32>, hit_uv: vec2<f32>, hit_depth: f32, glass: bool) -> vec3<f32> {
     let world4 = camera.inv_view_proj * vec4f(hit_uv.x * 2.0 - 1.0, 1.0 - hit_uv.y * 2.0, hit_depth, 1.0);
     let prev = camera.prev_view_proj * vec4f(world4.xyz / world4.w, 1.0);
     if prev.w > 0.0 {
         let prev_uv = (prev.xy / prev.w) * vec2f(0.5, -0.5) + 0.5;
         if all(prev_uv >= vec2f(0.0)) && all(prev_uv <= vec2f(1.0)) {
+            if glass {
+                return textureSampleLevel(t_prev_glass, s_linear, prev_uv, 0.0).rgb;
+            }
             return textureSampleLevel(t_prev, s_linear, prev_uv, 0.0).rgb;
         }
     }
@@ -140,7 +153,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let px = vec2<i32>(in.pos.xy);
     let dims = vec2<f32>(textureDimensions(t_hiz));
 
-    let depth = textureLoad(t_hiz, px, 0).r;
+    let depth = textureLoad(t_depth, px, 0);
     let weight = textureLoad(t_specular_weight, px, 0);
     let roughness = weight.a;
     if debug.disable_ssr != 0u || depth == 0.0 || all(weight.rgb == vec3f(0.0)) || roughness > MAX_ROUGHNESS {
@@ -189,22 +202,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // frame for `ssr_temporal`.
     let jitter = interleaved_gradient_noise(in.pos.xy + 5.588238 * camera.depth_params.z);
     let hit = trace_hiz(p0, dir, t_end, (1.0 + jitter) / len_px);
-    if hit < 0.0 {
+    if hit.x < 0.0 {
         return vec4f(0.0);
     }
 
-    let hit_px = p0.xy + dir.xy * hit;
+    let hit_px = p0.xy + dir.xy * hit.x;
+    let glass = hit.z > 0.0;
+    // The G-buffer normal under glass is the surface behind it; glass has no normal here.
     let hit_N = normalize(textureLoad(t_normal, vec2<i32>(hit_px), 0).rgb * 2.0 - 1.0);
-    if dot(hit_N, R) > 0.0 {
+    if !glass && dot(hit_N, R) > 0.0 {
         return vec4f(0.0);
     }
     let hit_uv = hit_px / dims;
-    let color = hit_color(hit_px, hit_uv);
+    let color = hit_color(hit_px, hit_uv, hit.y, glass);
 
     let edge = min(hit_uv, 1.0 - hit_uv);
     let confidence = smoothstep(0.0, 0.08, min(edge.x, edge.y))
         * (1.0 - smoothstep(FADE_ROUGHNESS, MAX_ROUGHNESS, roughness))
         * (1.0 - smoothstep(0.1, 0.5, R_vs.z))
-        * (1.0 - smoothstep(0.7, 1.0, hit));
+        * (1.0 - smoothstep(0.7, 1.0, hit.x));
     return vec4f(color * confidence, confidence);
 }

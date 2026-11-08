@@ -1,7 +1,9 @@
 //! Screen-space reflections: builds a Hi-Z pyramid of the G-buffer depth (`hiz.wgsl`, embedded),
 //! then traces each reflection ray through it (`ssr.wgsl`). Writes premultiplied hit colour with
 //! confidence in alpha, which `ssr_temporal` accumulates and `composite` blends. Hits read last
-//! frame's `composite` output (`prev_frame`), reprojected, so reflections show reflections.
+//! frame's `composite` output (`prev_frame`), reprojected, so reflections show reflections. The
+//! Hi-Z also holds the `ao` pass's glass depth, and glass hits read last frame's `transparent`
+//! output instead.
 
 use engine_core::world::World;
 
@@ -27,6 +29,10 @@ pub struct SsrInputs {
     pub debug_flags_id: ResourceId,
     /// Last frame's `composite` output. `lit` stands in until the first copy exists.
     pub prev_frame: FrameHistory,
+    /// The `ao` pass's nearest-glass depth.
+    pub glass_depth_id: ResourceId,
+    /// Last frame's `transparent` output, for glass hits. `lit` stands in until the first copy.
+    pub prev_glass_frame: FrameHistory,
 }
 
 struct Pipelines {
@@ -35,7 +41,7 @@ struct Pipelines {
     sampler: wgpu::Sampler,
     hiz_copy: wgpu::RenderPipeline,
     hiz_reduce: wgpu::RenderPipeline,
-    /// Binding 0: the G-buffer depth.
+    /// Bindings 0 and 2: the G-buffer and glass depths.
     hiz_copy_layout: wgpu::BindGroupLayout,
     /// Binding 1: the level above.
     hiz_reduce_layout: wgpu::BindGroupLayout,
@@ -50,8 +56,8 @@ struct Hiz {
     levels: Vec<wgpu::TextureView>,
     /// Entry `i` reads level `i` to build level `i + 1`.
     reduce_bgs: Vec<wgpu::BindGroup>,
-    /// Keyed by the depth view address.
-    copy_bg: Option<(usize, wgpu::BindGroup)>,
+    /// Keyed by the depth and glass depth view addresses.
+    copy_bg: Option<([usize; 2], wgpu::BindGroup)>,
 }
 
 pub struct SsrPass {
@@ -153,6 +159,8 @@ impl SsrPass {
                     count: None,
                 },
                 texture(7, float),
+                texture(8, wgpu::TextureSampleType::Depth),
+                texture(9, float),
             ],
         });
 
@@ -162,7 +170,7 @@ impl SsrPass {
         });
         let hiz_copy_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("hiz_copy"),
-            entries: &[texture(0, wgpu::TextureSampleType::Depth)],
+            entries: &[texture(0, wgpu::TextureSampleType::Depth), texture(2, wgpu::TextureSampleType::Depth)],
         });
         let hiz_reduce_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("hiz_reduce"),
@@ -249,7 +257,7 @@ impl PassDesc for SsrPass {
 
     fn reads(&self) -> Vec<ResourceId> {
         let i = &self.inputs;
-        vec![i.depth_id, i.normal_id, i.lit_id, i.specular_weight_id, i.camera_buffer_id, i.debug_flags_id]
+        vec![i.depth_id, i.glass_depth_id, i.normal_id, i.lit_id, i.specular_weight_id, i.camera_buffer_id, i.debug_flags_id]
     }
 
     fn writes(&self) -> Vec<ResourceId> {
@@ -277,9 +285,14 @@ impl Pass for SsrPass {
     ) {
         let i = &self.inputs;
         let view = |id| ctx.views.get(id).copied();
-        let (Some(output), Some(depth), Some(normal), Some(lit), Some(weight)) =
-            (view(&self.output_id), view(&i.depth_id), view(&i.normal_id), view(&i.lit_id), view(&i.specular_weight_id))
-        else {
+        let (Some(output), Some(depth), Some(glass_depth), Some(normal), Some(lit), Some(weight)) = (
+            view(&self.output_id),
+            view(&i.depth_id),
+            view(&i.glass_depth_id),
+            view(&i.normal_id),
+            view(&i.lit_id),
+            view(&i.specular_weight_id),
+        ) else {
             return;
         };
         let (Some(camera), Some(flags)) = (ctx.buffers.get(&i.camera_buffer_id), ctx.buffers.get(&i.debug_flags_id)) else {
@@ -295,12 +308,15 @@ impl Pass for SsrPass {
         }
         let Some(hiz) = self.hiz.as_mut() else { return };
 
-        let depth_key = std::ptr::from_ref(depth) as usize;
+        let depth_key = [depth, glass_depth].map(|v| std::ptr::from_ref(v) as usize);
         if hiz.copy_bg.as_ref().is_none_or(|(k, _)| *k != depth_key) {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("hiz_copy"),
                 layout: &pipelines.hiz_copy_layout,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth) }],
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(glass_depth) },
+                ],
             });
             hiz.copy_bg = Some((depth_key, bind_group));
         }
@@ -311,9 +327,13 @@ impl Pass for SsrPass {
         }
 
         let prev_frame = i.prev_frame.get();
-        let mut key: Vec<usize> = [normal, lit, weight].iter().map(|v| std::ptr::from_ref(*v) as usize).collect();
-        key.push(prev_frame.as_ref().map_or(0, |(generation, _)| *generation as usize));
+        let prev_glass_frame = i.prev_glass_frame.get();
+        let mut key: Vec<usize> = [depth, normal, lit, weight].iter().map(|v| std::ptr::from_ref(*v) as usize).collect();
+        for history in [&prev_frame, &prev_glass_frame] {
+            key.push(history.as_ref().map_or(0, |(generation, _)| *generation as usize));
+        }
         let prev_view = prev_frame.as_ref().map_or(lit, |(_, view)| view);
+        let prev_glass_view = prev_glass_frame.as_ref().map_or(lit, |(_, view)| view);
         if self.trace_bg.as_ref().is_none_or(|(k, _)| *k != key) {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ssr"),
@@ -327,6 +347,8 @@ impl Pass for SsrPass {
                     wgpu::BindGroupEntry { binding: 5, resource: flags.binding() },
                     wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&pipelines.sampler) },
                     wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(prev_view) },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(depth) },
+                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(prev_glass_view) },
                 ],
             });
             self.trace_bg = Some((key, bind_group));

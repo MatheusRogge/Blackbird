@@ -2,8 +2,8 @@
 //! and transmittance targets (`Blend` meshes aren't in the G-buffer), then GTAO over the G-buffer
 //! depth, normals and that glass into a raw target, then a depth-aware 4×4 blur into the output
 //! `lighting` reads. With the `ambient_occlusion` debug flag off the output is cleared to 1. The
-//! glass targets are also outputs: contact shadows in `lighting` march them, so they are drawn
-//! while either flag is on.
+//! glass targets are also outputs: contact shadows in `lighting` march them and `ssr` reflects them,
+//! so they are drawn while any of the three is on.
 
 use std::sync::{Arc, RwLock};
 
@@ -274,9 +274,11 @@ impl Pass for AoPass {
             return;
         };
         let Some(camera) = ctx.buffers.get(&self.camera_buffer_id) else { return };
-        let (ambient_occlusion, contact_shadows) = {
+        let (ambient_occlusion, draw_glass) = {
             let flags = self.debug_flags.read().expect("debug_flags poisoned");
-            (flags.ambient_occlusion, flags.contact_shadows && flags.shadows)
+            let contact_shadows = flags.contact_shadows && flags.shadows;
+            let ssr = flags.ssr && flags.reflections && flags.specular && flags.indirect;
+            (flags.ambient_occlusion, flags.ambient_occlusion || contact_shadows || ssr)
         };
 
         if self.pipelines.is_none() {
@@ -331,7 +333,7 @@ impl Pass for AoPass {
         let glass: Vec<_> = world
             .get_entity_handles::<Mesh>()
             .into_iter()
-            .filter(|h| (ambient_occlusion || contact_shadows) && h.entity.is_blended())
+            .filter(|h| draw_glass && h.entity.is_blended())
             .filter_map(|h| {
                 let draw = ctx.geometry.get(h.id)?;
                 (!draw.bounds.outside_clip(view_proj? * h.entity.transform)).then_some(draw)
