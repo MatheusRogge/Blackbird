@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use engine_core::{
     entity::EntityKey,
@@ -48,6 +49,9 @@ pub struct MeshDraw {
     pub instance: u32,
     /// Local-space bounds of the vertices.
     pub bounds: Aabb,
+    /// Equal for meshes sharing vertex and index data (until the arena grows), so draws can be
+    /// grouped into one instanced call.
+    pub geometry: u32,
 }
 
 impl MeshDraw {
@@ -56,9 +60,28 @@ impl MeshDraw {
     }
 }
 
-struct MeshAlloc {
+/// A mesh's shared data, by the addresses of its `Arc`s. The arena holds a clone of both, so
+/// neither can be freed (and its address reused) while the entry exists.
+type GeometryKey = (usize, usize);
+
+fn geometry_key(mesh: &Mesh) -> GeometryKey {
+    (Arc::as_ptr(&mesh.vertices) as *const () as usize, Arc::as_ptr(&mesh.indices) as *const () as usize)
+}
+
+struct Geometry {
     vertex: Allocation,
     index: Allocation,
+    id: u32,
+    base_vertex: i32,
+    indices: Range<u32>,
+    bounds: Aabb,
+    /// Live meshes using it; freed at 0.
+    users: u32,
+    _data: (Arc<[Vertex]>, Arc<[u32]>),
+}
+
+struct MeshSlot {
+    geometry: GeometryKey,
     draw: MeshDraw,
 }
 
@@ -100,11 +123,11 @@ impl Pool {
     }
 }
 
-/// Vertex and index data for every `Mesh` in the world, sub-allocated from one
-/// vertex buffer and one index buffer that grow on demand, plus a storage
-/// buffer of per-mesh model matrices rewritten every frame. Draw with
-/// `draw_indexed(draw.indices, draw.base_vertex, draw.instances())` after binding
-/// both buffers and the instance buffer.
+/// Vertex and index data for every `Mesh` in the world, sub-allocated from one vertex buffer and
+/// one index buffer that grow on demand, plus a storage buffer of per-mesh models rewritten every
+/// frame. Meshes sharing their `vertices` and `indices` `Arc`s share one upload. Draw with
+/// `draw_indexed(draw.indices, draw.base_vertex, draw.instances())` after binding both buffers and
+/// the instance buffer.
 pub struct GeometryArena {
     vertices: Pool,
     indices: Pool,
@@ -112,7 +135,9 @@ pub struct GeometryArena {
     instance_capacity: u32,
     free_instances: Vec<u32>,
     next_instance: u32,
-    meshes: HashMap<EntityKey, MeshAlloc>,
+    geometries: HashMap<GeometryKey, Geometry>,
+    next_geometry: u32,
+    meshes: HashMap<EntityKey, MeshSlot>,
     generation: u64,
 }
 
@@ -163,26 +188,28 @@ impl GeometryArena {
             instance_capacity: instances,
             free_instances: Vec::new(),
             next_instance: 0,
+            geometries: HashMap::new(),
+            next_geometry: 0,
             meshes: HashMap::new(),
             generation: 0,
         }
     }
 
-    /// Uploads meshes that are new since the last call, frees the ones whose
-    /// entity is gone and rewrites every mesh's transform. Vertices edited in
-    /// place keep their old GPU data.
+    /// Uploads geometry that is new since the last call, frees what no mesh uses any more and
+    /// rewrites every mesh's model. A mesh whose `vertices` / `indices` were replaced by new
+    /// `Arc`s moves to the new data; vertices edited in place keep their old GPU data.
     pub fn sync(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, world: &World) {
         let meshes = world.get_entity_handles::<Mesh>();
-        let live: HashSet<EntityKey> = meshes.iter().map(|h| h.id).collect();
+        let live: HashMap<EntityKey, GeometryKey> = meshes.iter().map(|h| (h.id, geometry_key(h.entity))).collect();
 
-        let (vertices, indices, free_instances) =
-            (&mut self.vertices, &mut self.indices, &mut self.free_instances);
-        self.meshes.retain(|key, alloc| {
-            let keep = live.contains(key);
+        let (geometries, free_instances) = (&mut self.geometries, &mut self.free_instances);
+        self.meshes.retain(|key, slot| {
+            let keep = live.get(key) == Some(&slot.geometry);
             if !keep {
-                vertices.free(alloc.vertex);
-                indices.free(alloc.index);
-                free_instances.push(alloc.draw.instance);
+                if let Some(geometry) = geometries.get_mut(&slot.geometry) {
+                    geometry.users -= 1;
+                }
+                free_instances.push(slot.draw.instance);
             }
             keep
         });
@@ -197,6 +224,16 @@ impl GeometryArena {
             }
         }
 
+        let (vertices, indices) = (&mut self.vertices, &mut self.indices);
+        self.geometries.retain(|_, geometry| {
+            let keep = geometry.users > 0;
+            if !keep {
+                vertices.free(geometry.vertex);
+                indices.free(geometry.index);
+            }
+            keep
+        });
+
         self.write_instances(device, queue, &meshes);
     }
 
@@ -209,37 +246,8 @@ impl GeometryArena {
 
         let mut models = vec![GpuModel::zeroed(); self.next_instance as usize];
         for handle in meshes {
-            if let Some(alloc) = self.meshes.get(&handle.id) {
-                let mesh = handle.entity;
-                let transform = mesh.transform;
-                models[alloc.draw.instance as usize] = GpuModel {
-                    model: transform.into(),
-                    normal: transform.inversed().transposed().into(),
-                    material: [
-                        mesh.alpha_cutoff().unwrap_or(0.0),
-                        if mesh.double_sided { 1.0 } else { 0.0 },
-                        mesh.material.metallic,
-                        mesh.material.roughness,
-                    ],
-                    base_color: mesh.material.base_color,
-                    emissive: {
-                        let [r, g, b] = mesh.material.emissive.map(|c| c * mesh.material.emissive_strength);
-                        [r, g, b, 0.0]
-                    },
-                    transmission: {
-                        let m = &mesh.material;
-                        let distance = if m.attenuation_distance.is_finite() { m.attenuation_distance } else { 0.0 };
-                        [m.transmission, m.ior, m.thickness, distance]
-                    },
-                    attenuation: {
-                        let [r, g, b] = mesh.material.attenuation_color;
-                        [r, g, b, 0.0]
-                    },
-                    diffuse_transmission: {
-                        let [r, g, b] = mesh.material.diffuse_transmission_color;
-                        [r, g, b, mesh.material.diffuse_transmission]
-                    },
-                };
+            if let Some(slot) = self.meshes.get(&handle.id) {
+                models[slot.draw.instance as usize] = gpu_model(handle.entity);
             }
         }
 
@@ -248,34 +256,57 @@ impl GeometryArena {
         }
     }
 
+    /// Gives `key` an instance slot on `mesh`'s geometry, uploading it if it's new. `false` if it
+    /// doesn't fit.
     fn insert(&mut self, queue: &wgpu::Queue, key: EntityKey, mesh: &Mesh) -> bool {
-        let Some(vertex) = self.vertices.alloc(queue, mesh.get_vertex_buffer_content()) else {
-            return false;
-        };
-        let Some(index) = self.indices.alloc(queue, mesh.get_indices_buffer_content()) else {
-            self.vertices.free(vertex);
-            return false;
-        };
+        let geometry_key = geometry_key(mesh);
+        if !self.geometries.contains_key(&geometry_key) {
+            let Some(vertex) = self.vertices.alloc(queue, mesh.get_vertex_buffer_content()) else {
+                return false;
+            };
+            let Some(index) = self.indices.alloc(queue, mesh.get_indices_buffer_content()) else {
+                self.vertices.free(vertex);
+                return false;
+            };
+            self.next_geometry += 1;
+            self.geometries.insert(
+                geometry_key,
+                Geometry {
+                    vertex,
+                    index,
+                    id: self.next_geometry,
+                    base_vertex: vertex.offset as i32,
+                    indices: index.offset..index.offset + mesh.indices.len() as u32,
+                    bounds: Aabb::from_points(mesh.vertices.iter().map(|v| v.position.into())),
+                    users: 0,
+                    _data: (Arc::clone(&mesh.vertices), Arc::clone(&mesh.indices)),
+                },
+            );
+        }
+        let geometry = self.geometries.get_mut(&geometry_key).expect("inserted above");
+        geometry.users += 1;
 
         let instance = self.free_instances.pop().unwrap_or_else(|| {
             self.next_instance += 1;
             self.next_instance - 1
         });
         let draw = MeshDraw {
-            base_vertex: vertex.offset as i32,
-            indices: index.offset..index.offset + mesh.indices.len() as u32,
+            base_vertex: geometry.base_vertex,
+            indices: geometry.indices.clone(),
             instance,
-            bounds: Aabb::from_points(mesh.vertices.iter().map(|v| v.position.into())),
+            bounds: geometry.bounds,
+            geometry: geometry.id,
         };
-        self.meshes.insert(key, MeshAlloc { vertex, index, draw });
+        self.meshes.insert(key, MeshSlot { geometry: geometry_key, draw });
         true
     }
 
-    /// Rebuilds both buffers bigger and re-uploads every live mesh, which also
+    /// Rebuilds both buffers bigger and re-uploads every live mesh's geometry, which also
     /// compacts away fragmentation.
     fn grow(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, meshes: &[EntityHandle<'_, Mesh>]) {
-        let needed_vertices: u64 = meshes.iter().map(|h| h.entity.vertices.len() as u64).sum();
-        let needed_indices: u64 = meshes.iter().map(|h| h.entity.indices.len() as u64).sum();
+        let unique: HashMap<GeometryKey, &Mesh> = meshes.iter().map(|h| (geometry_key(h.entity), h.entity)).collect();
+        let needed_vertices: u64 = unique.values().map(|m| m.vertices.len() as u64).sum();
+        let needed_indices: u64 = unique.values().map(|m| m.indices.len() as u64).sum();
 
         let mut vertex_cap = grown_capacity(self.vertices.capacity, needed_vertices);
         let mut index_cap = grown_capacity(self.indices.capacity, needed_indices);
@@ -304,7 +335,7 @@ impl GeometryArena {
     }
 
     pub fn get(&self, key: EntityKey) -> Option<&MeshDraw> {
-        self.meshes.get(&key).map(|alloc| &alloc.draw)
+        self.meshes.get(&key).map(|slot| &slot.draw)
     }
 
     pub fn vertex_buffer(&self) -> &wgpu::Buffer {
@@ -331,6 +362,25 @@ impl GeometryArena {
 
     pub fn index_usage(&self) -> (u32, u32) {
         (self.indices.used, self.indices.capacity)
+    }
+}
+
+fn gpu_model(mesh: &Mesh) -> GpuModel {
+    let transform = mesh.transform;
+    let m = &mesh.material;
+    let [er, eg, eb] = m.emissive.map(|c| c * m.emissive_strength);
+    let [ar, ag, ab] = m.attenuation_color;
+    let [dr, dg, db] = m.diffuse_transmission_color;
+    let distance = if m.attenuation_distance.is_finite() { m.attenuation_distance } else { 0.0 };
+    GpuModel {
+        model: transform.into(),
+        normal: transform.inversed().transposed().into(),
+        material: [mesh.alpha_cutoff().unwrap_or(0.0), if mesh.double_sided { 1.0 } else { 0.0 }, m.metallic, m.roughness],
+        base_color: m.base_color,
+        emissive: [er, eg, eb, 0.0],
+        transmission: [m.transmission, m.ior, m.thickness, distance],
+        attenuation: [ar, ag, ab, 0.0],
+        diffuse_transmission: [dr, dg, db, m.diffuse_transmission],
     }
 }
 

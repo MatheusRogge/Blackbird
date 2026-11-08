@@ -7,7 +7,7 @@ use engine_core::world::{EntityHandle, World};
 use ultraviolet::{Mat4, Vec3, Vec4};
 
 use crate::{
-    arena::{GeometryArena, MeshDraw},
+    arena::{Batch, GeometryArena, InstanceList, MeshDraw},
     bounds::Aabb,
     camera::Camera,
     graph::{NodeId, RenderGraph},
@@ -194,6 +194,7 @@ fn draw_glass(
     pipeline: &wgpu::RenderPipeline,
     (vp_bg, vp_offset): (&wgpu::BindGroup, u32),
     instance_bg: &wgpu::BindGroup,
+    instances: &mut InstanceList,
     textures: &AlbedoCache,
     geometry: &GeometryArena,
     glass: &[EntityHandle<'_, Mesh>],
@@ -217,12 +218,13 @@ fn draw_glass(
     pass.set_bind_group(1, instance_bg, &[]);
     pass.set_vertex_buffer(0, geometry.vertex_buffer().slice(..));
     pass.set_index_buffer(geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-    for (handle, draw) in visible(glass.iter(), geometry, view_proj) {
-        let Some((_, texture_bg)) = textures.get(&albedo_key(handle.entity)).or(textures.get(&0)) else {
+    let draws = visible(glass.iter(), geometry, view_proj).map(|(h, d)| (albedo_key(h.entity), d));
+    for batch in batches(instances, draws) {
+        let Some((_, texture_bg)) = textures.get(&batch.key).or(textures.get(&0)) else {
             continue;
         };
         pass.set_bind_group(2, texture_bg, &[]);
-        pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
+        pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
     }
 }
 
@@ -241,7 +243,10 @@ pub struct ShadowPass {
     glass_textures: AlbedoCache,
     bgl: Option<wgpu::BindGroupLayout>,
     instance_layout: Option<wgpu::BindGroupLayout>,
-    instance_bind_group: Option<(u64, wgpu::BindGroup)>,
+    /// Keyed by (geometry generation, instance list generation).
+    instance_bind_group: Option<((u64, u64), wgpu::BindGroup)>,
+    /// Every view's instanced draws this frame (cascades, local faces, glass tint).
+    instances: InstanceList,
 
     shadow_map_id: ResourceId,
     shadow_params_id: ResourceId,
@@ -349,6 +354,7 @@ impl ShadowPass {
                 bgl: None,
                 instance_layout: None,
                 instance_bind_group: None,
+            instances: InstanceList::default(),
                 shadow_map_id,
                 shadow_params_id,
                 cascade_vp_id,
@@ -547,24 +553,25 @@ impl ShadowPass {
             pass.set_bind_group(1, instance_bg, &[]);
             pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
             pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-            for (_, draw) in visible(meshes.iter().filter(|h| !h.entity.is_masked()), ctx.geometry, vp) {
-                pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
+            let opaque = visible(meshes.iter().filter(|h| !h.entity.is_masked()), ctx.geometry, vp);
+            for batch in batches(&mut self.instances, opaque.map(|(_, draw)| ((), draw))) {
+                pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
             }
 
             pass.set_pipeline(masked_pipeline);
             pass.set_bind_group(0, bind_group, &[offset]);
             pass.set_bind_group(1, instance_bg, &[]);
+            let draws = visible(masked.iter().copied(), ctx.geometry, vp).map(|(h, d)| (albedo_key(h.entity), d));
             let mut current_texture = None;
-            for (handle, draw) in visible(masked.iter().copied(), ctx.geometry, vp) {
-                let key = albedo_key(handle.entity);
-                if current_texture != Some(key) {
-                    let Some((_, texture_bg)) = self.masked_textures.get(&key).or(self.masked_textures.get(&0)) else {
+            for batch in batches(&mut self.instances, draws) {
+                if current_texture != Some(batch.key) {
+                    let Some((_, texture_bg)) = self.masked_textures.get(&batch.key).or(self.masked_textures.get(&0)) else {
                         continue;
                     };
                     pass.set_bind_group(2, texture_bg, &[]);
-                    current_texture = Some(key);
+                    current_texture = Some(batch.key);
                 }
-                pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
+                pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
             }
         }
         drop(pass);
@@ -591,16 +598,21 @@ impl ShadowPass {
             pass.set_bind_group(1, instance_bg, &[]);
             pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
             pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-            for (handle, draw) in visible(glass.iter(), ctx.geometry, vp) {
-                let Some((_, texture_bg)) = self.glass_textures.get(&albedo_key(handle.entity)).or(self.glass_textures.get(&0))
-                else {
+            let draws = visible(glass.iter(), ctx.geometry, vp).map(|(h, d)| (albedo_key(h.entity), d));
+            for batch in batches(&mut self.instances, draws) {
+                let Some((_, texture_bg)) = self.glass_textures.get(&batch.key).or(self.glass_textures.get(&0)) else {
                     continue;
                 };
                 pass.set_bind_group(2, texture_bg, &[]);
-                pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
+                pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
             }
         }
     }
+}
+
+/// `draws` as instanced draws: meshes sharing geometry and `key` are one.
+fn batches<'d, K: Ord + Copy>(instances: &mut InstanceList, draws: impl Iterator<Item = (K, &'d MeshDraw)>) -> Vec<Batch<K>> {
+    instances.batch(draws.map(|(key, draw)| (key, 0.0, draw)).collect())
 }
 
 /// The meshes with geometry whose bounds reach into the clip volume of `view_proj`.
@@ -724,6 +736,10 @@ impl Pass for ShadowPass {
         self.node_id = Some(node_id);
     }
 
+    fn draw_counts(&self) -> Option<crate::profiler::DrawCounts> {
+        Some(self.instances.counts())
+    }
+
     fn execute(
         &mut self,
         device: &wgpu::Device,
@@ -813,10 +829,13 @@ impl Pass for ShadowPass {
 
             let instance_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("shadow_instance_layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ..GeometryArena::instance_layout_entry(0)
-                }],
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ..GeometryArena::instance_layout_entry(0)
+                    },
+                    InstanceList::layout_entry(1, wgpu::ShaderStages::VERTEX),
+                ],
             });
 
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1047,17 +1066,20 @@ impl Pass for ShadowPass {
             return;
         }
 
-        let generation = ctx.geometry.generation();
+        // Every mesh can be drawn once per cascade and once per local light face.
+        let views = NUM_CASCADES + 6 * MAX_SHADOWED_LIGHTS;
+        self.instances.begin(device, (meshes.len() + glass.len()) * views);
+        let generation = (ctx.geometry.generation(), self.instances.generation());
         if self.instance_bind_group.as_ref().is_none_or(|(g, _)| *g != generation)
-            && let Some(layout) = self.instance_layout.as_ref()
+            && let (Some(layout), Some(ids)) = (self.instance_layout.as_ref(), self.instances.buffer())
         {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("shadow_instances"),
                 layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: ctx.geometry.instance_buffer().as_entire_binding(),
-                }],
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: ctx.geometry.instance_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: ids.as_entire_binding() },
+                ],
             });
             self.instance_bind_group = Some((generation, bind_group));
         }
@@ -1129,26 +1151,28 @@ impl Pass for ShadowPass {
             pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
             pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
 
-            for (_, draw) in visible(meshes.iter().filter(|h| !h.entity.is_masked()), ctx.geometry, light_vp) {
-                pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
+            let opaque = visible(meshes.iter().filter(|h| !h.entity.is_masked()), ctx.geometry, light_vp);
+            for batch in batches(&mut self.instances, opaque.map(|(_, draw)| ((), draw))) {
+                pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
             }
 
             if !masked.is_empty() {
                 pass.set_pipeline(masked_pipeline);
                 pass.set_bind_group(0, bg, &[vp_offset as u32]);
                 pass.set_bind_group(1, instance_bg, &[]);
+                let draws = visible(masked.iter().copied(), ctx.geometry, light_vp).map(|(h, d)| (albedo_key(h.entity), d));
                 let mut current_texture = None;
-                for (handle, draw) in visible(masked.iter().copied(), ctx.geometry, light_vp) {
-                    let key = albedo_key(handle.entity);
-                    if current_texture != Some(key) {
-                        let Some((_, texture_bg)) = self.masked_textures.get(&key).or(self.masked_textures.get(&0))
+                for batch in batches(&mut self.instances, draws) {
+                    if current_texture != Some(batch.key) {
+                        let Some((_, texture_bg)) =
+                            self.masked_textures.get(&batch.key).or(self.masked_textures.get(&0))
                         else {
                             continue;
                         };
                         pass.set_bind_group(2, texture_bg, &[]);
-                        current_texture = Some(key);
+                        current_texture = Some(batch.key);
                     }
-                    pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
+                    pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
                 }
             }
             drop(pass);
@@ -1159,6 +1183,7 @@ impl Pass for ShadowPass {
                 glass_pipeline,
                 (bg, vp_offset as u32),
                 instance_bg,
+                &mut self.instances,
                 &self.glass_textures,
                 ctx.geometry,
                 &glass,
@@ -1167,6 +1192,7 @@ impl Pass for ShadowPass {
         }
 
         self.render_local_shadows(encoder, queue, ctx, &meshes, &masked, &glass);
+        self.instances.finish(queue);
 
         let params = ShadowParams {
             view_to_shadow: view_to_shadow_raw,

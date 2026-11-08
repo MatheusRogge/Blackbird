@@ -18,6 +18,7 @@ pub struct GltfScene;
 GltfScene::new(Arc<GLTFAsset>)
 scene.with_root(Mat4) -> GltfScene        // place the whole scene under a transform (a placed model)
 scene.load_batch(&mut World, count) -> bool   // true while more mesh nodes remain
+                                              // each glTF mesh is built once and cloned per node, so nodes share geometry (instanced draws)
 scene.is_complete() -> bool
 scene.node_entities() -> &HashMap<usize, Vec<EntityKey>>   // glTF node index → its mesh entities
 scene.node_emitters() -> &HashMap<usize, EntityKey>        // glTF node index → its ParticleEmitter

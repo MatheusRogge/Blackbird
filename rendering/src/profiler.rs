@@ -15,6 +15,15 @@ pub struct PassStats {
     pub last_ms: f32,
     pub avg_ms: f32,
     pub gpu_ms: Option<f32>,
+    /// Last frame's draws, from passes that count them (`Pass::draw_counts`).
+    pub draws: Option<DrawCounts>,
+}
+
+/// A pass's mesh draws in one frame: `draws` calls drawing `instances` meshes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrawCounts {
+    pub draws: u32,
+    pub instances: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -30,10 +39,19 @@ pub struct FrameStats {
 impl fmt::Display for FrameStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "frame={} fps={:.1} cpu={:.2}ms (avg={:.2}ms)", self.frame, self.fps, self.last_ms, self.avg_ms)?;
+        let m = &self.memory;
+        write!(
+            f,
+            "\n  geometry: {} / {} vertices, {} / {} indices",
+            m.geometry_vertices.0, m.geometry_vertices.1, m.geometry_indices.0, m.geometry_indices.1
+        )?;
         for pass in &self.passes {
             write!(f, "\n  {:20} cpu {:6.2}ms  avg {:6.2}ms", pass.name, pass.last_ms, pass.avg_ms)?;
             if let Some(gpu) = pass.gpu_ms {
                 write!(f, "  gpu {:6.2}ms", gpu)?;
+            }
+            if let Some(d) = pass.draws {
+                write!(f, "  {} draws, {} meshes", d.draws, d.instances)?;
             }
         }
         Ok(())
@@ -45,6 +63,7 @@ pub struct FrameProfiler {
     frame_times: VecDeque<f32>,
     pass_times: HashMap<&'static str, VecDeque<f32>>,
     pass_order: Vec<&'static str>,
+    pass_draws: HashMap<&'static str, DrawCounts>,
     frame_start: Instant,
     last_stats: FrameStats,
 }
@@ -56,6 +75,7 @@ impl Default for FrameProfiler {
             frame_times: VecDeque::with_capacity(HISTORY),
             pass_times: HashMap::new(),
             pass_order: Vec::new(),
+            pass_draws: HashMap::new(),
             frame_start: Instant::now(),
             last_stats: FrameStats::default(),
         }
@@ -79,6 +99,13 @@ impl FrameProfiler {
         }
     }
 
+    pub fn record_draws(&mut self, name: &'static str, draws: Option<DrawCounts>) {
+        match draws {
+            Some(draws) => self.pass_draws.insert(name, draws),
+            None => self.pass_draws.remove(name),
+        };
+    }
+
     pub fn end_frame(&mut self) {
         let elapsed_ms = self.frame_start.elapsed().as_secs_f32() * 1000.0;
         if self.frame_times.len() >= HISTORY {
@@ -97,6 +124,7 @@ impl FrameProfiler {
                 last_ms: *history.back().unwrap_or(&0.0),
                 avg_ms: rolling_avg(history),
                 gpu_ms: None,
+                draws: self.pass_draws.get(name).copied(),
             })
         }).collect();
 

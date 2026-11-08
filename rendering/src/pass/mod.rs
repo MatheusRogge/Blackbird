@@ -78,4 +78,9 @@ pub trait Pass: PassDesc + Send + Sync + 'static {
         ctx: &PassContext<'_>,
         world: &World,
     );
+
+    /// The mesh draws of the last `execute`, for `FrameStats`. `None` for passes that don't count.
+    fn draw_counts(&self) -> Option<crate::profiler::DrawCounts> {
+        None
+    }
 }

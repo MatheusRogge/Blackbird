@@ -360,6 +360,9 @@ pub struct GltfScene {
     next_node: usize,
     cameras_loaded: bool,
     textures: TextureCache,
+    /// Primitives by glTF mesh, built once and cloned for each node using the mesh, so the nodes
+    /// share their geometry (`Mesh::vertices` / `indices`). Dropped once loading is done.
+    built_meshes: HashMap<usize, Vec<(Mesh, Option<usize>)>>,
     node_entities: HashMap<usize, Vec<EntityKey>>,
     node_cameras: HashMap<usize, EntityKey>,
     node_emitters: HashMap<usize, EntityKey>,
@@ -393,6 +396,7 @@ impl GltfScene {
             next_node: 0,
             cameras_loaded: false,
             textures: TextureCache::default(),
+            built_meshes: HashMap::new(),
             node_entities: HashMap::new(),
             node_cameras: HashMap::new(),
             node_emitters: HashMap::new(),
@@ -451,18 +455,24 @@ impl GltfScene {
             let Some(mesh) = self.asset.document.nodes().nth(node_index).and_then(|n| n.mesh()) else {
                 continue;
             };
-            let primitives =
-                build_mesh_primitives(&mesh, &self.asset.buffers, &self.asset.images, &mut self.textures);
+            let (buffers, images, textures) = (&self.asset.buffers, &self.asset.images, &mut self.textures);
+            let primitives = self
+                .built_meshes
+                .entry(mesh.index())
+                .or_insert_with(|| build_mesh_primitives(&mesh, buffers, images, textures));
             let keys = self.node_entities.entry(node_index).or_default();
-            for (entity, material) in primitives {
-                let key = world.add_entity(entity.with_transform(self.root * transform));
+            for (entity, material) in primitives.iter() {
+                let key = world.add_entity(entity.clone().with_transform(self.root * transform));
                 keys.push(key);
-                if let Some(material) = material {
+                if let Some(material) = *material {
                     self.material_meshes.entry(material).or_default().push(key);
                 }
             }
         }
         self.next_node = end;
+        if self.next_node >= self.pending.len() {
+            self.built_meshes.clear();
+        }
 
         !self.is_complete()
     }

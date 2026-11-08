@@ -1032,7 +1032,7 @@ fn raycast(world: &World, state: &EditorState, (origin, dir): (Vec3, Vec3)) -> O
         let (local_origin, local_dir) = (to_local.transform_point3(origin), to_local.transform_vec3(dir));
 
         let (mut lo, mut hi) = (Vec3::broadcast(f32::MAX), Vec3::broadcast(f32::MIN));
-        for v in &mesh.vertices {
+        for v in mesh.vertices.iter() {
             let p = Vec3::from(v.position);
             lo = lo.min_by_component(p);
             hi = hi.max_by_component(p);

@@ -10,7 +10,7 @@ use ultraviolet::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 
 use crate::{
-    arena::GeometryArena,
+    arena::{GeometryArena, InstanceList},
     camera::Camera,
     debug_flags::RenderDebugFlags,
     graph::{NodeId, RenderGraph},
@@ -351,8 +351,9 @@ impl Filter {
 
 struct Capture {
     scene_layout: wgpu::BindGroupLayout,
-    /// Keyed by the geometry generation.
-    scene_bg: Option<(u64, wgpu::BindGroup)>,
+    /// Keyed by (geometry generation, instance list generation).
+    scene_bg: Option<((u64, u64), wgpu::BindGroup)>,
+    instances: InstanceList,
     /// Depth only: back-face culled for single-sided opaque meshes, unculled and alpha-tested for
     /// masked and double-sided ones.
     prepass_opaque: wgpu::RenderPipeline,
@@ -440,6 +441,7 @@ impl ReflectionProbePass {
             label: Some("reflection_probe_scene_bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry { visibility: both, ..GeometryArena::instance_layout_entry(7) },
+                InstanceList::layout_entry(9, wgpu::ShaderStages::VERTEX),
                 wgpu::BindGroupLayoutEntry {
                     binding: 11,
                     visibility: both,
@@ -530,6 +532,7 @@ impl ReflectionProbePass {
         Capture {
             scene_layout,
             scene_bg: None,
+            instances: InstanceList::default(),
             prepass_opaque,
             prepass_masked,
             shade_opaque,
@@ -572,6 +575,10 @@ impl Pass for ReflectionProbePass {
         self.node_id = Some(node_id);
     }
 
+    fn draw_counts(&self) -> Option<crate::profiler::DrawCounts> {
+        self.capture.as_ref().map(|c| c.instances.counts())
+    }
+
     fn execute(
         &mut self,
         device: &wgpu::Device,
@@ -608,6 +615,7 @@ impl Pass for ReflectionProbePass {
         let meshes: Vec<_> =
             world.get_entity_handles::<Mesh>().into_iter().filter(|h| !h.entity.is_blended()).collect();
         capture.materials.prepare(device, queue, encoder, meshes.iter().map(|h| h.entity));
+        capture.instances.begin(device, meshes.len());
 
         let face = self.next_face;
         if face == 0 && self.cycle_center.is_none_or(|c| (eye - c).mag() > RECAPTURE_DISTANCE) {
@@ -629,13 +637,16 @@ impl Pass for ReflectionProbePass {
             views_buf.write_at(queue, STRIDE * face as u64, bytemuck::bytes_of(view));
         }
 
-        let generation = ctx.geometry.generation();
-        if capture.scene_bg.as_ref().is_none_or(|(g, _)| *g != generation) {
+        let generation = (ctx.geometry.generation(), capture.instances.generation());
+        if capture.scene_bg.as_ref().is_none_or(|(g, _)| *g != generation)
+            && let Some(ids) = capture.instances.buffer()
+        {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("reflection_probe_scene_bg"),
                 layout: &capture.scene_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 7, resource: ctx.geometry.instance_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 9, resource: ids.as_entire_binding() },
                     wgpu::BindGroupEntry {
                         binding: 11,
                         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -651,8 +662,9 @@ impl Pass for ReflectionProbePass {
 
         let offset = (STRIDE * face as u64) as u32;
         let view_proj = face_view_proj(center, FACES[face]);
-        // Front to back, so hidden fragments fail the depth test before they are shaded.
-        let mut draws: Vec<_> = meshes
+        // Instanced draws front to back by their nearest mesh, so hidden fragments mostly fail the
+        // prepass depth test early.
+        let draws: Vec<_> = meshes
             .iter()
             .filter_map(|handle| {
                 let draw = ctx.geometry.get(handle.id)?;
@@ -660,10 +672,13 @@ impl Pass for ReflectionProbePass {
                     return None;
                 }
                 let bounds = draw.bounds.transformed(handle.entity.transform);
-                Some((((bounds.min + bounds.max) * 0.5 - center).mag_sq(), handle.entity, draw))
+                let distance = ((bounds.min + bounds.max) * 0.5 - center).mag_sq();
+                Some(((handle.entity.is_masked(), material_key(handle.entity)), distance, draw))
             })
             .collect();
-        draws.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut batches = capture.instances.batch(draws);
+        batches.sort_by(|a, b| a.order.total_cmp(&b.order));
+        capture.instances.finish(queue);
 
         let bind_common = |pass: &mut wgpu::RenderPass<'_>| {
             pass.set_bind_group(0, scene_bg, &[offset]);
@@ -674,10 +689,11 @@ impl Pass for ReflectionProbePass {
             pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
         };
         let draw_meshes = |pass: &mut wgpu::RenderPass<'_>, opaque, masked| {
-            for (_, mesh, draw) in &draws {
-                pass.set_pipeline(if mesh.is_masked() { masked } else { opaque });
-                pass.set_bind_group(5, capture.materials.bind_group(material_key(mesh)), &[]);
-                pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
+            for batch in &batches {
+                let (is_masked, material) = batch.key;
+                pass.set_pipeline(if is_masked { masked } else { opaque });
+                pass.set_bind_group(5, capture.materials.bind_group(material), &[]);
+                pass.draw_indexed(batch.indices.clone(), batch.base_vertex, batch.instances.clone());
             }
         };
 

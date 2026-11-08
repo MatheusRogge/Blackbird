@@ -1275,6 +1275,8 @@ struct ProbeCapture {
 }
 
 @group(0) @binding(11) var<uniform> probe_capture: ProbeCapture;
+// The instance slot of each instance of the current draw (`InstanceList`).
+@group(0) @binding(9) var<storage, read> probe_instance_ids: array<u32>;
 
 // Distance stored for the sky, beyond any geometry.
 const PROBE_SKY_DISTANCE: f32 = 1.0e4;
@@ -1291,7 +1293,8 @@ fn vs_probe(
     @location(4) tangent: vec4<f32>,
     @builtin(instance_index) instance: u32,
 ) -> ForwardVertex {
-    let m = models[instance];
+    let slot = probe_instance_ids[instance];
+    let m = models[slot];
     let world = m.model * vec4f(position, 1.0);
     var out: ForwardVertex;
     out.pos = probe_capture.view_proj * world;
@@ -1301,7 +1304,7 @@ fn vs_probe(
     out.uv = uv;
     // Left unnormalized: meshes without tangents have zero ones, which fs_probe must detect.
     out.world_tangent = vec4f((m.model * vec4f(tangent.xyz, 0.0)).xyz, tangent.w);
-    out.instance = instance;
+    out.instance = slot;
     return out;
 }
 

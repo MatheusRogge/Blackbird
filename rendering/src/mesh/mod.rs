@@ -91,8 +91,10 @@ pub enum AlphaMode {
 
 #[derive(Debug, Clone)]
 pub struct Mesh {
-    pub indices: Vec<u32>,
-    pub vertices: Vec<Vertex>,
+    /// Shared by every mesh cloned from this one: the GPU keeps one copy per pair of allocations
+    /// (`GeometryArena`), and meshes sharing it are drawn instanced.
+    pub indices: Arc<[u32]>,
+    pub vertices: Arc<[Vertex]>,
     pub albedo_texture: Option<Arc<TextureAsset>>,
     pub normal_texture: Option<Arc<TextureAsset>>,
     /// glTF layout: G = roughness, B = metallic, linear.
@@ -110,8 +112,8 @@ pub struct Mesh {
 impl Default for Mesh {
     fn default() -> Self {
         Self {
-            indices: Vec::new(),
-            vertices: Vec::new(),
+            indices: Arc::new([]),
+            vertices: Arc::new([]),
             albedo_texture: None,
             normal_texture: None,
             metallic_roughness_texture: None,
@@ -132,8 +134,8 @@ impl Mesh {
         normal_texture: Option<Arc<TextureAsset>>,
     ) -> Self {
         Self {
-            indices,
-            vertices,
+            indices: indices.into(),
+            vertices: vertices.into(),
             albedo_texture,
             normal_texture,
             metallic_roughness_texture: None,
@@ -197,11 +199,11 @@ impl Mesh {
     }
 
     pub fn get_vertex_buffer_content(&self) -> &[u8] {
-        bytemuck::cast_slice(self.vertices.as_slice())
+        bytemuck::cast_slice(&self.vertices)
     }
 
     pub fn get_indices_buffer_content(&self) -> &[u8] {
-        bytemuck::cast_slice(self.indices.as_slice())
+        bytemuck::cast_slice(&self.indices)
     }
 }
 
@@ -230,7 +232,7 @@ impl MeshBatch {
         let mut out = Vec::new();
         let mut base: u32 = 0;
         for mesh in &self.meshes {
-            for &idx in &mesh.indices {
+            for &idx in mesh.indices.iter() {
                 out.push(idx + base);
             }
             base += mesh.vertices.len() as u32;

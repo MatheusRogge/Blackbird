@@ -22,7 +22,7 @@ pub mod shader;
 pub mod texture;
 
 pub use debug_flags::RenderDebugFlags;
-pub use profiler::{FrameStats, PassStats};
+pub use profiler::{DrawCounts, FrameStats, PassStats};
 pub use renderer::RenderGraphBuilder;
 pub use texture::TextureAsset;
 pub use wgpu;

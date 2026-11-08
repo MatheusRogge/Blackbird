@@ -4,11 +4,13 @@ use texture_pool::AliasingReport;
 
 mod frame;
 mod geometry;
+mod instances;
 mod upload;
 pub mod texture_pool;
 
 pub use frame::{FrameArena, FrameSlice};
 pub use geometry::{GeometryArena, GpuModel, MeshDraw};
+pub use instances::{Batch, InstanceList};
 pub use upload::UploadArena;
 
 /// Occupancy of the graph's arenas, published with `FrameStats`.

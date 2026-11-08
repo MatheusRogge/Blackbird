@@ -4,7 +4,7 @@ use crate::{
     camera::Camera,
     graph::{NodeId, RenderGraph},
     mesh::{Mesh, Vertex},
-    arena::GeometryArena,
+    arena::{GeometryArena, InstanceList},
     pass::material::{MaterialKey, MaterialTextures, material_key},
     pass::{Pass, PassContext, PassDesc},
     resource::{BindingResource, ResourceDescriptor, ResourceId},
@@ -31,7 +31,9 @@ pub struct GBufferPass {
     double_sided_pipeline: Option<wgpu::RenderPipeline>,
     camera_bind_group_layout: Option<wgpu::BindGroupLayout>,
     instance_layout: Option<wgpu::BindGroupLayout>,
-    instance_bind_group: Option<(u64, wgpu::BindGroup)>,
+    /// Keyed by (geometry generation, instance list generation).
+    instance_bind_group: Option<((u64, u64), wgpu::BindGroup)>,
+    instances: InstanceList,
     materials: Option<MaterialTextures>,
     camera_bind_group: Option<wgpu::BindGroup>,
 
@@ -100,6 +102,7 @@ impl GBufferPass {
                 camera_bind_group_layout: None,
                 instance_layout: None,
                 instance_bind_group: None,
+                instances: InstanceList::default(),
                 materials: None,
                 camera_bind_group: None,
                 camera_buffer_id,
@@ -245,6 +248,10 @@ impl Pass for GBufferPass {
         self.camera_bind_group = None;
     }
 
+    fn draw_counts(&self) -> Option<crate::profiler::DrawCounts> {
+        Some(self.instances.counts())
+    }
+
     fn execute(
         &mut self,
         device: &wgpu::Device,
@@ -284,7 +291,7 @@ impl Pass for GBufferPass {
 
             let instance_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("gbuffer_instance_layout"),
-                entries: &[GeometryArena::instance_layout_entry(0)],
+                entries: &[GeometryArena::instance_layout_entry(0), InstanceList::layout_entry(1, wgpu::ShaderStages::VERTEX)],
             });
 
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -379,6 +386,7 @@ impl Pass for GBufferPass {
         };
         // Before the render pass opens, so no resource creation happens during command recording.
         materials.prepare(device, queue, encoder, meshes.iter().map(|h| h.entity));
+        self.instances.begin(device, meshes.len());
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("gbuffer"),
@@ -456,36 +464,32 @@ impl Pass for GBufferPass {
             }));
         }
 
-        let generation = ctx.geometry.generation();
+        let generation = (ctx.geometry.generation(), self.instances.generation());
         if self.instance_bind_group.as_ref().is_none_or(|(g, _)| *g != generation)
-            && let Some(layout) = self.instance_layout.as_ref()
+            && let (Some(layout), Some(ids)) = (self.instance_layout.as_ref(), self.instances.buffer())
         {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("gbuffer_instances"),
                 layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: ctx.geometry.instance_buffer().as_entire_binding(),
-                }],
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: ctx.geometry.instance_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: ids.as_entire_binding() },
+                ],
             });
             self.instance_bind_group = Some((generation, bind_group));
         }
 
-        // Group draws by pipeline, then by bind group key, so consecutive meshes
-        // that share a material don't trigger a GPU state switch.
+        // Draws grouped by pipeline, then material, then geometry: meshes sharing all three are
+        // one instanced draw.
         let (w, h) = ctx.surface_size;
         let view_proj = world.get_entities::<Camera>().first().map(|c| c.view_proj_matrix(w as f32 / h as f32));
-        let in_view = |i: usize| {
-            let handle = &meshes[i];
-            view_proj.is_none_or(|vp| {
-                ctx.geometry.get(handle.id).is_some_and(|d| !d.bounds.outside_clip(vp * handle.entity.transform))
-            })
-        };
-        let mut draw_order: Vec<usize> = (0..meshes.len()).filter(|&i| in_view(i)).collect();
-        draw_order.sort_unstable_by_key(|&i| {
-            let m = meshes[i].entity;
-            (m.double_sided, material_key(m))
+        let visible = meshes.iter().filter_map(|handle| {
+            let draw = ctx.geometry.get(handle.id)?;
+            let in_view = view_proj.is_none_or(|vp| !draw.bounds.outside_clip(vp * handle.entity.transform));
+            in_view.then_some(((handle.entity.double_sided, material_key(handle.entity)), 0.0, draw))
         });
+        let batches = self.instances.batch(visible.collect());
+        self.instances.finish(queue);
 
         pass.set_pipeline(pipeline);
         let mut double_sided = false;
@@ -500,26 +504,17 @@ impl Pass for GBufferPass {
         }
 
         let mut current_bg_key: Option<MaterialKey> = None;
-
-        for i in draw_order {
-            let handle = &meshes[i];
-            let Some(draw) = ctx.geometry.get(handle.id) else {
-                continue;
-            };
-            let mesh = handle.entity;
-            let bg_key = material_key(mesh);
-
-            if mesh.double_sided != double_sided {
-                double_sided = mesh.double_sided;
+        for batch in batches {
+            let (batch_double_sided, bg_key) = batch.key;
+            if batch_double_sided != double_sided {
+                double_sided = batch_double_sided;
                 pass.set_pipeline(if double_sided { double_sided_pipeline } else { pipeline });
             }
-
             if current_bg_key != Some(bg_key) {
                 pass.set_bind_group(1, materials.bind_group(bg_key), &[]);
                 current_bg_key = Some(bg_key);
             }
-
-            pass.draw_indexed(draw.indices.clone(), draw.base_vertex, draw.instances());
+            pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
         }
     }
 }

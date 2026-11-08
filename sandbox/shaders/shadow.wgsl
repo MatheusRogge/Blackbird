@@ -23,13 +23,15 @@ struct Model {
 
 @group(0) @binding(0) var<uniform> light: LightUniform;
 @group(1) @binding(0) var<storage, read> models: array<Model>;
+// The instance slot of each instance of the current draw (`InstanceList`).
+@group(1) @binding(1) var<storage, read> instance_ids: array<u32>;
 
 @vertex
 fn vs_main(
     @location(0) position: vec3<f32>,
     @builtin(instance_index) instance: u32,
 ) -> @builtin(position) vec4<f32> {
-    return light.view_proj * models[instance].model * vec4<f32>(position, 1.0);
+    return light.view_proj * models[instance_ids[instance]].model * vec4<f32>(position, 1.0);
 }
 
 // Alpha-tested and double-sided meshes: drawn without culling, discarding cut-out texels.
@@ -49,7 +51,7 @@ fn vs_masked(
     @location(3) uv: vec2<f32>,
     @builtin(instance_index) instance: u32,
 ) -> MaskedOutput {
-    let m = models[instance];
+    let m = models[instance_ids[instance]];
     var out: MaskedOutput;
     out.position = light.view_proj * m.model * vec4<f32>(position, 1.0);
     out.uv = uv;
@@ -87,7 +89,7 @@ fn vs_glass(
     @location(3) uv: vec2<f32>,
     @builtin(instance_index) instance: u32,
 ) -> GlassOutput {
-    let m = models[instance];
+    let m = models[instance_ids[instance]];
     let world = m.model * vec4<f32>(position, 1.0);
     let clip = light.view_proj * world;
     var out: GlassOutput;
@@ -95,7 +97,7 @@ fn vs_glass(
     out.uv = uv;
     out.color = color;
     out.depth = select(clip.z, clip.w, light.light.w > 0.5);
-    out.instance = instance;
+    out.instance = instance_ids[instance];
     out.world_pos = world.xyz / world.w;
     out.world_normal = (m.normal * vec4f(normal, 0.0)).xyz;
     return out;

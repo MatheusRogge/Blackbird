@@ -688,6 +688,7 @@ impl RenderGraph {
 
             pass.execute(device, queue, &mut encoder, &ctx, world);
             self.profiler.record_pass(pass_name, t0.elapsed());
+            self.profiler.record_draws(pass_name, pass.draw_counts());
 
             if let Some(gpu) = &self.gpu_profiler {
                 gpu.write_end(&mut encoder, pass_idx as u32);

@@ -36,6 +36,9 @@ struct Model {
 
 @group(2) @binding(0)
 var<storage, read> models: array<Model>;
+// The instance slot of each instance of the current draw (`InstanceList`).
+@group(2) @binding(1)
+var<storage, read> instance_ids: array<u32>;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -69,7 +72,7 @@ struct GBufferOutput {
 @vertex
 fn vs_main(in: VertexInput, @builtin(instance_index) instance: u32) -> VertexOutput {
     var out: VertexOutput;
-    let m = models[instance];
+    let m = models[instance_ids[instance]];
 
     out.clip_position = camera.view_proj * m.model * vec4<f32>(in.position, 1.0);
     out.world_normal = normalize((m.normal * vec4<f32>(in.normal, 0.0)).xyz);
