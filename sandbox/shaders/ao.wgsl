@@ -3,12 +3,32 @@
 // visible hemisphere over a few screen-space slices per pixel, each rotated by a 4×4 interleaved
 // pattern; `fs_blur` averages that 4×4 neighbourhood, weighted by how well each tap lies on the
 // centre pixel's surface, so the result sees 4 × DIRECTIONS slice angles without temporal history.
+// Glass isn't in the G-buffer depth: `vs_glass` / `fs_glass` first draw the nearest visible glass
+// surface into its own depth target, with how much light it blocks, and `fs_ao` counts it as a
+// partial occluder.
 
 @group(0) @binding(0) var t_depth:  texture_depth_2d;
 @group(0) @binding(1) var t_normal: texture_2d<f32>;
 @group(0) @binding(2) var<uniform> camera: CameraUniform;
 // `fs_ao`'s output, read by `fs_blur`.
 @group(0) @binding(3) var t_raw:    texture_2d<f32>;
+@group(0) @binding(4) var<storage, read> models: array<Model>;
+// Nearest glass in front of the opaque depth (reversed-Z, 0 = none) and its opacity.
+@group(0) @binding(5) var t_glass_depth:   texture_depth_2d;
+@group(0) @binding(6) var t_glass_opacity: texture_2d<f32>;
+
+// Mirrors rendering::arena::GpuModel.
+struct Model {
+    model: mat4x4<f32>,
+    normal: mat4x4<f32>,
+    material: vec4<f32>,
+    base_color: vec4<f32>,
+    emissive: vec4<f32>,
+    // x: transmission factor.
+    transmission: vec4<f32>,
+    attenuation: vec4<f32>,
+    diffuse_transmission: vec4<f32>,
+}
 
 // Mirrors the prefix of rendering::pass::camera::CameraUniform.
 struct CameraUniform {
@@ -63,6 +83,44 @@ fn slice_arc(h: f32, n: f32) -> f32 {
     return 0.25 * (-cos(2.0 * h - n) + cos(n) + 2.0 * h * sin(n));
 }
 
+struct GlassVertex {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) @interpolate(flat) opacity: f32,
+}
+
+// The fraction of light a glass surface blocks: its coverage, minus what transmission lets through,
+// tinted by the base color and absorbed through the volume's thickness (Beer–Lambert). Textures and
+// Fresnel are ignored.
+@vertex
+fn vs_glass(@location(0) position: vec3<f32>, @builtin(instance_index) instance: u32) -> GlassVertex {
+    let m = models[instance];
+    var tint = m.base_color.rgb;
+    if m.transmission.w > 0.0 {
+        let scale = (length(m.model[0].xyz) + length(m.model[1].xyz) + length(m.model[2].xyz)) / 3.0;
+        tint *= pow(m.attenuation.rgb, vec3f(m.transmission.z * scale / m.transmission.w));
+    }
+    let passed = m.transmission.x * dot(tint, vec3f(0.2126, 0.7152, 0.0722));
+    return GlassVertex(camera.view_proj * m.model * vec4f(position, 1.0), m.base_color.a * saturate(1.0 - passed));
+}
+
+@fragment
+fn fs_glass(in: GlassVertex) -> @location(0) vec4<f32> {
+    if in.pos.z < textureLoad(t_depth, vec2<i32>(in.pos.xy), 0) {
+        discard;
+    }
+    return vec4f(in.opacity);
+}
+
+// Horizon cosine of an occluder at `sample_pos`, pulled down to -1 (no occlusion) by the distance
+// falloff.
+fn horizon_cos(sample_pos: vec3<f32>, p: vec3<f32>, v: vec3<f32>) -> f32 {
+    let delta = sample_pos - p;
+    let dist = length(delta);
+    let cos_h = dot(delta, v) / max(dist, 1e-4);
+    let falloff = saturate((dist - FALLOFF_START * RADIUS) / ((1.0 - FALLOFF_START) * RADIUS));
+    return mix(cos_h, -1.0, falloff);
+}
+
 @fragment
 fn fs_ao(in: VertexOutput) -> @location(0) vec4<f32> {
     let dims = vec2f(textureDimensions(t_depth));
@@ -102,7 +160,11 @@ fn fs_ao(in: VertexOutput) -> @location(0) vec4<f32> {
         let angle_n = sign(dot(n_proj, ortho)) * acos(clamp(dot(n_proj / n_len, v), -1.0, 1.0));
 
         // Cosine of the highest horizon on the -dir and +dir sides.
+        // Per side: the opaque horizon, the horizon counting glass as solid, and the opacity of the
+        // glass that set it. A side's visibility blends the two by that opacity.
         var horizon = vec2f(-1.0);
+        var glass_horizon = vec2f(-1.0);
+        var glass_opacity = vec2f(0.0);
         for (var side = 0u; side < 2u; side++) {
             let s = f32(side) * 2.0 - 1.0;
             for (var j = 0u; j < STEPS; j++) {
@@ -113,20 +175,27 @@ fn fs_ao(in: VertexOutput) -> @location(0) vec4<f32> {
                     break;
                 }
                 let sample_depth = textureLoad(t_depth, vec2<i32>(sample_px), 0);
-                if sample_depth == 0.0 {
-                    continue;
+                if sample_depth != 0.0 {
+                    horizon[side] = max(horizon[side], horizon_cos(world_pos(sample_px, sample_depth, dims), p, v));
                 }
-                let delta = world_pos(sample_px, sample_depth, dims) - p;
-                let dist2 = dot(delta, delta);
-                let cos_h = dot(delta, v) * inverseSqrt(max(dist2, 1e-8));
-                let falloff = saturate((sqrt(dist2) - FALLOFF_START * RADIUS) / ((1.0 - FALLOFF_START) * RADIUS));
-                horizon[side] = max(horizon[side], mix(cos_h, -1.0, falloff));
+                let glass_depth = textureLoad(t_glass_depth, vec2<i32>(sample_px), 0);
+                if glass_depth != 0.0 {
+                    let cos_h = horizon_cos(world_pos(sample_px, glass_depth, dims), p, v);
+                    if cos_h > glass_horizon[side] {
+                        glass_horizon[side] = cos_h;
+                        glass_opacity[side] = textureLoad(t_glass_opacity, vec2<i32>(sample_px), 0).r;
+                    }
+                }
             }
         }
 
+        let with_glass = max(horizon, glass_horizon);
         let h0 = angle_n + max(-acos(horizon.x) - angle_n, -0.5 * PI);
         let h1 = angle_n + min(acos(horizon.y) - angle_n, 0.5 * PI);
-        visible += (slice_arc(h0, angle_n) + slice_arc(h1, angle_n)) * n_len;
+        let g0 = angle_n + max(-acos(with_glass.x) - angle_n, -0.5 * PI);
+        let g1 = angle_n + min(acos(with_glass.y) - angle_n, 0.5 * PI);
+        visible += (mix(slice_arc(h0, angle_n), slice_arc(g0, angle_n), glass_opacity.x)
+            + mix(slice_arc(h1, angle_n), slice_arc(g1, angle_n), glass_opacity.y)) * n_len;
         total += n_len;
     }
     return vec4f(select(1.0, visible / total, total > 0.0));
