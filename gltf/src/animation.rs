@@ -9,6 +9,7 @@ use engine_core::{
     world::World,
 };
 use rendering::{
+    camera::Camera,
     light::{AreaLight, PointLight, SkyLight, SpotLight},
     mesh::{Mat4, Mesh},
     particles::ParticleEmitter,
@@ -36,6 +37,8 @@ pub enum Target {
     AreaLight(usize, LightProperty),
     /// The `blackbird_particles` emitter on a node.
     Particles(usize, ParticleProperty),
+    /// A perspective camera's vertical field of view, in radians, by its index in `cameras`.
+    CameraFov(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -95,6 +98,7 @@ impl Target {
             ["nodes", n, "extras", "blackbird_particles", p] => {
                 Self::Particles(index(n)?, *ParticleProperty::ALL.iter().find(|q| q.key() == *p)?)
             }
+            ["cameras", c, "perspective", "yfov"] => Self::CameraFov(index(c)?),
             _ => return None,
         })
     }
@@ -115,6 +119,7 @@ impl Target {
             Self::PunctualLight(l, p) => format!("/extensions/KHR_lights_punctual/lights/{l}/{}", light(p)),
             Self::AreaLight(l, p) => format!("/extras/blackbird_lights/{l}/{}", light(p)),
             Self::Particles(n, p) => format!("/nodes/{n}/extras/blackbird_particles/{}", p.key()),
+            Self::CameraFov(c) => format!("/cameras/{c}/perspective/yfov"),
         }
     }
 
@@ -122,7 +127,7 @@ impl Target {
         match self {
             Self::Rotation(_) => 4,
             Self::Translation(_) | Self::Scale(_) | Self::EmissiveFactor(_) => 3,
-            Self::EmissiveStrength(_) => 1,
+            Self::EmissiveStrength(_) | Self::CameraFov(_) => 1,
             Self::PunctualLight(_, p) | Self::AreaLight(_, p) => match p {
                 LightProperty::Intensity => 1,
                 LightProperty::Color => 3,
@@ -511,6 +516,10 @@ impl GltfScene {
                     LightProperty::Color => vec3(color),
                 })
             }
+            Target::CameraFov(camera) => {
+                let key = self.camera_entities(camera).next()?;
+                Some(scalar(world.get_entity::<Camera>(key)?.fovy))
+            }
             Target::Particles(node, property) => {
                 let e = world.get_entity::<ParticleEmitter>(*self.node_emitters.get(&node)?)?;
                 Some(match property {
@@ -553,6 +562,14 @@ impl GltfScene {
                 let lights = if matches!(target, Target::PunctualLight(..)) { &self.punctual_lights } else { &self.area_lights };
                 if let Some(&key) = lights.get(&index) {
                     set_light(world, key, property, v[0].max(0.0), vec3);
+                }
+            }
+            Target::CameraFov(camera) => {
+                let keys: Vec<EntityKey> = self.camera_entities(camera).collect();
+                for key in keys {
+                    if let Some(c) = world.get_entity_mut::<Camera>(key) {
+                        c.fovy = v[0].clamp(0.01, 3.1);
+                    }
                 }
             }
             Target::Particles(node, property) => {
@@ -598,6 +615,15 @@ impl GltfScene {
         }
     }
 
+    /// The entities of the nodes showing glTF camera `camera`.
+    fn camera_entities(&self, camera: usize) -> impl Iterator<Item = EntityKey> + '_ {
+        self.asset
+            .document
+            .nodes()
+            .filter(move |n| n.camera().is_some_and(|c| c.index() == camera))
+            .filter_map(|n| self.node_cameras.get(&n.index()).copied())
+    }
+
     fn place_node(&self, world: &mut World, node: usize, transform: Mat4) {
         for &key in self.node_entities.get(&node).into_iter().flatten() {
             if let Some(mesh) = world.get_entity_mut::<Mesh>(key) {
@@ -606,6 +632,11 @@ impl GltfScene {
         }
         if let Some(emitter) = self.node_emitters.get(&node).and_then(|&k| world.get_entity_mut::<ParticleEmitter>(k)) {
             emitter.transform = transform;
+        }
+        if let Some(camera) = self.node_cameras.get(&node).and_then(|&k| world.get_entity_mut::<Camera>(k)) {
+            camera.eye = transform.cols[3].xyz();
+            camera.target = camera.eye + (transform * Vec4::new(0.0, 0.0, -1.0, 0.0)).xyz().normalized();
+            camera.up = (transform * Vec4::new(0.0, 1.0, 0.0, 0.0)).xyz().normalized();
         }
         let Some(&light) = self.node_lights.get(&node) else { return };
         let position = transform.cols[3].xyz();
@@ -689,6 +720,36 @@ mod tests {
     }
 
     #[test]
+    fn a_camera_follows_its_animated_node_and_fov() {
+        let json = r#"{
+            "asset": { "version": "2.0" },
+            "cameras": [{ "type": "perspective", "perspective": { "yfov": 1.0, "znear": 0.1 } }],
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "camera": 0 }],
+            "extras": { "blackbird_animations": [{ "name": "Dolly", "tracks": [
+                { "pointer": "/nodes/0/translation", "keys": [
+                    { "time": 0.0, "value": [0, 0, 0] }, { "time": 2.0, "value": [0, 0, -4] }] },
+                { "pointer": "/cameras/0/perspective/yfov", "keys": [
+                    { "time": 0.0, "value": 1.0 }, { "time": 2.0, "value": 0.5 }] }] }] }
+        }"#;
+        let (document, buffers, images) = gltf::import_slice(json.as_bytes()).expect("valid glTF");
+        let mut scene = GltfScene::new(std::sync::Arc::new(crate::GLTFAsset { document, buffers, images }));
+        let mut world = World::default();
+        while scene.load_batch(&mut world, 10) {}
+
+        scene.pose(&mut world, 0, 1.0);
+        let camera = world.get_entities::<Camera>()[0];
+        assert!((camera.eye.z + 2.0).abs() < 1e-5);
+        assert!((camera.target.z + 3.0).abs() < 1e-5, "still looks down -Z");
+        assert!((camera.fovy - 0.75).abs() < 1e-5);
+
+        scene.reset_animation(&mut world);
+        let camera = world.get_entities::<Camera>()[0];
+        assert_eq!((camera.eye.z, camera.fovy), (0.0, 1.0));
+    }
+
+    #[test]
     fn pointers_round_trip() {
         for target in [
             Target::Translation(3),
@@ -698,6 +759,7 @@ mod tests {
             Target::PunctualLight(0, LightProperty::Color),
             Target::AreaLight(4, LightProperty::Intensity),
             Target::Particles(29, ParticleProperty::SpawnRate),
+            Target::CameraFov(1),
         ] {
             assert_eq!(Target::parse(&target.pointer()), Some(target));
         }

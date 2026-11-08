@@ -11,7 +11,9 @@ use engine::gltf::animation::{
 use engine_core::animation::{Curve, Interpolation, Key, Value};
 use gltf_api::Document;
 
+use crate::math::{self, euler_to_quat, quat_to_euler};
 use crate::state::{EditorState, LightData, SceneLight};
+use ultraviolet::Mat4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EditorTarget {
@@ -87,6 +89,9 @@ pub struct Timeline {
     pub playing: bool,
     /// The viewport shows the clip at `time`. Turned on by playing or scrubbing.
     pub preview: bool,
+    /// The curve view's time and (shown) value ranges; `None` fits the clip / the track.
+    pub view_time: Option<(f32, f32)>,
+    pub view_values: Option<(f32, f32)>,
 }
 
 impl Timeline {
@@ -243,6 +248,9 @@ pub fn label(state: &EditorState, target: EditorTarget) -> String {
         EditorTarget::Scene(Target::EmissiveFactor(m)) => format!("{} · emissive color", material_name(m)),
         EditorTarget::Scene(Target::EmissiveStrength(m)) => format!("{} · emissive strength", material_name(m)),
         EditorTarget::Scene(Target::Particles(n, p)) => format!("{} · {}", node_name(n), p.key().replace('_', " ")),
+        EditorTarget::Scene(Target::CameraFov(c)) => {
+            camera_nodes(state, c).first().map_or_else(|| format!("Camera {c}"), |&n| node_name(n)) + " · field of view"
+        }
         EditorTarget::Scene(Target::PunctualLight(i, p) | Target::AreaLight(i, p)) => {
             format!("Light {i} · {}", light(p))
         }
@@ -289,6 +297,10 @@ pub fn current_value(state: &EditorState, target: EditorTarget) -> Option<Value>
                     ParticleProperty::Opacity => v1(data.opacity),
                 })
             }
+            Target::CameraFov(c) => {
+                let fov = camera_nodes(state, c).iter().find_map(|n| Some(state.node_edits.get(n)?.camera.as_ref()?.fov_y_deg))?;
+                Some(v1(fov.to_radians()))
+            }
             Target::PunctualLight(..) | Target::AreaLight(..) => None,
         },
         EditorTarget::Light(id, p) => {
@@ -314,6 +326,93 @@ pub fn node_materials(state: &EditorState, n: usize) -> Vec<usize> {
     materials
 }
 
+/// The glTF camera node `n` shows.
+pub fn node_camera(state: &EditorState, n: usize) -> Option<usize> {
+    Some(state.document.as_ref()?.nodes().nth(n)?.camera()?.index())
+}
+
+/// The nodes showing glTF camera `camera`.
+fn camera_nodes(state: &EditorState, camera: usize) -> Vec<usize> {
+    let Some(doc) = &state.document else { return Vec::new() };
+    doc.nodes().filter(|n| n.camera().is_some_and(|c| c.index() == camera)).map(|n| n.index()).collect()
+}
+
+/// The previewed clip, if the viewport shows one, and the playhead.
+fn previewed(state: &EditorState) -> Option<(&EditorClip, f32)> {
+    let clip = state.timeline.clip.filter(|_| state.timeline.preview)?;
+    Some((state.clips.get(clip)?, state.timeline.time))
+}
+
+/// Camera node `n`'s world transform and field of view (radians) in the previewed clip at the
+/// playhead, for Assume Camera View. `None` when nothing previews.
+pub fn posed_camera(state: &EditorState, n: usize) -> Option<(Mat4, Option<f32>)> {
+    let (clip, time) = previewed(state)?;
+    let sample = |target| clip.tracks.iter().find(|t| t.target == EditorTarget::Scene(target)).map(|t| t.curve.sample(time));
+    let local = |node: usize| {
+        let (mut translation, mut rotation, mut scale) = match state.node_edits.get(&node) {
+            Some(edit) => (edit.translation, edit.rotation, edit.scale),
+            None => state
+                .document
+                .as_ref()
+                .and_then(|d| d.nodes().nth(node))
+                .map_or(([0.0; 3], [0.0, 0.0, 0.0, 1.0], [1.0; 3]), |n| n.transform().decomposed()),
+        };
+        if let Some(v) = sample(Target::Translation(node)) {
+            translation = [v[0], v[1], v[2]];
+        }
+        if let Some(v) = sample(Target::Rotation(node)) {
+            rotation = v;
+        }
+        if let Some(v) = sample(Target::Scale(node)) {
+            scale = [v[0], v[1], v[2]];
+        }
+        math::trs(translation, rotation, scale)
+    };
+    let mut world = local(n);
+    let mut current = state.node_parents.get(&n).copied();
+    while let Some(parent) = current {
+        world = local(parent) * world;
+        current = state.node_parents.get(&parent).copied();
+    }
+    let fov = node_camera(state, n).and_then(|c| sample(Target::CameraFov(c))).map(|v| v[0]);
+    Some((world, fov))
+}
+
+/// How the editor shows a track's values: rotations as Euler degrees, fields of view in degrees,
+/// everything else as stored. Returns the shown value and its component count.
+pub fn to_display(target: EditorTarget, value: Value) -> (Value, usize) {
+    match linear_scale(target) {
+        Some(scale) => (value.map(|v| v * scale), components(target)),
+        None => {
+            let [x, y, z] = quat_to_euler(value);
+            ([x, y, z, 0.0], 3)
+        }
+    }
+}
+
+/// Inverse of `to_display`. A rotation stays in the hemisphere of `previous`, so blending with
+/// its neighbours doesn't take the long way round.
+pub fn from_display(target: EditorTarget, shown: Value, previous: Value) -> Value {
+    match linear_scale(target) {
+        Some(scale) => shown.map(|v| v / scale),
+        None => {
+            let q = euler_to_quat([shown[0], shown[1], shown[2]]);
+            let dot: f32 = (0..4).map(|c| q[c] * previous[c]).sum();
+            if dot < 0.0 { q.map(|c| -c) } else { q }
+        }
+    }
+}
+
+/// The factor from stored to shown values (and slopes), or `None` for rotations, which aren't
+/// shown linearly.
+pub fn linear_scale(target: EditorTarget) -> Option<f32> {
+    match target {
+        EditorTarget::Scene(Target::Rotation(_)) => None,
+        EditorTarget::Scene(Target::CameraFov(_)) => Some(1f32.to_degrees()),
+        _ => Some(1.0),
+    }
+}
+
 /// Everything about the selection that can be animated.
 pub fn animatable(state: &EditorState) -> Vec<EditorTarget> {
     use crate::state::Selection;
@@ -326,6 +425,9 @@ pub fn animatable(state: &EditorState) -> Vec<EditorTarget> {
             }
             if state.node_edits.get(&n).is_some_and(|e| e.particles.is_some()) {
                 targets.extend(ParticleProperty::ALL.map(|p| EditorTarget::Scene(Target::Particles(n, p))));
+            }
+            if let Some(camera) = node_camera(state, n) {
+                targets.push(EditorTarget::Scene(Target::CameraFov(camera)));
             }
         }
         Some(Selection::Light(i)) => {
@@ -405,6 +507,24 @@ mod tests {
         let index = lights.iter().position(|l| l.id == spot).unwrap();
         assert_eq!(saved[0].tracks[0].pointer, format!("/extensions/KHR_lights_punctual/lights/{index}/intensity"));
         assert_eq!(saved[0].tracks[0].keys[0].interpolation, engine::gltf::animation::InterpolationData::EaseIn);
+    }
+
+    #[test]
+    fn display_round_trips_and_keeps_the_rotation_hemisphere() {
+        let fov = EditorTarget::Scene(Target::CameraFov(0));
+        let (shown, n) = to_display(fov, [0.5, 0.0, 0.0, 0.0]);
+        assert_eq!(n, 1);
+        assert!((shown[0] - 0.5f32.to_degrees()).abs() < 1e-4);
+        assert!((from_display(fov, shown, [0.0; 4])[0] - 0.5).abs() < 1e-6);
+
+        let rotation = EditorTarget::Scene(Target::Rotation(0));
+        let previous = euler_to_quat([10.0, 20.0, 30.0]).map(|c| -c);
+        let (shown, n) = to_display(rotation, previous);
+        assert_eq!(n, 3);
+        let back = from_display(rotation, shown, previous);
+        for c in 0..4 {
+            assert!((back[c] - previous[c]).abs() < 1e-4, "{back:?} vs {previous:?}");
+        }
     }
 
     #[test]

@@ -1,11 +1,12 @@
 //! The Animation panel: clips, a track per animated property, a timeline to scrub and play, and a
 //! curve view of the selected track where keys and cubic tangents are dragged.
 
+use std::collections::HashSet;
+
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
-use engine_core::animation::{Interpolation, Key};
+use engine_core::animation::{Curve, Interpolation, Key, Value};
 
 use crate::animation::{self, EditorClip, EditorTarget, components};
-use crate::math::{euler_to_quat, quat_to_euler};
 use crate::state::EditorState;
 use engine::gltf::animation::Target;
 
@@ -24,6 +25,7 @@ const COMPONENT_COLORS: [Color32; 4] = [
     Color32::from_rgb(100, 150, 240),
     Color32::from_rgb(220, 220, 220),
 ];
+const PLAYHEAD: Color32 = Color32::from_rgb(255, 170, 40);
 const RULER_HEIGHT: f32 = 18.0;
 const KEY_RADIUS: f32 = 5.0;
 /// Length of a drawn tangent handle, in points.
@@ -97,6 +99,12 @@ fn draw_header(ui: &mut Ui, state: &mut EditorState) {
         let duration = state.clips[index].duration();
         ui.add(egui::DragValue::new(&mut state.timeline.time).speed(0.01).range(0.0..=duration.max(0.0)).suffix(" s"));
         ui.label(egui::RichText::new(format!("/ {duration:.2} s")).weak());
+        if ui.button("⛶ Frame").on_hover_text(
+            "Fit the curve view to the clip and track (F).\nWheel: zoom time · Ctrl + wheel: zoom values · Middle / right drag: pan",
+        ).clicked() {
+            state.timeline.view_time = None;
+            state.timeline.view_values = None;
+        }
 
         ui.separator();
         let clip = &mut state.clips[index];
@@ -122,6 +130,8 @@ fn select_clip(state: &mut EditorState, clip: Option<usize>) {
     timeline.key = None;
     timeline.time = 0.0;
     timeline.playing = false;
+    timeline.view_time = None;
+    timeline.view_values = None;
 }
 
 fn draw_tracks(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
@@ -151,6 +161,7 @@ fn draw_tracks(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
                 if ui.selectable_label(state.timeline.track == Some(i), format!("{label} ({keys})")).clicked() {
                     state.timeline.track = Some(i);
                     state.timeline.key = None;
+                    state.timeline.view_values = None;
                 }
                 if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
                     delete = Some(i);
@@ -191,19 +202,9 @@ fn draw_key_inspector(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
     };
     let time = state.timeline.time;
     let track = &mut state.clips[clip_index].tracks[track_index];
-    let is_rotation = matches!(track.target, EditorTarget::Scene(Target::Rotation(_)));
-    let n = components(track.target);
+    let target = track.target;
     if ui.button("◆ Key at playhead").on_hover_text("Adds a key with the curve's value at the playhead.").clicked() {
-        let value = track.curve.sample(time);
-        let interpolation = track.curve.keys.iter().rev().find(|k| k.time <= time).map_or(Interpolation::Linear, |k| k.interpolation);
-        match track.curve.keys.iter().position(|k| (k.time - time).abs() < 1e-3) {
-            Some(i) => state.timeline.key = Some(i),
-            None => {
-                track.curve.keys.push(Key::new(time, value, interpolation));
-                track.curve.keys.sort_by(|a, b| a.time.total_cmp(&b.time));
-                state.timeline.key = track.curve.keys.iter().position(|k| k.time == time);
-            }
-        }
+        state.timeline.key = Some(insert_key(&mut track.curve, time));
     }
     ui.separator();
     let Some(key_index) = state.timeline.key.filter(|&k| k < track.curve.keys.len()) else {
@@ -219,20 +220,15 @@ fn draw_key_inspector(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
 
         ui.label("Value");
         ui.horizontal_wrapped(|ui| {
-            if is_rotation {
-                let euler = quat_to_euler(key.value);
-                let mut edited = euler;
-                for (c, axis) in ["X", "Y", "Z"].iter().enumerate() {
-                    ui.add(egui::DragValue::new(&mut edited[c]).speed(0.5).prefix(format!("{axis} ")).suffix("°"));
-                }
-                if edited != euler {
-                    key.value = euler_to_quat(edited);
-                }
-            } else {
-                for c in 0..n {
-                    let speed = drag_speed(key.value[c]);
-                    ui.add(egui::DragValue::new(&mut key.value[c]).speed(speed));
-                }
+            let (shown, n) = animation::to_display(target, key.value);
+            let mut edited = shown;
+            let unit = unit(target);
+            for (c, value) in edited.iter_mut().enumerate().take(n) {
+                let prefix = if n == 3 { ["X ", "Y ", "Z "][c] } else { "" };
+                ui.add(egui::DragValue::new(value).speed(drag_speed(shown[c])).prefix(prefix).suffix(unit));
+            }
+            if edited != shown {
+                key.value = animation::from_display(target, edited, key.value);
             }
         });
         ui.end_row();
@@ -245,12 +241,16 @@ fn draw_key_inspector(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
         });
         ui.end_row();
 
-        if !is_rotation {
+        if let Some(scale) = animation::linear_scale(target) {
+            let n = components(target);
             for (label, tangent) in [("In slope", &mut key.in_tangent), ("Out slope", &mut key.out_tangent)] {
                 ui.label(label).on_hover_text("Value per second, used by Cubic segments.");
                 ui.horizontal_wrapped(|ui| {
                     for value in tangent.iter_mut().take(n) {
-                        ui.add(egui::DragValue::new(value).speed(0.05));
+                        let mut shown = *value * scale;
+                        if ui.add(egui::DragValue::new(&mut shown).speed(0.05)).changed() {
+                            *value = shown / scale;
+                        }
                     }
                 });
                 ui.end_row();
@@ -260,6 +260,26 @@ fn draw_key_inspector(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
     if ui.button("Delete key").clicked() {
         track.curve.keys.remove(key_index);
         state.timeline.key = None;
+    }
+}
+
+/// Adds a key on `curve` at `time` with the curve's value there (keeping the shape), or finds the
+/// one already there. Returns its index.
+fn insert_key(curve: &mut Curve, time: f32) -> usize {
+    if let Some(i) = curve.keys.iter().position(|k| (k.time - time).abs() < 1e-3) {
+        return i;
+    }
+    let value = curve.sample(time);
+    let interpolation = curve.keys.iter().rev().find(|k| k.time <= time).map_or(Interpolation::Linear, |k| k.interpolation);
+    curve.keys.push(Key::new(time, value, interpolation));
+    curve.keys.sort_by(|a, b| a.time.total_cmp(&b.time));
+    curve.keys.iter().position(|k| k.time == time).unwrap_or(0)
+}
+
+fn unit(target: EditorTarget) -> &'static str {
+    match target {
+        EditorTarget::Scene(Target::Rotation(_) | Target::CameraFov(_)) => "°",
+        _ => "",
     }
 }
 
@@ -277,6 +297,7 @@ fn drag_speed(value: f32) -> f64 {
 /// Maps time / value to the curve view and back.
 struct View {
     rect: Rect,
+    t_min: f32,
     t_max: f32,
     v_min: f32,
     v_max: f32,
@@ -284,7 +305,7 @@ struct View {
 
 impl View {
     fn x(&self, t: f32) -> f32 {
-        self.rect.left() + t / self.t_max * self.rect.width()
+        self.rect.left() + (t - self.t_min) / (self.t_max - self.t_min) * self.rect.width()
     }
 
     fn y(&self, v: f32) -> f32 {
@@ -296,15 +317,64 @@ impl View {
     }
 
     fn time_at(&self, x: f32) -> f32 {
-        ((x - self.rect.left()) / self.rect.width() * self.t_max).max(0.0)
+        (self.t_min + (x - self.rect.left()) / self.rect.width() * (self.t_max - self.t_min)).max(0.0)
+    }
+
+    fn value_at(&self, y: f32) -> f32 {
+        self.v_min + (self.rect.bottom() - y) / self.rect.height() * (self.v_max - self.v_min)
     }
 
     fn dt(&self, dx: f32) -> f32 {
-        dx / self.rect.width() * self.t_max
+        dx / self.rect.width() * (self.t_max - self.t_min)
     }
 
     fn dv(&self, dy: f32) -> f32 {
         -dy / self.rect.height() * (self.v_max - self.v_min)
+    }
+}
+
+/// Wheel zooms time around the pointer, Ctrl + wheel (or a pinch) zooms values, a sideways scroll
+/// or a middle / right drag pans, F frames the clip and track again.
+fn navigate(ui: &Ui, state: &mut EditorState, view: &View, background: &egui::Response, hovered: bool) {
+    let timeline = &mut state.timeline;
+    let (scroll, zoom, frame) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.key_pressed(egui::Key::F)));
+    let pointer = ui.input(|i| i.pointer.hover_pos()).unwrap_or(view.rect.center());
+    let mut time = (view.t_min, view.t_max);
+    let mut values = (view.v_min, view.v_max);
+    if hovered {
+        if frame && !ui.ctx().egui_wants_keyboard_input() {
+            timeline.view_time = None;
+            timeline.view_values = None;
+            return;
+        }
+        if scroll.y != 0.0 {
+            let factor = (-scroll.y * 0.004).exp();
+            let at = view.time_at(pointer.x);
+            time = (at + (time.0 - at) * factor, at + (time.1 - at) * factor);
+        }
+        if scroll.x != 0.0 {
+            let dt = view.dt(-scroll.x);
+            time = (time.0 + dt, time.1 + dt);
+        }
+        if zoom != 1.0 {
+            let at = view.value_at(pointer.y);
+            values = (at + (values.0 - at) / zoom, at + (values.1 - at) / zoom);
+        }
+    }
+    if background.dragged_by(egui::PointerButton::Middle) || background.dragged_by(egui::PointerButton::Secondary) {
+        let delta = background.drag_delta();
+        let (dt, dv) = (view.dt(-delta.x), view.dv(-delta.y));
+        time = (time.0 + dt, time.1 + dt);
+        values = (values.0 + dv, values.1 + dv);
+    }
+    if time != (view.t_min, view.t_max) {
+        // Nothing happens before 0 s.
+        let shift = (-time.0).max(0.0);
+        let span = (time.1 - time.0).clamp(0.01, 3600.0);
+        timeline.view_time = Some((time.0 + shift, time.0 + shift + span));
+    }
+    if values != (view.v_min, view.v_max) && values.1 - values.0 > 1e-6 {
+        timeline.view_values = Some(values);
     }
 }
 
@@ -316,24 +386,37 @@ fn draw_curves(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
     painter.rect_filled(full, 2.0, ui.visuals().extreme_bg_color);
 
     let clip = &state.clips[clip_index];
-    let t_max = (clip.duration().max(state.timeline.time) * 1.05).max(1.0);
     let track_index = state.timeline.track.filter(|&t| t < clip.tracks.len());
+    let (t_min, t_max) = state.timeline.view_time.unwrap_or((0.0, (clip.duration().max(state.timeline.time) * 1.05).max(1.0)));
+    let (v_min, v_max) =
+        state.timeline.view_values.unwrap_or_else(|| track_index.map_or((0.0, 1.0), |t| value_range(&clip.tracks[t])));
+    let view = View { rect: area, t_min, t_max, v_min, v_max };
 
-    let (v_min, v_max) = track_index.map_or((0.0, 1.0), |t| value_range(&clip.tracks[t]));
-    let view = View { rect: area, t_max, v_min, v_max };
-
-    // Ruler: ticks, and scrubbing.
-    let step = nice_step(t_max / (full.width() / 70.0).max(1.0));
+    // Ruler and grid.
     let text = ui.visuals().weak_text_color();
-    let mut tick = 0.0;
+    let grid = Stroke::new(1.0, ui.visuals().faint_bg_color);
+    let font = egui::FontId::monospace(10.0);
+    let step = nice_step((t_max - t_min) / (full.width() / 70.0).max(1.0));
+    let mut tick = (t_min / step).ceil() * step;
     while tick <= t_max {
         let x = view.x(tick);
-        painter.line_segment([pos2(x, ruler.top()), pos2(x, full.bottom())], Stroke::new(1.0, ui.visuals().faint_bg_color));
-        painter.text(pos2(x + 2.0, ruler.top() + 2.0), egui::Align2::LEFT_TOP, format!("{tick:.2}"), egui::FontId::monospace(10.0), text);
+        painter.line_segment([pos2(x, ruler.top()), pos2(x, full.bottom())], grid);
+        painter.text(pos2(x + 2.0, ruler.top() + 2.0), egui::Align2::LEFT_TOP, format!("{tick:.2}"), font.clone(), text);
         tick += step;
     }
+    if track_index.is_some() {
+        let step = nice_step((v_max - v_min) / (area.height() / 40.0).max(1.0));
+        let mut tick = (v_min / step).ceil() * step;
+        while tick <= v_max {
+            let y = view.y(tick);
+            painter.line_segment([pos2(full.left(), y), pos2(full.right(), y)], grid);
+            painter.text(pos2(full.left() + 2.0, y - 1.0), egui::Align2::LEFT_BOTTOM, format!("{tick:.3}"), font.clone(), text);
+            tick += step;
+        }
+    }
+
     let scrub = ui.interact(ruler, ui.scope_id().with("animation_ruler"), Sense::click_and_drag());
-    if (scrub.dragged() || scrub.clicked())
+    if (scrub.dragged_by(egui::PointerButton::Primary) || scrub.clicked())
         && let Some(pointer) = scrub.interact_pointer_pos()
     {
         state.timeline.time = view.time_at(pointer.x).min(clip.duration().max(0.0));
@@ -351,6 +434,11 @@ fn draw_curves(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
         }
     }
 
+    // Registered before the keys and handles so they, drawn on top, get the pointer first.
+    let background = ui.interact(area, ui.scope_id().with("animation_curve_bg"), Sense::click_and_drag());
+    let hovered = ui.rect_contains_pointer(full);
+    navigate(ui, state, &view, &background, hovered);
+
     let Some(track_index) = track_index else {
         painter.text(area.center(), egui::Align2::CENTER_CENTER, "Select a track to edit its curve", egui::FontId::proportional(13.0), text);
         draw_playhead(&painter, &view, full, state.timeline.time);
@@ -358,32 +446,39 @@ fn draw_curves(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
     };
 
     let track = &state.clips[clip_index].tracks[track_index];
-    let n = components(track.target);
-    let is_rotation = matches!(track.target, EditorTarget::Scene(Target::Rotation(_)));
+    let target = track.target;
+    let n = animation::to_display(target, track.curve.sample(0.0)).1;
+    let is_rotation = animation::linear_scale(target).is_none();
     let samples = (area.width() as usize).clamp(32, 600);
+    let shown: Vec<Value> = (0..=samples)
+        .map(|i| animation::to_display(target, track.curve.sample(t_min + (t_max - t_min) * i as f32 / samples as f32)).0)
+        .collect();
     for (c, &color) in COMPONENT_COLORS.iter().enumerate().take(n) {
-        let points: Vec<Pos2> = (0..=samples)
-            .map(|i| {
-                let t = t_max * i as f32 / samples as f32;
-                view.pos(t, track.curve.sample(t)[c])
-            })
-            .collect();
-        painter.add(egui::Shape::line(points, Stroke::new(1.5, color)));
+        let mut line: Vec<Pos2> = Vec::new();
+        for (i, v) in shown.iter().enumerate() {
+            // An Euler angle wrapping past ±180° isn't a jump in the rotation: break the line.
+            if is_rotation && i > 0 && (v[c] - shown[i - 1][c]).abs() > 180.0 {
+                painter.add(egui::Shape::line(std::mem::take(&mut line), Stroke::new(1.5, color)));
+            }
+            line.push(view.pos(t_min + (t_max - t_min) * i as f32 / samples as f32, v[c]));
+        }
+        painter.add(egui::Shape::line(line, Stroke::new(1.5, color)));
     }
     if v_min < 0.0 && v_max > 0.0 {
-        painter.line_segment([view.pos(0.0, 0.0), view.pos(t_max, 0.0)], Stroke::new(1.0, ui.visuals().weak_text_color()));
+        painter.line_segment([view.pos(t_min, 0.0), view.pos(t_max, 0.0)], Stroke::new(1.0, text));
     }
-
-    // Registered before the keys and handles so they, drawn on top, get the pointer first.
-    let background = ui.interact(area, ui.scope_id().with("animation_curve_bg"), Sense::click());
 
     // Keys: click to select, drag to move (time, and the grabbed component's value).
     let selected = state.timeline.key;
     let mut select = None;
     let keys = state.clips[clip_index].tracks[track_index].curve.keys.clone();
     for (k, key) in keys.iter().enumerate() {
+        let (value, _) = animation::to_display(target, key.value);
         for (c, &color) in COMPONENT_COLORS.iter().enumerate().take(n) {
-            let pos = view.pos(key.time, key.value[c]);
+            let pos = view.pos(key.time, value[c]);
+            if !full.contains(pos) {
+                continue;
+            }
             let id = ui.scope_id().with(("animation_key", clip_index, track_index, k, c));
             let response = ui.interact(Rect::from_center_size(pos, vec2(KEY_RADIUS * 3.0, KEY_RADIUS * 3.0)), id, Sense::click_and_drag());
             let is_selected = selected == Some(k);
@@ -396,14 +491,14 @@ fn draw_curves(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
             if response.clicked() || response.drag_started() {
                 select = Some(k);
             }
-            if response.dragged() {
+            if response.dragged_by(egui::PointerButton::Primary) {
                 let delta = response.drag_delta();
                 let (before, after) = neighbor_times(&keys, k);
                 let key = &mut state.clips[clip_index].tracks[track_index].curve.keys[k];
                 key.time = (key.time + view.dt(delta.x)).clamp(before, after);
-                if !is_rotation {
-                    key.value[c] += view.dv(delta.y);
-                }
+                let (mut shown, _) = animation::to_display(target, key.value);
+                shown[c] += view.dv(delta.y);
+                key.value = animation::from_display(target, shown, key.value);
             }
         }
     }
@@ -413,7 +508,7 @@ fn draw_curves(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
 
     // Tangent handles of the selected key, where a cubic segment uses them.
     if let Some(k) = state.timeline.key.filter(|&k| k < keys.len())
-        && !is_rotation
+        && let Some(scale) = animation::linear_scale(target)
     {
         let incoming = k > 0 && keys[k - 1].interpolation == Interpolation::Cubic;
         let outgoing = keys[k].interpolation == Interpolation::Cubic && k + 1 < keys.len();
@@ -423,12 +518,11 @@ fn draw_curves(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
             }
             for (c, &color) in COMPONENT_COLORS.iter().enumerate().take(n) {
                 let key = state.clips[clip_index].tracks[track_index].curve.keys[k];
-                let slope = if side < 0.0 { key.in_tangent[c] } else { key.out_tangent[c] };
-                let origin = view.pos(key.time, key.value[c]);
+                let slope = scale * if side < 0.0 { key.in_tangent[c] } else { key.out_tangent[c] };
+                let origin = view.pos(key.time, key.value[c] * scale);
                 // A handle TANGENT_HANDLE points long along the slope, as drawn on screen.
-                let direction = vec2(view.dt(1.0), slope * view.dt(1.0));
-                let screen = vec2(1.0, view.y(key.value[c] + direction.y) - origin.y).normalized() * TANGENT_HANDLE * side;
-                let handle = origin + screen;
+                let rise = view.y(key.value[c] * scale + slope * view.dt(1.0)) - origin.y;
+                let handle = origin + vec2(1.0, rise).normalized() * TANGENT_HANDLE * side;
                 painter.line_segment([origin, handle], Stroke::new(1.0, color));
                 let id = ui.scope_id().with(("animation_tangent", clip_index, track_index, k, c, side as i8));
                 let response = ui.interact(Rect::from_center_size(handle, vec2(10.0, 10.0)), id, Sense::drag());
@@ -438,7 +532,7 @@ fn draw_curves(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
                 {
                     let dt = view.dt(pointer.x - origin.x);
                     if dt.abs() > 1e-5 {
-                        let slope = view.dv(pointer.y - origin.y) / dt;
+                        let slope = view.dv(pointer.y - origin.y) / dt / scale;
                         let key = &mut state.clips[clip_index].tracks[track_index].curve.keys[k];
                         if side < 0.0 { key.in_tangent[c] = slope } else { key.out_tangent[c] = slope }
                     }
@@ -452,14 +546,7 @@ fn draw_curves(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
         && let Some(pointer) = background.interact_pointer_pos()
     {
         let time = view.time_at(pointer.x);
-        let curve = &mut state.clips[clip_index].tracks[track_index].curve;
-        if !curve.keys.iter().any(|k| (k.time - time).abs() < 1e-3) {
-            let value = curve.sample(time);
-            let interpolation = curve.keys.iter().rev().find(|k| k.time <= time).map_or(Interpolation::Linear, |k| k.interpolation);
-            curve.keys.push(Key::new(time, value, interpolation));
-            curve.keys.sort_by(|a, b| a.time.total_cmp(&b.time));
-            state.timeline.key = curve.keys.iter().position(|k| k.time == time);
-        }
+        state.timeline.key = Some(insert_key(&mut state.clips[clip_index].tracks[track_index].curve, time));
     }
 
     draw_playhead(&painter, &view, full, state.timeline.time);
@@ -467,7 +554,7 @@ fn draw_curves(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
 
 fn draw_playhead(painter: &egui::Painter, view: &View, full: Rect, time: f32) {
     let x = view.x(time);
-    painter.line_segment([pos2(x, full.top()), pos2(x, full.bottom())], Stroke::new(1.5, Color32::from_rgb(255, 170, 40)));
+    painter.line_segment([pos2(x, full.top()), pos2(x, full.bottom())], Stroke::new(1.5, PLAYHEAD));
 }
 
 fn diamond(center: Pos2, r: f32) -> Vec<Pos2> {
@@ -476,11 +563,10 @@ fn diamond(center: Pos2, r: f32) -> Vec<Pos2> {
 
 /// The value range the curve view shows for `track`: its keys and the curve between them, padded.
 fn value_range(track: &animation::EditorTrack) -> (f32, f32) {
-    let n = components(track.target);
     let duration = track.curve.duration();
     let (mut lo, mut hi) = (f32::MAX, f32::MIN);
     for i in 0..=64 {
-        let v = track.curve.sample(duration * i as f32 / 64.0);
+        let (v, n) = animation::to_display(track.target, track.curve.sample(duration * i as f32 / 64.0));
         for &c in &v[..n] {
             lo = lo.min(c);
             hi = hi.max(c);
@@ -499,4 +585,59 @@ fn nice_step(raw: f32) -> f32 {
     let normalized = raw / magnitude;
     let nice = if normalized <= 1.0 { 1.0 } else if normalized <= 2.0 { 2.0 } else if normalized <= 5.0 { 5.0 } else { 10.0 };
     nice * magnitude
+}
+
+/// The inspector's ◆ buttons beside animatable fields: filled where the field has a key at the
+/// playhead, hollow and coloured where it is animated, faint otherwise. Clicks are collected while
+/// the inspector holds the state borrowed, then `apply` keys them.
+pub struct KeyButtons {
+    time: f32,
+    keyed: HashSet<EditorTarget>,
+    tracked: HashSet<EditorTarget>,
+    clicked: Vec<EditorTarget>,
+}
+
+impl KeyButtons {
+    pub fn new(state: &EditorState) -> Self {
+        let time = state.timeline.time;
+        let tracks = state.timeline.clip.and_then(|c| state.clips.get(c)).map_or(&[][..], |c| &c.tracks[..]);
+        Self {
+            time,
+            keyed: tracks
+                .iter()
+                .filter(|t| t.curve.keys.iter().any(|k| (k.time - time).abs() < 1e-3))
+                .map(|t| t.target)
+                .collect(),
+            tracked: tracks.iter().map(|t| t.target).collect(),
+            clicked: Vec::new(),
+        }
+    }
+
+    /// A grid label with a ◆ that keys `targets` (none: just the label).
+    pub fn label(&mut self, ui: &mut Ui, text: &str, targets: &[EditorTarget]) -> egui::Response {
+        ui.horizontal(|ui| {
+            if !targets.is_empty() {
+                let keyed = targets.iter().all(|t| self.keyed.contains(t));
+                let tracked = targets.iter().any(|t| self.tracked.contains(t));
+                let (glyph, color) = match (keyed, tracked) {
+                    (true, _) => ("◆", PLAYHEAD),
+                    (false, true) => ("◇", PLAYHEAD),
+                    _ => ("◇", ui.visuals().weak_text_color()),
+                };
+                let hover = if keyed { "Keyed at {t} s: click to replace with this value" } else { "Key this value at {t} s" };
+                let button = egui::Button::new(egui::RichText::new(glyph).color(color)).frame(false).small();
+                if ui.add(button).on_hover_text(hover.replace("{t}", &format!("{:.2}", self.time))).clicked() {
+                    self.clicked.extend_from_slice(targets);
+                }
+            }
+            ui.label(text)
+        })
+        .inner
+    }
+
+    pub fn apply(self, state: &mut EditorState) {
+        for target in self.clicked {
+            key_at_playhead(state, target);
+        }
+    }
 }

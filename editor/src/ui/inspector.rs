@@ -6,6 +6,10 @@ use engine::gltf::objects::PLAYER_EYE_HEIGHT;
 use engine::gltf::particles::{Collision, Lighting, ParticleData, ShapeKind};
 use engine::rendering::pass::particle_sim::MAX_PARTICLES;
 
+use engine::gltf::animation::{LightProperty, ParticleProperty, Target};
+
+use super::animation::KeyButtons;
+use crate::animation::{self, EditorTarget};
 use crate::math::{euler_to_quat, quat_to_euler};
 use crate::state::{
     CameraEdit, EditorObject, EditorState, LightData, LightDataExt, NodeEdit, NodeKind, ObjectKind, PhysicalCamera,
@@ -21,11 +25,9 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
         .min_size(240.0)
         .default_size(280.0)
         .show(root, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Inspector");
-                draw_key_menu(ui, state);
-            });
+            ui.heading("Inspector");
             ui.separator();
+            let mut keys = KeyButtons::new(state);
 
             match state.selected.clone() {
                 None => {
@@ -33,7 +35,8 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                 }
                 Some(Selection::Light(idx)) => {
                     if let Some(light) = state.lights.get_mut(idx) {
-                        draw_light(ui, &mut light.data);
+                        let id = light.id;
+                        draw_light(ui, &mut light.data, &mut keys, id);
                     }
                 }
                 Some(Selection::Object(id)) => {
@@ -43,6 +46,11 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                     }
                 }
                 Some(Selection::GltfNode(idx)) => {
+                    let emissive: Vec<EditorTarget> = animation::node_materials(state, idx)
+                        .into_iter()
+                        .map(|m| EditorTarget::Scene(Target::EmissiveFactor(m)))
+                        .collect();
+                    let fov = animation::node_camera(state, idx).map(|c| EditorTarget::Scene(Target::CameraFov(c)));
                     let node_kind = state.scene_nodes.iter()
                         .find_map(|n| find_node(n, idx))
                         .map(|n| n.kind.clone());
@@ -68,12 +76,12 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
 
                     if let Some(edit) = state.node_edits.get_mut(&idx) {
                         ui.push_id(idx, |ui| {
-                            draw_transform(ui, &mut edit.translation, &mut edit.rotation, &mut edit.scale);
+                            draw_transform(ui, &mut edit.translation, &mut edit.rotation, &mut edit.scale, Some((&mut keys, idx)));
                             if let Some(NodeKind::Mesh(_)) = &node_kind {
-                                draw_material(ui, edit);
+                                draw_material(ui, edit, &mut keys, &emissive);
                             }
                             if let Some(particles) = &mut edit.particles {
-                                draw_particles(ui, particles);
+                                draw_particles(ui, particles, &mut keys, idx);
                                 ui.horizontal(|ui| {
                                     if ui.button("Burst").on_hover_text("Spawn this many particles at once (not saved).").clicked() {
                                         state.particle_bursts.push((idx, state.burst_size));
@@ -83,7 +91,8 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                             }
                             if let Some(camera) = &mut edit.camera {
                                 let mut is_main = state.main_camera == Some(idx);
-                                draw_camera(ui, camera, &mut is_main, state.camera_settings.exposure_stops);
+                                let fov: Vec<EditorTarget> = fov.into_iter().collect();
+                                draw_camera(ui, camera, &mut is_main, state.camera_settings.exposure_stops, &mut keys, &fov);
                                 if is_main {
                                     state.main_camera = Some(idx);
                                 } else if state.main_camera == Some(idx) {
@@ -103,21 +112,24 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
                     }
                 }
             }
+            keys.apply(state);
         });
 }
 
-fn draw_light(ui: &mut egui::Ui, data: &mut LightData) {
+fn draw_light(ui: &mut egui::Ui, data: &mut LightData, keys: &mut KeyButtons, id: u64) {
+    let color_key = [EditorTarget::Light(id, LightProperty::Color)];
+    let intensity_key = [EditorTarget::Light(id, LightProperty::Intensity)];
     ui.label(egui::RichText::new(data.label()).strong());
     ui.separator();
 
     match data {
         LightData::Sky { color, intensity, direction } => {
             egui::Grid::new("light_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                ui.label("Color");
+                keys.label(ui, "Color", &color_key);
                 ui.color_edit_button_rgb(color);
                 ui.end_row();
 
-                ui.label("Intensity");
+                keys.label(ui, "Intensity", &intensity_key);
                 ui.add(egui::DragValue::new(intensity).speed(0.05).range(0.0..=200_000.0).suffix(" lx"));
                 ui.end_row();
 
@@ -141,11 +153,11 @@ fn draw_light(ui: &mut egui::Ui, data: &mut LightData) {
                 });
                 ui.end_row();
 
-                ui.label("Color");
+                keys.label(ui, "Color", &color_key);
                 ui.color_edit_button_rgb(color);
                 ui.end_row();
 
-                ui.label("Intensity");
+                keys.label(ui, "Intensity", &intensity_key);
                 ui.add(egui::DragValue::new(intensity).speed(0.1).range(0.0..=1_000_000.0).suffix(" cd"));
                 ui.end_row();
 
@@ -177,11 +189,11 @@ fn draw_light(ui: &mut egui::Ui, data: &mut LightData) {
                 });
                 ui.end_row();
 
-                ui.label("Color");
+                keys.label(ui, "Color", &color_key);
                 ui.color_edit_button_rgb(color);
                 ui.end_row();
 
-                ui.label("Intensity");
+                keys.label(ui, "Intensity", &intensity_key);
                 ui.add(egui::DragValue::new(intensity).speed(0.1).range(0.0..=1_000_000.0).suffix(" cd"));
                 ui.end_row();
 
@@ -236,11 +248,11 @@ fn draw_light(ui: &mut egui::Ui, data: &mut LightData) {
                 });
                 ui.end_row();
 
-                ui.label("Color");
+                keys.label(ui, "Color", &color_key);
                 ui.color_edit_button_rgb(color);
                 ui.end_row();
 
-                ui.label("Intensity");
+                keys.label(ui, "Intensity", &intensity_key);
                 ui.add(egui::DragValue::new(intensity).speed(0.1).range(0.0..=1_000_000.0).suffix(" nt"));
                 ui.end_row();
             });
@@ -277,13 +289,14 @@ fn draw_object(ui: &mut egui::Ui, object: &mut EditorObject, project_dir: Option
         }
     }
     ui.separator();
-    draw_transform(ui, &mut data.translation, &mut data.rotation, &mut data.scale);
+    draw_transform(ui, &mut data.translation, &mut data.rotation, &mut data.scale, None);
     if let ObjectKind::Shape { material, .. } = &mut data.kind {
         draw_shape_material(ui, material);
     }
 }
 
-fn draw_particles(ui: &mut egui::Ui, data: &mut ParticleData) {
+fn draw_particles(ui: &mut egui::Ui, data: &mut ParticleData, keys: &mut KeyButtons, node: usize) {
+    let key = |p| [EditorTarget::Scene(Target::Particles(node, p))];
     egui::CollapsingHeader::new("Particles").default_open(true).show(ui, |ui| {
         egui::Grid::new("particles_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
             ui.label("Shape");
@@ -327,31 +340,31 @@ fn draw_particles(ui: &mut egui::Ui, data: &mut ParticleData) {
             ui.add(egui::DragValue::new(&mut data.count).speed(10.0).range(1..=MAX_PARTICLES));
             ui.end_row();
 
-            ui.label("Spawn rate");
+            keys.label(ui, "Spawn rate", &key(ParticleProperty::SpawnRate));
             ui.add(egui::DragValue::new(&mut data.spawn_rate).speed(1.0).range(0.0..=f32::MAX).suffix(" /s"));
             ui.end_row();
 
-            ui.label("Lifetime");
+            keys.label(ui, "Lifetime", &key(ParticleProperty::Lifetime));
             range_drag(ui, &mut data.lifetime, 0.1, 1.0, " s");
             ui.end_row();
 
-            ui.label("Size").on_hover_text("Diameter, min and max.");
+            keys.label(ui, "Size", &key(ParticleProperty::Size)).on_hover_text("Diameter, min and max.");
             range_drag(ui, &mut data.size, 0.1, 1000.0, " mm");
             ui.end_row();
 
-            ui.label("Velocity").on_hover_text("World-space drift, m/s.");
+            keys.label(ui, "Velocity", &key(ParticleProperty::Velocity)).on_hover_text("World-space drift, m/s.");
             vec3_drag(ui, &mut data.velocity, 0.001, f32::MIN..=f32::MAX, "");
             ui.end_row();
 
-            ui.label("Turbulence").on_hover_text("Speed of the swirling motion added to the drift.");
+            keys.label(ui, "Turbulence", &key(ParticleProperty::Turbulence)).on_hover_text("Speed of the swirling motion added to the drift.");
             ui.add(egui::DragValue::new(&mut data.turbulence).speed(0.001).range(0.0..=f32::MAX).suffix(" m/s"));
             ui.end_row();
 
-            ui.label("Color").on_hover_text("Scattering albedo when lit, emitted radiance when unlit.");
+            keys.label(ui, "Color", &key(ParticleProperty::Color)).on_hover_text("Scattering albedo when lit, emitted radiance when unlit.");
             ui.color_edit_button_rgb(&mut data.color);
             ui.end_row();
 
-            ui.label("Opacity");
+            keys.label(ui, "Opacity", &key(ParticleProperty::Opacity));
             ui.add(egui::Slider::new(&mut data.opacity, 0.0..=1.0));
             ui.end_row();
 
@@ -442,7 +455,22 @@ fn draw_shape_material(ui: &mut egui::Ui, material: &mut ShapeMaterial) {
     });
 }
 
-fn draw_transform(ui: &mut egui::Ui, translation: &mut [f32; 3], rotation: &mut [f32; 4], scale: &mut [f32; 3]) {
+/// `keys`: the node whose fields get ◆ buttons, if the transform is a glTF node's.
+fn draw_transform(
+    ui: &mut egui::Ui,
+    translation: &mut [f32; 3],
+    rotation: &mut [f32; 4],
+    scale: &mut [f32; 3],
+    mut keys: Option<(&mut KeyButtons, usize)>,
+) {
+    let mut label = |ui: &mut egui::Ui, text: &str, target: fn(usize) -> Target| match &mut keys {
+        Some((keys, node)) => {
+            keys.label(ui, text, &[EditorTarget::Scene(target(*node))]);
+        }
+        None => {
+            ui.label(text);
+        }
+    };
     ui.collapsing("Transform", |ui| {
         let euler = quat_to_euler(*rotation);
         let mut euler_edit = euler;
@@ -451,7 +479,7 @@ fn draw_transform(ui: &mut egui::Ui, translation: &mut [f32; 3], rotation: &mut 
             .num_columns(2)
             .spacing([12.0, 4.0])
             .show(ui, |ui| {
-                ui.label("Translation");
+                label(ui, "Translation", Target::Translation);
                 ui.horizontal(|ui| {
                     ui.add(egui::DragValue::new(&mut translation[0]).speed(0.1).prefix("X "));
                     ui.add(egui::DragValue::new(&mut translation[1]).speed(0.1).prefix("Y "));
@@ -459,7 +487,7 @@ fn draw_transform(ui: &mut egui::Ui, translation: &mut [f32; 3], rotation: &mut 
                 });
                 ui.end_row();
 
-                ui.label("Rotation");
+                label(ui, "Rotation", Target::Rotation);
                 ui.horizontal(|ui| {
                     ui.add(egui::DragValue::new(&mut euler_edit[0]).speed(0.5).prefix("X ").suffix("°"));
                     ui.add(egui::DragValue::new(&mut euler_edit[1]).speed(0.5).prefix("Y ").suffix("°"));
@@ -467,7 +495,7 @@ fn draw_transform(ui: &mut egui::Ui, translation: &mut [f32; 3], rotation: &mut 
                 });
                 ui.end_row();
 
-                ui.label("Scale");
+                label(ui, "Scale", Target::Scale);
                 ui.horizontal(|ui| {
                     ui.add(egui::DragValue::new(&mut scale[0]).speed(0.01).prefix("X "));
                     ui.add(egui::DragValue::new(&mut scale[1]).speed(0.01).prefix("Y "));
@@ -482,7 +510,7 @@ fn draw_transform(ui: &mut egui::Ui, translation: &mut [f32; 3], rotation: &mut 
     });
 }
 
-fn draw_material(ui: &mut egui::Ui, edit: &mut NodeEdit) {
+fn draw_material(ui: &mut egui::Ui, edit: &mut NodeEdit, keys: &mut KeyButtons, emissive_targets: &[EditorTarget]) {
     ui.collapsing("Material", |ui| {
         egui::Grid::new("material_grid")
             .num_columns(2)
@@ -511,14 +539,21 @@ fn draw_material(ui: &mut egui::Ui, edit: &mut NodeEdit) {
                 ui.end_row();
 
                 let emissive = edit.emissive_factor.get_or_insert([0.0; 3]);
-                ui.label("Emissive");
+                keys.label(ui, "Emissive", emissive_targets);
                 ui.color_edit_button_rgb(emissive);
                 ui.end_row();
             });
     });
 }
 
-fn draw_camera(ui: &mut egui::Ui, camera: &mut CameraEdit, is_main: &mut bool, project_stops: f32) {
+fn draw_camera(
+    ui: &mut egui::Ui,
+    camera: &mut CameraEdit,
+    is_main: &mut bool,
+    project_stops: f32,
+    keys: &mut KeyButtons,
+    fov: &[EditorTarget],
+) {
     ui.collapsing("Camera", |ui| {
         ui.checkbox(is_main, "Player camera")
             .on_hover_text("The camera the player renders this scene from. Other cameras are removed when it plays.");
@@ -527,7 +562,7 @@ fn draw_camera(ui: &mut egui::Ui, camera: &mut CameraEdit, is_main: &mut bool, p
             .num_columns(2)
             .spacing([12.0, 4.0])
             .show(ui, |ui| {
-                ui.label("FOV Y");
+                keys.label(ui, "FOV Y", fov);
                 ui.add(egui::DragValue::new(&mut camera.fov_y_deg).speed(0.5).range(1.0..=170.0).suffix("°"));
                 ui.end_row();
 
@@ -624,27 +659,4 @@ fn find_node(
         return Some(node);
     }
     node.children.iter().find_map(|c| find_node(c, idx))
-}
-
-/// "◆ Key": keys one of the selection's animatable properties at the Animation panel's playhead,
-/// with its current value.
-fn draw_key_menu(ui: &mut egui::Ui, state: &mut EditorState) {
-    let targets = crate::animation::animatable(state);
-    if targets.is_empty() {
-        return;
-    }
-    let clip = state.timeline.clip.and_then(|c| state.clips.get(c)).map_or("a new clip".to_string(), |c| c.name.clone());
-    let hover = format!("Key a property's current value at {:.2} s in {clip}", state.timeline.time);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.menu_button("◆ Key", |ui| {
-            for target in targets {
-                if ui.button(crate::animation::label(state, target)).clicked() {
-                    super::animation::key_at_playhead(state, target);
-                    ui.close();
-                }
-            }
-        })
-        .response
-        .on_hover_text(hover);
-    });
 }

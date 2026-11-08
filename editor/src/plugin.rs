@@ -875,8 +875,12 @@ impl EditorPlugin {
         let s = self.state.lock().expect("editor state mutex poisoned");
         let Some(cam_key) = s.editor_camera_key else { return };
         let preview = s.camera_preview_node.and_then(|idx| {
-            let camera = s.node_edits.get(&idx)?.camera.clone()?;
-            Some((s.node_world(idx), camera))
+            let mut camera = s.node_edits.get(&idx)?.camera.clone()?;
+            let (world, fov) = crate::animation::posed_camera(&s, idx).unwrap_or((s.node_world(idx), None));
+            if let Some(fov) = fov {
+                camera.fov_y_deg = fov.to_degrees();
+            }
+            Some((world, camera))
         });
         let project_exposure = s.camera_settings.exposure();
         drop(s);
