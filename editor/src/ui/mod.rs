@@ -1,4 +1,5 @@
 mod add_menu;
+mod animation;
 mod assets;
 mod build;
 mod gizmo;
@@ -34,6 +35,7 @@ impl UiLayer for EditorUiLayer {
             let add = hierarchy::draw(root, &mut state);
             inspector::draw(root, &mut state);
             self.assets.draw(root, &mut state);
+            animation::draw(root, &mut state);
             (root.available_rect_before_wrap(), add)
         });
         if let Some(kind) = add {

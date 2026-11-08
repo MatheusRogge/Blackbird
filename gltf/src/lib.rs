@@ -373,6 +373,8 @@ pub struct GltfScene {
     node_lights: HashMap<usize, EntityKey>,
     /// Translation, rotation, scale of the nodes animation has moved.
     animated_nodes: HashMap<usize, animation::Trs>,
+    /// What animation overwrote on entities, for `reset_animation`.
+    originals: HashMap<animation::Target, engine_core::animation::Value>,
 }
 
 impl GltfScene {
@@ -384,6 +386,7 @@ impl GltfScene {
             area_lights: HashMap::new(),
             node_lights: HashMap::new(),
             animated_nodes: HashMap::new(),
+            originals: HashMap::new(),
             pending: mesh_nodes(&asset.document),
             root: Mat4::identity(),
             asset,

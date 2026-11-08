@@ -15,6 +15,7 @@ use rendering::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
+use std::collections::{HashMap, HashSet};
 use ultraviolet::{Vec3, Vec4};
 
 use crate::GltfScene;
@@ -302,9 +303,14 @@ pub struct PlayingClip {
 /// Every clip of `doc`: our `blackbird_animations` (plus the standard channels they include), and
 /// each standard animation no clip includes, looping.
 pub fn load_clips(doc: &gltf::Document, buffers: &[gltf::buffer::Data]) -> Vec<PlayingClip> {
-    let data = read_clip_data(doc);
+    build_clips(doc, buffers, &read_clip_data(doc))
+}
+
+/// `data`'s clips (plus the standard channels they include), then each standard animation of `doc`
+/// none of them includes.
+pub fn build_clips(doc: &gltf::Document, buffers: &[gltf::buffer::Data], data: &[ClipData]) -> Vec<PlayingClip> {
     let mut clips = Vec::new();
-    for clip in &data {
+    for clip in data {
         let mut tracks: Vec<(Target, Curve)> = clip.tracks.iter().filter_map(TrackData::curve).collect();
         if let Some(animation) = clip.animation.and_then(|i| doc.animations().nth(i)) {
             tracks.extend(standard_tracks(&animation, buffers));
@@ -379,6 +385,43 @@ impl GltfScene {
         &mut self.clips
     }
 
+    /// Replaces the clips with `data`'s (`build_clips`), e.g. the editor's edited ones.
+    pub fn set_clip_data(&mut self, data: &[ClipData]) {
+        self.clips = build_clips(&self.asset.document, &self.asset.buffers, data);
+    }
+
+    /// Sets the light entities light targets resolve to, by `KHR_lights_punctual` index and by
+    /// `blackbird_lights` index, replacing what `bind_lights` set.
+    pub fn set_light_bindings(&mut self, punctual: HashMap<usize, EntityKey>, area: HashMap<usize, EntityKey>) {
+        self.punctual_lights = punctual;
+        self.area_lights = area;
+    }
+
+    /// Applies clip `index` at clip-local `time`, without touching any clip's playback.
+    pub fn pose(&mut self, world: &mut World, index: usize, time: f32) {
+        let Some(playing) = self.clips.get(index) else { return };
+        let samples: Vec<(Target, Value)> = playing.clip.sample(time).map(|(t, v)| (*t, v)).collect();
+        let mut moved = false;
+        for (target, value) in samples {
+            moved |= self.apply(world, target, value);
+        }
+        if moved {
+            self.update_transforms(world, &HashSet::new());
+        }
+    }
+
+    /// Writes back every value animation has changed since the last reset, and puts animated
+    /// nodes back at their glTF transforms.
+    pub fn reset_animation(&mut self, world: &mut World) {
+        for (target, value) in std::mem::take(&mut self.originals) {
+            self.write(world, target, value);
+        }
+        if !self.animated_nodes.is_empty() {
+            let moved: HashSet<usize> = self.animated_nodes.drain().map(|(node, _)| node).collect();
+            self.update_transforms(world, &moved);
+        }
+    }
+
     /// Hands over the light entities spawned from `lights::read_lights`, in its order (each with its
     /// node, `None` for `blackbird_lights`), so clips can animate them and their nodes can move them.
     pub fn bind_lights(&mut self, lights: impl IntoIterator<Item = (Option<usize>, EntityKey)>) {
@@ -418,12 +461,73 @@ impl GltfScene {
             moved |= self.apply(world, target, value);
         }
         if moved {
-            self.update_transforms(world);
+            self.update_transforms(world, &HashSet::new());
         }
     }
 
-    /// Writes one sampled value. Returns whether it moved a node.
+    /// Writes one sampled value, first remembering what it replaces (`reset_animation`). Returns
+    /// whether it moved a node.
     fn apply(&mut self, world: &mut World, target: Target, v: Value) -> bool {
+        if !matches!(target, Target::Translation(_) | Target::Rotation(_) | Target::Scale(_))
+            && !self.originals.contains_key(&target)
+            && let Some(current) = self.current(world, target)
+        {
+            self.originals.insert(target, current);
+        }
+        self.write(world, target, v)
+    }
+
+    /// The value `target` has now, for the properties `write` sets on entities.
+    fn current(&self, world: &World, target: Target) -> Option<Value> {
+        let vec3 = |v: Vec3| [v.x, v.y, v.z, 0.0];
+        let scalar = |v: f32| [v, 0.0, 0.0, 0.0];
+        match target {
+            Target::Translation(_) | Target::Rotation(_) | Target::Scale(_) => None,
+            Target::EmissiveFactor(m) | Target::EmissiveStrength(m) => {
+                let mesh = self.material_meshes.get(&m)?.iter().find_map(|&k| world.get_entity::<Mesh>(k))?;
+                Some(match target {
+                    Target::EmissiveFactor(_) => {
+                        let [r, g, b] = mesh.material.emissive;
+                        [r, g, b, 0.0]
+                    }
+                    _ => scalar(mesh.material.emissive_strength),
+                })
+            }
+            Target::PunctualLight(index, property) | Target::AreaLight(index, property) => {
+                let lights = if matches!(target, Target::PunctualLight(..)) { &self.punctual_lights } else { &self.area_lights };
+                let key = *lights.get(&index)?;
+                let (intensity, color) = if let Some(l) = world.get_entity::<PointLight>(key) {
+                    (l.intensity, l.color)
+                } else if let Some(l) = world.get_entity::<SpotLight>(key) {
+                    (l.intensity, l.color)
+                } else if let Some(l) = world.get_entity::<AreaLight>(key) {
+                    (l.intensity, l.color)
+                } else {
+                    let l = world.get_entity::<SkyLight>(key)?;
+                    (l.intensity, l.color)
+                };
+                Some(match property {
+                    LightProperty::Intensity => scalar(intensity),
+                    LightProperty::Color => vec3(color),
+                })
+            }
+            Target::Particles(node, property) => {
+                let e = world.get_entity::<ParticleEmitter>(*self.node_emitters.get(&node)?)?;
+                Some(match property {
+                    ParticleProperty::SpawnRate => scalar(e.spawn_rate),
+                    ParticleProperty::Lifetime => [e.lifetime[0], e.lifetime[1], 0.0, 0.0],
+                    ParticleProperty::Size => [e.size[0], e.size[1], 0.0, 0.0],
+                    ParticleProperty::Velocity => vec3(e.velocity),
+                    ParticleProperty::Turbulence => scalar(e.turbulence),
+                    ParticleProperty::Color => vec3(e.color),
+                    ParticleProperty::Opacity => scalar(e.opacity),
+                })
+            }
+        }
+    }
+
+    /// Writes one value. Returns whether it moved a node.
+    fn write(&mut self, world: &mut World, target: Target, v: Value) -> bool {
         let vec3 = Vec3::new(v[0], v[1], v[2]);
         match target {
             Target::Translation(node) | Target::Rotation(node) | Target::Scale(node) => {
@@ -471,9 +575,9 @@ impl GltfScene {
         false
     }
 
-    /// Re-derives the world transform of every node at or under an animated one and moves its
-    /// meshes, emitters and lights.
-    fn update_transforms(&self, world: &mut World) {
+    /// Re-derives the world transform of every node at or under an animated one (or one in
+    /// `also`) and moves its meshes, emitters and lights.
+    fn update_transforms(&self, world: &mut World, also: &HashSet<usize>) {
         let document = &self.asset.document;
         let Some(scene) = document.default_scene().or_else(|| document.scenes().next()) else { return };
         let mut stack: Vec<(gltf::Node<'_>, Mat4, bool)> = scene.nodes().map(|n| (n, self.root, false)).collect();
@@ -486,7 +590,7 @@ impl GltfScene {
                 None => node.transform().matrix(),
             };
             let transform = parent * Mat4::from(local);
-            let moved = parent_moved || animated.is_some();
+            let moved = parent_moved || animated.is_some() || also.contains(&node.index());
             stack.extend(node.children().map(|child| (child, transform, moved)));
             if moved {
                 self.place_node(world, node.index(), transform);
@@ -544,6 +648,45 @@ fn set_light(world: &mut World, key: EntityKey, property: LightProperty, intensi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pose_and_reset_drive_a_material() {
+        let json = r#"{
+            "asset": { "version": "2.0" },
+            "extensionsUsed": ["KHR_materials_emissive_strength"],
+            "buffers": [{ "byteLength": 36, "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAA" }],
+            "bufferViews": [{ "buffer": 0, "byteLength": 36 }],
+            "accessors": [{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+                "min": [0, 0, 0], "max": [1, 1, 0] }],
+            "materials": [{ "name": "Lens", "emissiveFactor": [1, 1, 1],
+                "extensions": { "KHR_materials_emissive_strength": { "emissiveStrength": 40.0 } } }],
+            "meshes": [{ "primitives": [{ "attributes": { "POSITION": 0 }, "material": 0 }] }],
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "extras": { "blackbird_animations": [{ "name": "Dim", "autoplay": false, "tracks": [{
+                "pointer": "/materials/0/extensions/KHR_materials_emissive_strength/emissiveStrength",
+                "keys": [{ "time": 0.0, "value": 40.0 }, { "time": 1.0, "value": 0.0 }] }] }] }
+        }"#;
+        let (document, buffers, images) = gltf::import_slice(json.as_bytes()).expect("valid glTF");
+        let mut scene = GltfScene::new(std::sync::Arc::new(crate::GLTFAsset { document, buffers, images }));
+        let mut world = World::default();
+        while scene.load_batch(&mut world, 10) {}
+        let strength = |world: &World| world.get_entities::<Mesh>()[0].material.emissive_strength;
+
+        // Not autoplaying: ticking leaves it alone.
+        scene.animate(&mut world, 0.5);
+        assert_eq!(strength(&world), 40.0);
+
+        scene.pose(&mut world, 0, 0.75);
+        assert!((strength(&world) - 10.0).abs() < 1e-4);
+        scene.reset_animation(&mut world);
+        assert_eq!(strength(&world), 40.0);
+
+        scene.clips_mut()[0].playback.playing = true;
+        scene.animate(&mut world, 0.25);
+        assert!((strength(&world) - 30.0).abs() < 1e-4);
+    }
 
     #[test]
     fn pointers_round_trip() {

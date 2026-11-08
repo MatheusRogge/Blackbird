@@ -68,6 +68,9 @@ pub fn write_gltf(state: &EditorState, path: &Path) -> Result<()> {
 
     detach_nodes(&mut root, &state.deleted_nodes);
     crate::lights::write_lights(&mut root, state)?;
+    let clips = crate::animation::to_clip_data(&state.clips, &state.lights);
+    let clips = if clips.is_empty() { None } else { Some(serde_json::to_value(clips)?) };
+    set_extra(&mut root.extras, engine::gltf::animation::EXTRAS_KEY, clips)?;
     write_main_camera(&mut root, state.main_camera)?;
     write_objects(&mut root, state, path)?;
 
@@ -282,11 +285,13 @@ mod tests {
 
         let shared = EditorState::new();
         let mut state = shared.lock().unwrap();
+        state.clips = crate::animation::load_clips(&doc, &state.lights);
         state.document = Some(doc);
         write_gltf(&state, &scene_path).unwrap();
 
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&scene_path).unwrap()).unwrap();
         assert_eq!(saved["extras"]["blackbird_animations"][0]["name"], "Flicker");
+        assert_eq!(saved["extras"]["blackbird_animations"][0]["tracks"][0]["keys"][0]["value"], serde_json::json!([1.0, 1.0, 1.0]));
         std::fs::remove_dir_all(&dir).ok();
     }
 

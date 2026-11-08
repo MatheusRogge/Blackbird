@@ -11,6 +11,7 @@ pub use engine::gltf::lights::LightData;
 pub use engine::gltf::objects::{ObjectKind, SceneObject as ObjectData, Shape, ShapeMaterial};
 pub use project::CameraSettings;
 
+use crate::animation::{EditorClip, Timeline};
 use crate::asset_browser::AssetBrowserState;
 use crate::history::History;
 use engine::gltf::particles::ParticleData;
@@ -260,6 +261,7 @@ pub struct Snapshot {
     lights: Vec<SceneLight>,
     objects: Vec<EditorObject>,
     main_camera: Option<usize>,
+    clips: Vec<EditorClip>,
 }
 
 #[derive(Default)]
@@ -291,6 +293,9 @@ pub struct EditorState {
 
     pub selected: Option<Selection>,
     pub node_edits: HashMap<usize, NodeEdit>,
+    /// Animation clips (`blackbird_animations`), edited in the Animation panel.
+    pub clips: Vec<EditorClip>,
+    pub timeline: Timeline,
     /// Each edited node as loaded, to tell real edits from seeded ones.
     node_baselines: HashMap<usize, NodeEdit>,
     /// Deleted glTF nodes (their subtrees go with them): collapsed in the viewport, detached from
@@ -360,6 +365,8 @@ impl EditorState {
             entity_nodes: HashMap::new(),
             selected: None,
             node_edits: HashMap::new(),
+            clips: Vec::new(),
+            timeline: Timeline::default(),
             node_baselines: HashMap::new(),
             deleted_nodes: HashSet::new(),
             gizmo_mode: GizmoMode::default(),
@@ -475,6 +482,7 @@ impl EditorState {
             lights: self.lights.clone(),
             objects: self.objects.clone(),
             main_camera: self.main_camera,
+            clips: self.clips.clone(),
         }
     }
 
@@ -491,6 +499,8 @@ impl EditorState {
         self.lights = snapshot.lights;
         self.objects = snapshot.objects;
         self.main_camera = snapshot.main_camera;
+        self.clips = snapshot.clips;
+        self.timeline.clamp(&self.clips);
 
         let names: HashMap<usize, String> = self.node_edits.iter().map(|(&idx, e)| (idx, e.name.clone())).collect();
         rename_nodes(&mut self.scene_nodes, &names);

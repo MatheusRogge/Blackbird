@@ -6,6 +6,7 @@ use engine::gltf::objects::PLAYER_EYE_HEIGHT;
 use engine::gltf::particles::{Collision, Lighting, ParticleData, ShapeKind};
 use engine::rendering::pass::particle_sim::MAX_PARTICLES;
 
+use crate::math::{euler_to_quat, quat_to_euler};
 use crate::state::{
     CameraEdit, EditorObject, EditorState, LightData, LightDataExt, NodeEdit, NodeKind, ObjectKind, PhysicalCamera,
     SceneNode, Selection, Shape, ShapeMaterial,
@@ -20,7 +21,10 @@ pub fn draw(root: &mut Ui, state: &mut EditorState) {
         .min_size(240.0)
         .default_size(280.0)
         .show(root, |ui| {
-            ui.heading("Inspector");
+            ui.horizontal(|ui| {
+                ui.heading("Inspector");
+                draw_key_menu(ui, state);
+            });
             ui.separator();
 
             match state.selected.clone() {
@@ -622,24 +626,25 @@ fn find_node(
     node.children.iter().find_map(|c| find_node(c, idx))
 }
 
-fn quat_to_euler(q: [f32; 4]) -> [f32; 3] {
-    let [x, y, z, w] = q;
-    let roll = f32::atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y));
-    let sin_pitch = (2.0 * (w * y - z * x)).clamp(-1.0, 1.0);
-    let pitch = f32::asin(sin_pitch);
-    let yaw = f32::atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z));
-    [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()]
-}
-
-fn euler_to_quat(euler: [f32; 3]) -> [f32; 4] {
-    let [roll, pitch, yaw] = euler.map(f32::to_radians);
-    let (cr, sr) = (f32::cos(roll * 0.5), f32::sin(roll * 0.5));
-    let (cp, sp) = (f32::cos(pitch * 0.5), f32::sin(pitch * 0.5));
-    let (cy, sy) = (f32::cos(yaw * 0.5), f32::sin(yaw * 0.5));
-    [
-        sr * cp * cy - cr * sp * sy,
-        cr * sp * cy + sr * cp * sy,
-        cr * cp * sy - sr * sp * cy,
-        cr * cp * cy + sr * sp * sy,
-    ]
+/// "◆ Key": keys one of the selection's animatable properties at the Animation panel's playhead,
+/// with its current value.
+fn draw_key_menu(ui: &mut egui::Ui, state: &mut EditorState) {
+    let targets = crate::animation::animatable(state);
+    if targets.is_empty() {
+        return;
+    }
+    let clip = state.timeline.clip.and_then(|c| state.clips.get(c)).map_or("a new clip".to_string(), |c| c.name.clone());
+    let hover = format!("Key a property's current value at {:.2} s in {clip}", state.timeline.time);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.menu_button("◆ Key", |ui| {
+            for target in targets {
+                if ui.button(crate::animation::label(state, target)).clicked() {
+                    super::animation::key_at_playhead(state, target);
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text(hover);
+    });
 }

@@ -162,3 +162,26 @@ mod tests {
         assert!(close(p.x, 10.0) && close(p.y, 2.0) && close(p.z, 0.0));
     }
 }
+
+/// XYZ Euler angles in degrees.
+pub fn quat_to_euler(q: [f32; 4]) -> [f32; 3] {
+    let [x, y, z, w] = q;
+    let roll = f32::atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y));
+    let sin_pitch = (2.0 * (w * y - z * x)).clamp(-1.0, 1.0);
+    let pitch = f32::asin(sin_pitch);
+    let yaw = f32::atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z));
+    [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()]
+}
+
+pub fn euler_to_quat(euler: [f32; 3]) -> [f32; 4] {
+    let [roll, pitch, yaw] = euler.map(f32::to_radians);
+    let (cr, sr) = (f32::cos(roll * 0.5), f32::sin(roll * 0.5));
+    let (cp, sp) = (f32::cos(pitch * 0.5), f32::sin(pitch * 0.5));
+    let (cy, sy) = (f32::cos(yaw * 0.5), f32::sin(yaw * 0.5));
+    [
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    ]
+}

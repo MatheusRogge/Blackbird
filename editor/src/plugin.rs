@@ -12,6 +12,7 @@ use engine::gltf::{GLTFAsset, GltfScene};
 use engine::plugin::{EnginePluginError, Plugin};
 use engine::rendering::camera::Camera;
 use engine::rendering::mesh::Mesh;
+use engine::gltf::animation::ClipData;
 use engine::gltf::particles::ParticleData;
 use engine::rendering::particles::ParticleEmitter;
 use ultraviolet::{Mat4, Vec3};
@@ -124,6 +125,10 @@ pub struct EditorPlugin {
     applied_deleted: Vec<usize>,
     /// Entity of each `SceneLight::id`.
     light_entities: HashMap<u64, EntityKey>,
+    /// The clips last handed to `scene`, as saved.
+    scene_clips: Vec<ClipData>,
+    /// The clip the viewport shows, while previewing.
+    previewed_clip: Option<usize>,
     /// Entities of each `EditorObject::id`.
     object_entities: HashMap<u64, ObjectEntities>,
     /// Model files by absolute path.
@@ -156,6 +161,8 @@ impl EditorPlugin {
             applied_entities: 0,
             applied_deleted: Vec::new(),
             light_entities: HashMap::new(),
+            scene_clips: Vec::new(),
+            previewed_clip: None,
             object_entities: HashMap::new(),
             models: HashMap::new(),
             saved_project: None,
@@ -218,6 +225,7 @@ impl Plugin for EditorPlugin {
         }
         self.apply_node_transforms(engine);
         self.apply_particle_edits(engine);
+        self.preview_animation(engine, delta);
 
         let (in_camera_preview, mut settings) = {
             let s = self.state.lock().expect("editor state mutex poisoned");
@@ -620,6 +628,8 @@ impl EditorPlugin {
                     Err(e) => (Vec::new(), Some(e)),
                 };
                 self.scene = Some(GltfScene::new(Arc::clone(&asset)));
+                self.scene_clips.clear();
+                self.previewed_clip = None;
                 let scene_path = {
                     let mut s = self.state.lock().expect("editor state mutex poisoned");
                     let path_display = s.file_path.as_ref()
@@ -644,6 +654,8 @@ impl EditorPlugin {
                         .into_iter()
                         .map(|(node, data)| SceneLight { id: s.new_id(), data, node })
                         .collect();
+                    s.clips = crate::animation::load_clips(&doc, &s.lights);
+                    s.timeline.clamp(&[]);
                     let scene_file = s.file_path.clone().unwrap_or_default();
                     s.objects = objects
                         .into_iter()
@@ -927,6 +939,51 @@ impl EditorPlugin {
             if let Some(emitter) = world.get_entity_mut::<ParticleEmitter>(key) {
                 emitter.burst(count);
             }
+        }
+    }
+
+    /// Keeps the scene's clips in step with the edited ones and, while the Animation panel
+    /// previews, poses the viewport at its playhead (advancing it while playing). Stopping the
+    /// preview puts every animated value back.
+    fn preview_animation(&mut self, engine: &mut Engine, delta: f32) {
+        let Some(scene) = &mut self.scene else { return };
+        let mut s = self.state.lock().expect("editor state mutex poisoned");
+        let data = crate::animation::to_clip_data(&s.clips, &s.lights);
+        let edited = data != self.scene_clips;
+        if edited {
+            scene.set_clip_data(&data);
+            self.scene_clips = data;
+        }
+        let (mut punctual, mut area) = (HashMap::new(), HashMap::new());
+        for (id, (is_area, index)) in crate::animation::light_indices(&s.lights) {
+            if let Some(&key) = self.light_entities.get(&id) {
+                if is_area { area.insert(index, key) } else { punctual.insert(index, key) };
+            }
+        }
+        let state = &mut *s;
+        let pose = match (state.timeline.preview, state.timeline.clip.and_then(|c| state.clips.get(c))) {
+            (true, Some(clip)) => {
+                if state.timeline.playing {
+                    state.timeline.advance(clip, delta);
+                }
+                state.timeline.clip.map(|c| (c, state.timeline.time))
+            }
+            _ => None,
+        };
+        drop(s);
+
+        let mut world = engine.world();
+        scene.set_light_bindings(punctual, area);
+        let switched = pose.map(|(clip, _)| clip) != self.previewed_clip;
+        // A clip that changed may no longer animate something it did.
+        if (switched || edited) && self.previewed_clip.is_some() {
+            scene.reset_animation(&mut world);
+            // Animated nodes went back to their glTF transforms; put the edited ones back.
+            self.applied_transforms.clear();
+        }
+        self.previewed_clip = pose.map(|(clip, _)| clip);
+        if let Some((clip, time)) = pose {
+            scene.pose(&mut world, clip, time);
         }
     }
 

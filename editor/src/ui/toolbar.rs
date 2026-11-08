@@ -147,6 +147,9 @@ fn draw_view_menu(ui: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<Ren
     if ui.add(egui::Button::selectable(state.show_gizmos, "Gizmos")).clicked() {
         state.show_gizmos = !state.show_gizmos;
     }
+    if ui.add(egui::Button::selectable(state.timeline.show, "Animation")).clicked() {
+        state.timeline.show = !state.timeline.show;
+    }
     ui.separator();
     if ui.add(egui::Button::selectable(flags.reflections, "Reflections")).clicked() {
         flags.reflections = !flags.reflections;

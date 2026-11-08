@@ -1,3 +1,4 @@
+mod animation;
 mod asset_browser;
 mod camera;
 mod export;
