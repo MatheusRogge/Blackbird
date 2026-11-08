@@ -5,6 +5,7 @@ use crate::{
     graph::RenderGraph,
     light::SharedShadowCasters,
     pass::{
+        ao::AoPass,
         bvh_upload::BvhUploadPass,
         camera::CameraPass,
         cluster_assignment::ClusterAssignmentPass,
@@ -44,6 +45,7 @@ pub struct RenderGraphPBRBuilder {
     composite_shader:      ShaderAsset,
     ssr_temporal_shader:   ShaderAsset,
     particle_sim_shader:   ShaderAsset,
+    ao_shader:             ShaderAsset,
     debug_flags:           Option<Arc<RwLock<RenderDebugFlags>>>,
 }
 
@@ -62,6 +64,7 @@ impl RenderGraphPBRBuilder {
         composite_shader:     ShaderAsset,
         ssr_temporal_shader:  ShaderAsset,
         particle_sim_shader:  ShaderAsset,
+        ao_shader:            ShaderAsset,
     ) -> Self {
         Self {
             gbuffer_shader,
@@ -76,6 +79,7 @@ impl RenderGraphPBRBuilder {
             composite_shader,
             ssr_temporal_shader,
             particle_sim_shader,
+            ao_shader,
             debug_flags: None,
         }
     }
@@ -146,6 +150,16 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         );
         graph.add_pass(device, gbuffer_pass);
 
+        let (ao_pass, ao_id) = AoPass::new(
+            &mut graph,
+            gbuffer_outputs.depth_id,
+            gbuffer_outputs.normal_id,
+            camera_buffer_id,
+            self.ao_shader,
+            Arc::clone(&debug_flags),
+        );
+        graph.add_pass(device, ao_pass);
+
         let (cluster_pass, cluster_outputs) =
             ClusterAssignmentPass::new(&mut graph, &light_buffers, self.cluster_shader);
         graph.add_pass(device, cluster_pass);
@@ -165,6 +179,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         let (lighting_pass, lighting_outputs) = LightingPass::new(
             &mut graph,
             &gbuffer_outputs,
+            ao_id,
             &cluster_outputs,
             &light_buffers,
             &shadow_outputs,

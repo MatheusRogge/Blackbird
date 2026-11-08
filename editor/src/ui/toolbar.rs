@@ -162,6 +162,12 @@ fn draw_view_menu(ui: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<Ren
     if ui.add_enabled(flags.reflections, probe).clicked() {
         flags.reflection_probe = !flags.reflection_probe;
     }
+    if ui.add(egui::Button::selectable(flags.ambient_occlusion, "Ambient occlusion")).clicked() {
+        flags.ambient_occlusion = !flags.ambient_occlusion;
+    }
+    if ui.add(egui::Button::selectable(flags.contact_shadows, "Contact shadows")).clicked() {
+        flags.contact_shadows = !flags.contact_shadows;
+    }
     if ui.add(egui::Button::selectable(flags.particles, "Particles")).clicked() {
         flags.particles = !flags.particles;
     }

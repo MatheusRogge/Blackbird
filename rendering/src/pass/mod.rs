@@ -1,3 +1,4 @@
+pub mod ao;
 pub mod bvh_upload;
 pub mod camera;
 pub mod debug_overlay;

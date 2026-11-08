@@ -47,6 +47,7 @@ fn main() -> anyhow::Result<()> {
     let composite        = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/composite.wgsl"));
     let ssr_temporal     = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/ssr_temporal.wgsl"));
     let particle_sim     = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/particle_sim.wgsl"));
+    let ao               = ShaderAsset::from_raw(include_str!("../../sandbox/shaders/ao.wgsl"));
 
     let debug_flags = Arc::new(RwLock::new(RenderDebugFlags {
         show_grid: true,
@@ -66,6 +67,7 @@ fn main() -> anyhow::Result<()> {
         composite,
         ssr_temporal,
         particle_sim,
+        ao,
     ).with_debug_flags(debug_flags.clone());
 
     WindowedApplication::new(render_graph)

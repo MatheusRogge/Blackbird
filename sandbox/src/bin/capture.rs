@@ -9,6 +9,7 @@
 //!   --target x,y,z       point the camera looks at
 //!   --exposure E         linear exposure override
 //!   --no-specular --no-reflections --no-ssr --no-reflection-probe --no-emissive-lights --no-indirect --no-direct --no-shadows --no-particles
+//!   --no-ao --no-contact-shadows
 //!   --view lit|albedo|normal|material|emissive|shadows
 //!   --point x,y,z,I[,r]  add a white point light of I candela (range 10), source radius r (default 0)
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
@@ -115,6 +116,8 @@ fn parse_args() -> Result<Options> {
             "--no-direct" => flags.direct = false,
             "--no-shadows" => flags.shadows = false,
             "--no-particles" => flags.particles = false,
+            "--no-ao" => flags.ambient_occlusion = false,
+            "--no-contact-shadows" => flags.contact_shadows = false,
             "--view" => {
                 flags.view = match value()?.as_str() {
                     "lit" => GBufferView::Lit,
@@ -269,6 +272,7 @@ fn main() -> Result<()> {
         shader("composite.wgsl")?,
         shader("ssr_temporal.wgsl")?,
         shader("particle_sim.wgsl")?,
+        shader("ao.wgsl")?,
     )
     .with_debug_flags(flags);
 

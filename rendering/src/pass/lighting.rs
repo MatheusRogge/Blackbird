@@ -396,14 +396,14 @@ pub struct LightingPass {
     emissive_id: ResourceId,
     transmission_id: ResourceId,
     depth_id: ResourceId,
+    ao_id: ResourceId,
 
     lit_id: ResourceId,
     specular_weight_id: ResourceId,
     specular_fallback_id: ResourceId,
 
-    // Binds texture views — recreated when albedo is reallocated (resize).
-    gbuffer_bg: Option<wgpu::BindGroup>,
-    cached_albedo_ptr: usize,
+    /// Keyed by the albedo and AO view addresses (screen textures move on resize).
+    gbuffer_bg: Option<([usize; 2], wgpu::BindGroup)>,
 
     bindings: LightingBindings,
 
@@ -416,6 +416,7 @@ impl LightingPass {
     pub fn new(
         graph: &mut RenderGraph,
         gbuffer: &GBufferOutputs,
+        ao_id: ResourceId,
         cluster: &ClusterOutputs,
         light_buffers: &LightBuffers,
         shadow: &ShadowOutputs,
@@ -460,11 +461,11 @@ impl LightingPass {
                 emissive_id: gbuffer.emissive_id,
                 transmission_id: gbuffer.transmission_id,
                 depth_id: gbuffer.depth_id,
+                ao_id,
                 lit_id,
                 specular_weight_id,
                 specular_fallback_id,
                 gbuffer_bg: None,
-                cached_albedo_ptr: 0,
                 bindings: LightingBindings::new(
                     cluster,
                     light_buffers,
@@ -488,7 +489,7 @@ impl PassDesc for LightingPass {
     }
 
     fn reads(&self) -> Vec<ResourceId> {
-        let mut reads = vec![self.albedo_id, self.normal_id, self.material_id, self.emissive_id, self.transmission_id, self.depth_id];
+        let mut reads = vec![self.albedo_id, self.normal_id, self.material_id, self.emissive_id, self.transmission_id, self.depth_id, self.ao_id];
         reads.extend(self.bindings.reads());
         reads
     }
@@ -505,7 +506,6 @@ impl Pass for LightingPass {
 
     fn on_resize(&mut self, _width: u32, _height: u32) {
         self.gbuffer_bg = None;
-        self.cached_albedo_ptr = 0;
     }
 
     fn execute(
@@ -526,6 +526,7 @@ impl Pass for LightingPass {
             self.depth_id,
             self.emissive_id,
             self.transmission_id,
+            self.ao_id,
         ]
         .map(|id| ctx.views.get(&id).copied());
         let [
@@ -538,6 +539,7 @@ impl Pass for LightingPass {
             Some(depth_view),
             Some(emissive_view),
             Some(transmission_view),
+            Some(ao_view),
         ] = views
         else {
             return;
@@ -572,6 +574,7 @@ impl Pass for LightingPass {
                     },
                     texture_entry(5, wgpu::TextureViewDimension::D2, FILTERABLE),
                     texture_entry(15, wgpu::TextureViewDimension::D2, FILTERABLE),
+                    texture_entry(16, wgpu::TextureViewDimension::D2, FILTERABLE),
                 ],
             });
 
@@ -634,9 +637,9 @@ impl Pass for LightingPass {
             return;
         };
 
-        let albedo_ptr = albedo_view as *const wgpu::TextureView as usize;
-        if self.gbuffer_bg.is_none() || albedo_ptr != self.cached_albedo_ptr {
-            self.gbuffer_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let key = [albedo_view, ao_view].map(|v| std::ptr::from_ref(v) as usize);
+        if self.gbuffer_bg.as_ref().is_none_or(|(k, _)| *k != key) {
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("lighting_gbuffer_bg"),
                 layout: gbuffer_bgl,
                 entries: &[
@@ -650,11 +653,12 @@ impl Pass for LightingPass {
                         binding: 15,
                         resource: wgpu::BindingResource::TextureView(transmission_view),
                     },
+                    wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(ao_view) },
                 ],
-            }));
-            self.cached_albedo_ptr = albedo_ptr;
+            });
+            self.gbuffer_bg = Some((key, bind_group));
         }
-        let Some(gbuffer_bg) = self.gbuffer_bg.as_ref() else { return };
+        let Some((_, gbuffer_bg)) = self.gbuffer_bg.as_ref() else { return };
         let Some(lighting_bgs) = self.bindings.bind_groups(device, ctx) else { return };
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

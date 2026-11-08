@@ -11,6 +11,8 @@ pub struct DebugFlagsGpu {
     pub disable_specular: u32,
     pub disable_reflections: u32,
     pub disable_ssr:      u32,
+    pub disable_contact_shadows: u32,
+    pub _pad: [u32; 3],
 }
 
 /// What the `lighting` pass outputs: the lit image, or one G-buffer target as-is.
@@ -61,6 +63,10 @@ pub struct RenderDebugFlags {
     pub reflection_probe: bool,
     /// Particle emitters (`particle_sim` + `particles`).
     pub particles: bool,
+    /// Screen-space ambient occlusion of indirect light (`ao` pass).
+    pub ambient_occlusion: bool,
+    /// Short screen-space shadow rays toward the sky light and shadowed local lights (`lighting`).
+    pub contact_shadows: bool,
     pub view:     GBufferView,
 
     pub show_bvh:        bool,
@@ -89,6 +95,8 @@ impl Default for RenderDebugFlags {
             ssr: true,
             reflection_probe: true,
             particles: true,
+            ambient_occlusion: true,
+            contact_shadows: true,
             view:     GBufferView::Lit,
 
             show_bvh:        false,
@@ -117,6 +125,8 @@ impl RenderDebugFlags {
             disable_specular: !self.specular as u32,
             disable_reflections: !self.reflections as u32,
             disable_ssr:      !self.ssr as u32,
+            disable_contact_shadows: !self.contact_shadows as u32,
+            _pad: [0; 3],
         }
     }
 }

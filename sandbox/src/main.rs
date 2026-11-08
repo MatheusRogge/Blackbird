@@ -122,6 +122,7 @@ fn main() -> anyhow::Result<()> {
     let composite_shader      = ShaderAsset::from_raw(include_str!("../shaders/composite.wgsl"));
     let ssr_temporal_shader   = ShaderAsset::from_raw(include_str!("../shaders/ssr_temporal.wgsl"));
     let particle_sim_shader   = ShaderAsset::from_raw(include_str!("../shaders/particle_sim.wgsl"));
+    let ao_shader             = ShaderAsset::from_raw(include_str!("../shaders/ao.wgsl"));
 
     let render_graph = RenderGraphPBRBuilder::new(
         gbuffer_shader,
@@ -136,6 +137,7 @@ fn main() -> anyhow::Result<()> {
         composite_shader,
         ssr_temporal_shader,
         particle_sim_shader,
+        ao_shader,
     );
 
     WindowedApplication::new(render_graph)
