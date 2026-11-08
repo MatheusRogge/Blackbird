@@ -150,7 +150,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         );
         graph.add_pass(device, gbuffer_pass);
 
-        let (ao_pass, ao_id) = AoPass::new(
+        let (ao_pass, ao_outputs) = AoPass::new(
             &mut graph,
             gbuffer_outputs.depth_id,
             gbuffer_outputs.normal_id,
@@ -179,7 +179,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         let (lighting_pass, lighting_outputs) = LightingPass::new(
             &mut graph,
             &gbuffer_outputs,
-            ao_id,
+            &ao_outputs,
             &cluster_outputs,
             &light_buffers,
             &shadow_outputs,
@@ -239,6 +239,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             &mut graph,
             composite_id,
             &gbuffer_outputs,
+            &ao_outputs,
             &lighting_outputs,
             &cluster_outputs,
             &light_buffers,

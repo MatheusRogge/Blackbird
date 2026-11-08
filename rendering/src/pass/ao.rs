@@ -1,7 +1,9 @@
 //! Screen-space ambient occlusion (`ao.wgsl`): draws the nearest visible glass into its own depth
-//! and opacity targets (`Blend` meshes aren't in the G-buffer), then GTAO over the G-buffer depth,
-//! normals and that glass into a raw target, then a depth-aware 4×4 blur into the output
-//! `lighting` reads. With the `ambient_occlusion` debug flag off the output is cleared to 1.
+//! and transmittance targets (`Blend` meshes aren't in the G-buffer), then GTAO over the G-buffer
+//! depth, normals and that glass into a raw target, then a depth-aware 4×4 blur into the output
+//! `lighting` reads. With the `ambient_occlusion` debug flag off the output is cleared to 1. The
+//! glass targets are also outputs: contact shadows in `lighting` march them, so they are drawn
+//! while either flag is on.
 
 use std::sync::{Arc, RwLock};
 
@@ -20,6 +22,16 @@ use crate::{
 
 pub const AO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 const GLASS_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const GLASS_TRANSMITTANCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+#[derive(Clone, Copy)]
+pub struct AoOutputs {
+    pub ao_id: ResourceId,
+    /// Nearest glass in front of the opaque depth (reversed-Z, cleared to 0).
+    pub glass_depth_id: ResourceId,
+    /// That glass's transmittance in rgb, cleared to 1.
+    pub glass_transmittance_id: ResourceId,
+}
 
 struct Pipelines {
     glass: wgpu::RenderPipeline,
@@ -39,7 +51,7 @@ pub struct AoPass {
     raw_id: ResourceId,
     output_id: ResourceId,
     glass_depth_id: ResourceId,
-    glass_opacity_id: ResourceId,
+    glass_transmittance_id: ResourceId,
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
     pipelines: Option<Pipelines>,
     /// Keyed by the input view addresses (screen textures move on resize).
@@ -56,7 +68,7 @@ impl AoPass {
         camera_buffer_id: ResourceId,
         shader: ShaderAsset,
         debug_flags: Arc<RwLock<RenderDebugFlags>>,
-    ) -> (Self, ResourceId) {
+    ) -> (Self, AoOutputs) {
         let mut target = |format| {
             graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
                 format,
@@ -66,7 +78,7 @@ impl AoPass {
         let raw_id = target(AO_FORMAT);
         let output_id = target(AO_FORMAT);
         let glass_depth_id = target(GLASS_DEPTH_FORMAT);
-        let glass_opacity_id = target(AO_FORMAT);
+        let glass_transmittance_id = target(GLASS_TRANSMITTANCE_FORMAT);
         let pass = Self {
             node_id: None,
             shader,
@@ -76,13 +88,13 @@ impl AoPass {
             raw_id,
             output_id,
             glass_depth_id,
-            glass_opacity_id,
+            glass_transmittance_id,
             debug_flags,
             pipelines: None,
             bind_groups: None,
             glass_bg: None,
         };
-        (pass, output_id)
+        (pass, AoOutputs { ao_id: output_id, glass_depth_id, glass_transmittance_id })
     }
 
     fn create_pipelines(&self, device: &wgpu::Device) -> Pipelines {
@@ -169,7 +181,7 @@ impl AoPass {
             fragment: Some(wgpu::FragmentState {
                 module: &module,
                 entry_point: Some("fs_glass"),
-                targets: &[Some(AO_FORMAT.into())],
+                targets: &[Some(GLASS_TRANSMITTANCE_FORMAT.into())],
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState::default(),
@@ -228,7 +240,7 @@ impl PassDesc for AoPass {
     }
 
     fn writes(&self) -> Vec<ResourceId> {
-        vec![self.raw_id, self.output_id, self.glass_depth_id, self.glass_opacity_id]
+        vec![self.raw_id, self.output_id, self.glass_depth_id, self.glass_transmittance_id]
     }
 }
 
@@ -251,21 +263,21 @@ impl Pass for AoPass {
         world: &World,
     ) {
         let view = |id| ctx.views.get(id).copied();
-        let (Some(output), Some(raw), Some(depth), Some(normal), Some(glass_depth), Some(glass_opacity)) = (
+        let (Some(output), Some(raw), Some(depth), Some(normal), Some(glass_depth), Some(glass_transmittance)) = (
             view(&self.output_id),
             view(&self.raw_id),
             view(&self.depth_id),
             view(&self.normal_id),
             view(&self.glass_depth_id),
-            view(&self.glass_opacity_id),
+            view(&self.glass_transmittance_id),
         ) else {
             return;
         };
         let Some(camera) = ctx.buffers.get(&self.camera_buffer_id) else { return };
-        if !self.debug_flags.read().expect("debug_flags poisoned").ambient_occlusion {
-            fullscreen(encoder, "ao_blur", output, None);
-            return;
-        }
+        let (ambient_occlusion, contact_shadows) = {
+            let flags = self.debug_flags.read().expect("debug_flags poisoned");
+            (flags.ambient_occlusion, flags.contact_shadows && flags.shadows)
+        };
 
         if self.pipelines.is_none() {
             self.pipelines = Some(self.create_pipelines(device));
@@ -286,7 +298,7 @@ impl Pass for AoPass {
             self.glass_bg = Some((glass_key, bind_group));
         }
 
-        let key: Vec<usize> = [raw, depth, normal, glass_depth, glass_opacity]
+        let key: Vec<usize> = [raw, depth, normal, glass_depth, glass_transmittance]
             .iter()
             .map(|v| std::ptr::from_ref(*v) as usize)
             .collect();
@@ -296,7 +308,7 @@ impl Pass for AoPass {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(normal) },
                 wgpu::BindGroupEntry { binding: 2, resource: camera.binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(glass_depth) },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(glass_opacity) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(glass_transmittance) },
             ];
             let ao = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ao"),
@@ -319,7 +331,7 @@ impl Pass for AoPass {
         let glass: Vec<_> = world
             .get_entity_handles::<Mesh>()
             .into_iter()
-            .filter(|h| h.entity.is_blended())
+            .filter(|h| (ambient_occlusion || contact_shadows) && h.entity.is_blended())
             .filter_map(|h| {
                 let draw = ctx.geometry.get(h.id)?;
                 (!draw.bounds.outside_clip(view_proj? * h.entity.transform)).then_some(draw)
@@ -329,10 +341,10 @@ impl Pass for AoPass {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ao_glass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: glass_opacity,
+                    view: glass_transmittance,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: glass_depth,
@@ -351,7 +363,11 @@ impl Pass for AoPass {
                 }
             }
         }
-        fullscreen(encoder, "ao", raw, Some((&pipelines.ao, ao_bg)));
-        fullscreen(encoder, "ao_blur", output, Some((&pipelines.blur, blur_bg)));
+        if ambient_occlusion {
+            fullscreen(encoder, "ao", raw, Some((&pipelines.ao, ao_bg)));
+            fullscreen(encoder, "ao_blur", output, Some((&pipelines.blur, blur_bg)));
+        } else {
+            fullscreen(encoder, "ao_blur", output, None);
+        }
     }
 }

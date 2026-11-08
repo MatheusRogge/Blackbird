@@ -7,6 +7,7 @@ use engine_core::world::World;
 use crate::{
     debug_flags::{DebugFlagsGpu, RenderDebugFlags},
     graph::{NodeId, RenderGraph},
+    pass::ao::AoOutputs,
     pass::cluster_assignment::ClusterOutputs,
     pass::gbuffer::GBufferOutputs,
     pass::light_upload::LightBuffers,
@@ -397,13 +398,15 @@ pub struct LightingPass {
     transmission_id: ResourceId,
     depth_id: ResourceId,
     ao_id: ResourceId,
+    glass_depth_id: ResourceId,
+    glass_transmittance_id: ResourceId,
 
     lit_id: ResourceId,
     specular_weight_id: ResourceId,
     specular_fallback_id: ResourceId,
 
-    /// Keyed by the albedo and AO view addresses (screen textures move on resize).
-    gbuffer_bg: Option<([usize; 2], wgpu::BindGroup)>,
+    /// Keyed by the albedo, AO and glass view addresses (screen textures move on resize).
+    gbuffer_bg: Option<([usize; 4], wgpu::BindGroup)>,
 
     bindings: LightingBindings,
 
@@ -416,7 +419,7 @@ impl LightingPass {
     pub fn new(
         graph: &mut RenderGraph,
         gbuffer: &GBufferOutputs,
-        ao_id: ResourceId,
+        ao: &AoOutputs,
         cluster: &ClusterOutputs,
         light_buffers: &LightBuffers,
         shadow: &ShadowOutputs,
@@ -461,7 +464,9 @@ impl LightingPass {
                 emissive_id: gbuffer.emissive_id,
                 transmission_id: gbuffer.transmission_id,
                 depth_id: gbuffer.depth_id,
-                ao_id,
+                ao_id: ao.ao_id,
+                glass_depth_id: ao.glass_depth_id,
+                glass_transmittance_id: ao.glass_transmittance_id,
                 lit_id,
                 specular_weight_id,
                 specular_fallback_id,
@@ -489,7 +494,7 @@ impl PassDesc for LightingPass {
     }
 
     fn reads(&self) -> Vec<ResourceId> {
-        let mut reads = vec![self.albedo_id, self.normal_id, self.material_id, self.emissive_id, self.transmission_id, self.depth_id, self.ao_id];
+        let mut reads = vec![self.albedo_id, self.normal_id, self.material_id, self.emissive_id, self.transmission_id, self.depth_id, self.ao_id, self.glass_depth_id, self.glass_transmittance_id];
         reads.extend(self.bindings.reads());
         reads
     }
@@ -527,6 +532,8 @@ impl Pass for LightingPass {
             self.emissive_id,
             self.transmission_id,
             self.ao_id,
+            self.glass_depth_id,
+            self.glass_transmittance_id,
         ]
         .map(|id| ctx.views.get(&id).copied());
         let [
@@ -540,6 +547,8 @@ impl Pass for LightingPass {
             Some(emissive_view),
             Some(transmission_view),
             Some(ao_view),
+            Some(glass_depth_view),
+            Some(glass_transmittance_view),
         ] = views
         else {
             return;
@@ -575,6 +584,8 @@ impl Pass for LightingPass {
                     texture_entry(5, wgpu::TextureViewDimension::D2, FILTERABLE),
                     texture_entry(15, wgpu::TextureViewDimension::D2, FILTERABLE),
                     texture_entry(16, wgpu::TextureViewDimension::D2, FILTERABLE),
+                    texture_entry(17, wgpu::TextureViewDimension::D2, wgpu::TextureSampleType::Depth),
+                    texture_entry(18, wgpu::TextureViewDimension::D2, FILTERABLE),
                 ],
             });
 
@@ -637,7 +648,7 @@ impl Pass for LightingPass {
             return;
         };
 
-        let key = [albedo_view, ao_view].map(|v| std::ptr::from_ref(v) as usize);
+        let key = [albedo_view, ao_view, glass_depth_view, glass_transmittance_view].map(|v| std::ptr::from_ref(v) as usize);
         if self.gbuffer_bg.as_ref().is_none_or(|(k, _)| *k != key) {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("lighting_gbuffer_bg"),
@@ -654,6 +665,11 @@ impl Pass for LightingPass {
                         resource: wgpu::BindingResource::TextureView(transmission_view),
                     },
                     wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(ao_view) },
+                    wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::TextureView(glass_depth_view) },
+                    wgpu::BindGroupEntry {
+                        binding: 18,
+                        resource: wgpu::BindingResource::TextureView(glass_transmittance_view),
+                    },
                 ],
             });
             self.gbuffer_bg = Some((key, bind_group));

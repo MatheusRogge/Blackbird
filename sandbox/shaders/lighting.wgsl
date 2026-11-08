@@ -10,6 +10,10 @@
 @group(0) @binding(15) var t_transmission: texture_2d<f32>;
 // Screen-space ambient occlusion (rendering::pass::ao), 1 = unoccluded.
 @group(0) @binding(16) var t_ao: texture_2d<f32>;
+// The `ao` pass's glass prepass: the nearest glass in front of the opaque depth (reversed-Z, 0 =
+// none) and the light it lets through (rgb), for contact shadows.
+@group(0) @binding(17) var t_glass_depth: texture_depth_2d;
+@group(0) @binding(18) var t_glass_transmittance: texture_2d<f32>;
 
 // Probe atlases + params
 const PROBES_PER_ROW: u32 = 30u;
@@ -642,18 +646,24 @@ fn interleaved_gradient_noise(p: vec2<f32>) -> f32 {
     return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715))));
 }
 
-// Visibility (0 or 1) along `L_ws` from `pos_ws` over up to `max_length`. `geo_N` is the surface's
-// geometric normal (not the shading normal), or 0 for none. Lights behind the geometric surface are
-// left to the shadow maps: normal-mapped detail facing them would otherwise march into the surface.
-fn contact_shadow(geo_N: vec3<f32>, pos_ws: vec3<f32>, L_ws: vec3<f32>, max_length: f32, pixel: vec2<f32>) -> f32 {
+// Transmittance along `L_ws` from `pos_ws` over up to `max_length`: 0 past an opaque occluder, and
+// with `glass`, the transmittance of the glass prepass's glass it passes behind. `geo_N` is the
+// surface's geometric normal (not the shading normal), or 0 for none. Lights behind the geometric
+// surface are left to the shadow maps: normal-mapped detail facing them would otherwise march into
+// the surface. Blended surfaces don't march the glass, which holds their own surface.
+//
+// Combine it with a shadow map's visibility by `min`, not a product: glass the tint map already
+// caught would otherwise tint twice.
+fn contact_shadow(geo_N: vec3<f32>, pos_ws: vec3<f32>, L_ws: vec3<f32>, max_length: f32, pixel: vec2<f32>, glass: bool) -> vec3<f32> {
     if all(geo_N == vec3f(0.0)) || dot(geo_N, L_ws) <= 0.0 || debug.disable_shadows != 0u
         || debug.disable_contact_shadows != 0u {
-        return 1.0;
+        return vec3f(1.0);
     }
     let dims = vec2f(cp.screen_w, cp.screen_h);
     let reach = min(CONTACT_LENGTH, max_length);
     let jitter = interleaved_gradient_noise(pixel);
     let start = pos_ws + geo_N * (CONTACT_BIAS * distance(pos_ws, camera.inv_view[3].xyz));
+    var through = vec3f(1.0);
     for (var i = 0u; i < CONTACT_STEPS; i++) {
         let p = start + L_ws * (reach * (f32(i) + jitter) / f32(CONTACT_STEPS));
         let clip = camera.view_proj * vec4f(p, 1.0);
@@ -666,15 +676,21 @@ fn contact_shadow(geo_N: vec3<f32>, pos_ws: vec3<f32>, L_ws: vec3<f32>, max_leng
             break;
         }
         let d = textureLoad(t_depth, vec2<i32>(px), 0);
-        if d == 0.0 {
-            continue;
+        if d != 0.0 && contact_occludes(clip.w - linear_depth(d), clip.w) {
+            return vec3f(0.0);
         }
-        let in_front = clip.w - linear_depth(d);
-        if in_front > CONTACT_BIAS * clip.w && in_front < CONTACT_THICKNESS {
-            return 0.0;
+        if glass {
+            let g = textureLoad(t_glass_depth, vec2<i32>(px), 0);
+            if g != 0.0 && contact_occludes(clip.w - linear_depth(g), clip.w) {
+                through = min(through, textureLoad(t_glass_transmittance, vec2<i32>(px), 0).rgb);
+            }
         }
     }
-    return 1.0;
+    return through;
+}
+
+fn contact_occludes(in_front: f32, ray_depth: f32) -> bool {
+    return in_front > CONTACT_BIAS * ray_depth && in_front < CONTACT_THICKNESS;
 }
 
 fn gbuffer_pos_ws(pixel: vec2<i32>) -> vec4<f32> {
@@ -711,8 +727,9 @@ fn view_to_world_dir(v: vec3<f32>) -> vec3<f32> {
 // `probe_capture` is for points seen by the reflection probe rather than the camera: the camera's
 // light clusters don't apply, so every point light is looped over, and the sky shadow comes from
 // whichever cascade contains the point. A nonzero `geo_N` (the geometric normal) adds contact
-// shadows, which march the G-buffer depth of the camera's view, so only the deferred path does.
-fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws: vec3<f32>, pixel: vec2<f32>, depth_vs: f32, probe_capture: bool, geo_N: vec3<f32>) -> vec3<f32> {
+// shadows, which march the camera view's depth, so the probe capture passes 0; `contact_glass` is
+// `contact_shadow`'s `glass`.
+fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws: vec3<f32>, pixel: vec2<f32>, depth_vs: f32, probe_capture: bool, geo_N: vec3<f32>, contact_glass: bool) -> vec3<f32> {
     let N = surf_ws.N;
     let N_vs = surf_vs.N;
     let alpha = surf_vs.alpha;
@@ -737,8 +754,8 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
             continue;
         }
 
-        let vis = local_shadow_of(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel)
-            * contact_shadow(select(vec3f(0.0), geo_N, light.shadow_slot != SHADOW_SLOT_NONE), pos_ws, view_to_world_dir(to_light / dist), dist, pixel);
+        let vis = min(local_shadow_of(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel),
+            contact_shadow(select(vec3f(0.0), geo_N, light.shadow_slot != SHADOW_SLOT_NONE), pos_ws, view_to_world_dir(to_light / dist), dist, pixel, contact_glass));
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
         color += sphere_light_brdf(surf_vs, to_light, dist, light.source_radius) * light.color * vis
             * (light.intensity * falloff);
@@ -756,8 +773,8 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let L  = to_light / dist;
         let cd = dot(-L, normalize(light.direction_vs));
         let t  = clamp((cd - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
-        let vis = local_shadow_of(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel)
-            * contact_shadow(select(vec3f(0.0), geo_N, light.shadow_slot != SHADOW_SLOT_NONE), pos_ws, view_to_world_dir(to_light / dist), dist, pixel);
+        let vis = min(local_shadow_of(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel),
+            contact_shadow(select(vec3f(0.0), geo_N, light.shadow_slot != SHADOW_SLOT_NONE), pos_ws, view_to_world_dir(to_light / dist), dist, pixel, contact_glass));
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
         color += sphere_light_brdf(surf_vs, to_light, dist, light.source_radius) * light.color * vis
             * (light.intensity * t * t * falloff);
@@ -789,8 +806,8 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let area     = 4.0 * half_r * half_u;
         let normal   = normalize(cross(r_dir, u_dir));
         let radiance = light.color * light.intensity
-            * local_shadow_of(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel)
-            * contact_shadow(select(vec3f(0.0), geo_N, light.shadow_slot != SHADOW_SLOT_NONE), pos_ws, view_to_world_dir(L), sqrt(dist2), pixel);
+            * min(local_shadow_of(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel),
+                contact_shadow(select(vec3f(0.0), geo_N, light.shadow_slot != SHADOW_SLOT_NONE), pos_ws, view_to_world_dir(L), sqrt(dist2), pixel, contact_glass));
         let facing   = area_facing(light, -L, normal);
         color += diffuse_brdf(surf_vs, L) * radiance * (facing * area / (dist2 + area));
 
@@ -863,7 +880,7 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
             lit = shadow_sum / 9.0 * glass_tint(t_glass_tint, shadow_uv, cascade, ref_depth);
         }
 
-        lit *= contact_shadow(geo_N, pos_ws, L, CONTACT_LENGTH, pixel);
+        lit = min(lit, contact_shadow(geo_N, pos_ws, L, CONTACT_LENGTH, pixel, contact_glass));
         color += brdf(surf_ws, L) * sky.color * (sky.intensity * lit);
     }
 
@@ -1043,7 +1060,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
     }
 
     if debug.disable_direct == 0u {
-        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, depth_vs, false, geometric_normal(frag_xy, pos_ws, view_dir));
+        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, depth_vs, false, geometric_normal(frag_xy, pos_ws, view_dir), true);
     }
 
     color += emissive;
@@ -1326,7 +1343,7 @@ fn fs_forward(in: ForwardVertex, @builtin(front_facing) front_facing: bool) -> @
 
     var color = emissive * coverage;
     if debug.disable_direct == 0u {
-        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, -pos_vs.z, false, vec3f(0.0));
+        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, -pos_vs.z, false, Ng, false);
     }
     // Exposed, unlike `color`: screen-space hits come from the exposed `t_behind`.
     var reflected = vec3f(0.0);
@@ -1472,7 +1489,7 @@ fn shade_probe(in: ForwardVertex, front_facing: bool, m: Model, base: vec4<f32>)
 
     var color = emissive;
     if debug.disable_direct == 0u {
-        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, -pos_vs.z, true, vec3f(0.0));
+        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, -pos_vs.z, true, vec3f(0.0), false);
     }
     if debug.disable_indirect == 0u {
         color += diffuse_color * sample_probe_irradiance(pos_ws, N, N, view_dir);

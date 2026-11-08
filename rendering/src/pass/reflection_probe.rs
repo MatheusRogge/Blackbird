@@ -354,9 +354,11 @@ struct Capture {
     /// Keyed by (geometry generation, instance list generation).
     scene_bg: Option<((u64, u64), wgpu::BindGroup)>,
     instances: InstanceList,
-    /// Binding 3: `direct_lighting` names the G-buffer depth for contact shadows, which captures
-    /// leave off, so a 1×1 stand-in satisfies the layout.
+    /// Bindings 3 and 17: `direct_lighting` names the G-buffer and glass depths (and, at 18, the
+    /// glass transmittance) for contact shadows, which captures leave off, so 1×1 stand-ins
+    /// satisfy the layout.
     no_depth: wgpu::TextureView,
+    no_glass: wgpu::TextureView,
     /// Depth only: back-face culled for single-sided opaque meshes, unculled and alpha-tested for
     /// masked and double-sided ones.
     prepass_opaque: wgpu::RenderPipeline,
@@ -456,6 +458,26 @@ impl ReflectionProbePass {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
+                    binding: 17,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Depth,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 18,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
                     binding: 11,
                     visibility: both,
                     ty: wgpu::BindingType::Buffer {
@@ -542,20 +564,25 @@ impl ReflectionProbePass {
             })
             .create_view(&wgpu::TextureViewDescriptor::default());
         let filter = Filter::new(device, probe_textures(&self.textures, device));
-        let no_depth = device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("reflection_probe_no_depth"),
-                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Depth32Float,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            })
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let stand_in = |label, format| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let no_depth = stand_in("reflection_probe_no_depth", wgpu::TextureFormat::Depth32Float);
+        let no_glass = stand_in("reflection_probe_no_glass", wgpu::TextureFormat::Rgba8Unorm);
         Capture {
             no_depth,
+            no_glass,
             scene_layout,
             scene_bg: None,
             instances: InstanceList::default(),
@@ -674,6 +701,8 @@ impl Pass for ReflectionProbePass {
                     wgpu::BindGroupEntry { binding: 7, resource: ctx.geometry.instance_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 9, resource: ids.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&capture.no_depth) },
+                    wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::TextureView(&capture.no_depth) },
+                    wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::TextureView(&capture.no_glass) },
                     wgpu::BindGroupEntry {
                         binding: 11,
                         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {

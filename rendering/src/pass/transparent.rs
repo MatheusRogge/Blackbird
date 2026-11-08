@@ -10,6 +10,7 @@ use crate::{
     debug_flags::{GBufferView, RenderDebugFlags},
     graph::{NodeId, RenderGraph},
     mesh::{Mesh, Vertex},
+    pass::ao::AoOutputs,
     pass::cluster_assignment::ClusterOutputs,
     pass::gbuffer::GBufferOutputs,
     pass::light_upload::LightBuffers,
@@ -167,8 +168,8 @@ pub struct TransparentPass {
     node_id: Option<NodeId>,
     shader: ShaderAsset,
     pipelines: Option<Pipelines>,
-    /// Keyed by the scene, depth and normal view addresses and the geometry generation.
-    scene_bg: Option<((usize, usize, usize, u64), wgpu::BindGroup)>,
+    /// Keyed by the scene, depth, normal and glass view addresses and the geometry generation.
+    scene_bg: Option<(([usize; 5], u64), wgpu::BindGroup)>,
     behind: Option<Behind>,
     bindings: LightingBindings,
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
@@ -176,6 +177,8 @@ pub struct TransparentPass {
     scene_id: ResourceId,
     depth_id: ResourceId,
     normal_id: ResourceId,
+    glass_depth_id: ResourceId,
+    glass_transmittance_id: ResourceId,
     debug_flags_id: ResourceId,
     output_id: ResourceId,
 }
@@ -186,6 +189,7 @@ impl TransparentPass {
         graph: &mut RenderGraph,
         scene_id: ResourceId,
         gbuffer: &GBufferOutputs,
+        ao: &AoOutputs,
         lighting: &LightingOutputs,
         cluster: &ClusterOutputs,
         light_buffers: &LightBuffers,
@@ -221,6 +225,8 @@ impl TransparentPass {
             scene_id,
             depth_id: gbuffer.depth_id,
             normal_id: gbuffer.normal_id,
+            glass_depth_id: ao.glass_depth_id,
+            glass_transmittance_id: ao.glass_transmittance_id,
             debug_flags_id: lighting.debug_flags_id,
             output_id,
         };
@@ -234,16 +240,7 @@ impl TransparentPass {
             label: Some("transparent_scene_bgl"),
             entries: &[
                 color_entry(1),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Depth,
-                    },
-                    count: None,
-                },
+                depth_entry(3),
                 sampler_entry(4),
                 color_entry(6),
                 wgpu::BindGroupLayoutEntry {
@@ -251,6 +248,8 @@ impl TransparentPass {
                     ..GeometryArena::instance_layout_entry(7)
                 },
                 color_entry(8),
+                depth_entry(17),
+                color_entry(18),
             ],
         });
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -397,6 +396,19 @@ fn color_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+fn depth_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            multisampled: false,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            sample_type: wgpu::TextureSampleType::Depth,
+        },
+        count: None,
+    }
+}
+
 fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -503,7 +515,14 @@ impl PassDesc for TransparentPass {
     }
 
     fn reads(&self) -> Vec<ResourceId> {
-        let mut reads = vec![self.scene_id, self.depth_id, self.normal_id, self.debug_flags_id];
+        let mut reads = vec![
+            self.scene_id,
+            self.depth_id,
+            self.normal_id,
+            self.glass_depth_id,
+            self.glass_transmittance_id,
+            self.debug_flags_id,
+        ];
         reads.extend(self.bindings.reads());
         reads
     }
@@ -531,11 +550,20 @@ impl Pass for TransparentPass {
         ctx: &PassContext<'_>,
         world: &World,
     ) {
-        let (Some(&output_view), Some(&scene_view), Some(&depth_view), Some(&normal_view)) = (
+        let (
+            Some(&output_view),
+            Some(&scene_view),
+            Some(&depth_view),
+            Some(&normal_view),
+            Some(&glass_depth_view),
+            Some(&glass_transmittance_view),
+        ) = (
             ctx.views.get(&self.output_id),
             ctx.views.get(&self.scene_id),
             ctx.views.get(&self.depth_id),
             ctx.views.get(&self.normal_id),
+            ctx.views.get(&self.glass_depth_id),
+            ctx.views.get(&self.glass_transmittance_id),
         ) else {
             return;
         };
@@ -588,9 +616,8 @@ impl Pass for TransparentPass {
         }
 
         let key = (
-            scene_view as *const wgpu::TextureView as usize,
-            depth_view as *const wgpu::TextureView as usize,
-            normal_view as *const wgpu::TextureView as usize,
+            [scene_view, depth_view, normal_view, glass_depth_view, glass_transmittance_view]
+                .map(|v| std::ptr::from_ref(v) as usize),
             ctx.geometry.generation(),
         );
         if self.scene_bg.as_ref().is_none_or(|(k, _)| *k != key) {
@@ -604,6 +631,11 @@ impl Pass for TransparentPass {
                     wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(scene_view) },
                     wgpu::BindGroupEntry { binding: 7, resource: ctx.geometry.instance_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&behind.view) },
+                    wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::TextureView(glass_depth_view) },
+                    wgpu::BindGroupEntry {
+                        binding: 18,
+                        resource: wgpu::BindingResource::TextureView(glass_transmittance_view),
+                    },
                 ],
             });
             self.scene_bg = Some((key, bind_group));
