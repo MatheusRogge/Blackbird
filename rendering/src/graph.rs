@@ -497,11 +497,8 @@ impl RenderGraph {
         surface_size: (u32, u32),
         world: &World,
     ) -> wgpu::CommandBuffer {
-        if let Some(gpu) = &mut self.gpu_profiler
-            && gpu.try_read_results()
-        {
-            let times = gpu.last_gpu_times_ms.clone();
-            self.profiler.apply_gpu_times(&times);
+        if let Some(times) = self.gpu_profiler.as_mut().and_then(GpuProfiler::try_read_results) {
+            self.profiler.apply_gpu_times(times);
         }
 
         self.profiler.begin_frame();
@@ -514,7 +511,9 @@ impl RenderGraph {
 
         let timing_features =
             wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-        if self.gpu_profiler.is_none() && device.features().contains(timing_features) {
+        if device.features().contains(timing_features)
+            && self.gpu_profiler.as_ref().is_none_or(|gpu| gpu.num_passes() != order.len() as u32)
+        {
             self.gpu_profiler = Some(GpuProfiler::new(device, queue, order.len() as u32));
         }
 
@@ -701,10 +700,8 @@ impl RenderGraph {
             }
         }
 
-        self.gpu_resolved = self
-            .gpu_profiler
-            .as_ref()
-            .is_some_and(|gpu| gpu.resolve(&mut encoder));
+        let names: Vec<_> = order.iter().map(|id| self.ctx.passes[id].name()).collect();
+        self.gpu_resolved = self.gpu_profiler.as_mut().is_some_and(|gpu| gpu.resolve(&mut encoder, names));
 
         self.profiler.end_frame();
         self.profiler.set_arena_stats(self.ctx.arena_stats());

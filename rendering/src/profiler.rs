@@ -64,6 +64,8 @@ pub struct FrameProfiler {
     pass_times: HashMap<&'static str, VecDeque<f32>>,
     pass_order: Vec<&'static str>,
     pass_draws: HashMap<&'static str, DrawCounts>,
+    /// Latest GPU time per pass, a few frames old (timestamp readback).
+    pass_gpu: HashMap<&'static str, f32>,
     frame_start: Instant,
     last_stats: FrameStats,
 }
@@ -76,6 +78,7 @@ impl Default for FrameProfiler {
             pass_times: HashMap::new(),
             pass_order: Vec::new(),
             pass_draws: HashMap::new(),
+            pass_gpu: HashMap::new(),
             frame_start: Instant::now(),
             last_stats: FrameStats::default(),
         }
@@ -123,7 +126,7 @@ impl FrameProfiler {
                 name,
                 last_ms: *history.back().unwrap_or(&0.0),
                 avg_ms: rolling_avg(history),
-                gpu_ms: None,
+                gpu_ms: self.pass_gpu.get(name).copied(),
                 draws: self.pass_draws.get(name).copied(),
             })
         }).collect();
@@ -142,10 +145,10 @@ impl FrameProfiler {
         self.last_stats.memory = memory;
     }
 
-    pub fn apply_gpu_times(&mut self, gpu_times_ms: &[f32]) {
-        for (pass, &gpu_ms) in self.last_stats.passes.iter_mut().zip(gpu_times_ms.iter()) {
-            pass.gpu_ms = Some(gpu_ms);
-        }
+    /// GPU times from a read-back frame, kept until newer ones arrive: the stats are rebuilt every
+    /// frame, and setting them on the last stats lost them at the next `end_frame`.
+    pub fn apply_gpu_times(&mut self, gpu_times_ms: impl IntoIterator<Item = (&'static str, f32)>) {
+        self.pass_gpu.extend(gpu_times_ms);
     }
 
     pub fn stats(&self) -> &FrameStats {
@@ -158,6 +161,8 @@ pub struct GpuProfiler {
     resolve_buf: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
     num_passes: u32,
+    /// Pass names in the order of the resolved queries.
+    names: Vec<&'static str>,
     timestamp_period_ns: f32,
     ready: Arc<AtomicBool>,
     pending: bool,
@@ -193,6 +198,7 @@ impl GpuProfiler {
             resolve_buf,
             staging_buf,
             num_passes,
+            names: Vec::new(),
             timestamp_period_ns: queue.get_timestamp_period(),
             ready: Arc::new(AtomicBool::new(false)),
             pending: false,
@@ -208,10 +214,16 @@ impl GpuProfiler {
         encoder.write_timestamp(&self.query_set, pass_idx * 2 + 1);
     }
 
-    pub fn resolve(&self, encoder: &mut wgpu::CommandEncoder) -> bool {
+    pub fn num_passes(&self) -> u32 {
+        self.num_passes
+    }
+
+    /// Resolves this frame's queries for `names`, the passes in query order.
+    pub fn resolve(&mut self, encoder: &mut wgpu::CommandEncoder, names: Vec<&'static str>) -> bool {
         if self.pending {
             return false;
         }
+        self.names = names;
         encoder.resolve_query_set(&self.query_set, 0..self.num_passes * 2, &self.resolve_buf, 0);
         encoder.copy_buffer_to_buffer(&self.resolve_buf, 0, &self.staging_buf, 0, (self.num_passes as u64) * 2 * 8);
         true
@@ -231,9 +243,10 @@ impl GpuProfiler {
         self.pending = true;
     }
 
-    pub fn try_read_results(&mut self) -> bool {
+    /// The pass times of the last resolved frame, once read back.
+    pub fn try_read_results(&mut self) -> Option<Vec<(&'static str, f32)>> {
         if !self.pending || !self.ready.load(Ordering::Acquire) {
-            return false;
+            return None;
         }
 
         {
@@ -248,7 +261,7 @@ impl GpuProfiler {
         self.staging_buf.unmap();
         self.ready.store(false, Ordering::Release);
         self.pending = false;
-        true
+        Some(self.names.iter().copied().zip(self.last_gpu_times_ms.iter().copied()).collect())
     }
 }
 
