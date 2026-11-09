@@ -7,6 +7,7 @@ use engine_core::world::World;
 use crate::{
     debug_flags::{DebugFlagsGpu, RenderDebugFlags},
     graph::{NodeId, RenderGraph},
+    light::SHADOW_MASK_LAYERS,
     pass::ao::AoOutputs,
     pass::cluster_assignment::ClusterOutputs,
     pass::gbuffer::GBufferOutputs,
@@ -33,6 +34,45 @@ pub struct LightingOutputs {
 }
 
 pub const SPECULAR_WEIGHT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const SHADOW_MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// Half-resolution visibility of the most important shadowed lights, a layer each, which
+/// `fs_shadow_mask` renders and `fs_main` upsamples (`ShadowedLights::mask_slots`).
+struct ShadowMask {
+    size: (u32, u32),
+    view: wgpu::TextureView,
+    layers: Vec<wgpu::TextureView>,
+}
+
+impl ShadowMask {
+    fn new(device: &wgpu::Device, (width, height): (u32, u32)) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow_mask"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: SHADOW_MASK_LAYERS as u32 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SHADOW_MASK_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let layers = (0..SHADOW_MASK_LAYERS as u32)
+            .map(|layer| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Self { size: (width, height), view, layers }
+    }
+}
 
 fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
@@ -396,8 +436,12 @@ pub struct LightingPass {
     node_id: Option<NodeId>,
     shader: ShaderAsset,
     pipeline: Option<wgpu::RenderPipeline>,
+    mask_pipeline: Option<wgpu::RenderPipeline>,
     gbuffer_bgl: Option<wgpu::BindGroupLayout>,
     sampler: Option<wgpu::Sampler>,
+    shadow_mask: Option<ShadowMask>,
+    /// Bound in place of the shadow mask while it's being rendered.
+    mask_placeholder: Option<ShadowMask>,
 
     albedo_id: ResourceId,
     normal_id: ResourceId,
@@ -413,8 +457,9 @@ pub struct LightingPass {
     specular_weight_id: ResourceId,
     specular_fallback_id: ResourceId,
 
-    /// Keyed by the albedo, AO and glass view addresses (screen textures move on resize).
-    gbuffer_bg: Option<([usize; 4], wgpu::BindGroup)>,
+    /// Keyed by the albedo, AO, glass and shadow mask view addresses (screen textures move on
+    /// resize). The second binds the mask placeholder, for the mask pass.
+    gbuffer_bg: Option<([usize; 5], wgpu::BindGroup, wgpu::BindGroup)>,
 
     bindings: LightingBindings,
 
@@ -464,8 +509,11 @@ impl LightingPass {
                 node_id: None,
                 shader,
                 pipeline: None,
+                mask_pipeline: None,
                 gbuffer_bgl: None,
                 sampler: None,
+                shadow_mask: None,
+                mask_placeholder: None,
                 albedo_id: gbuffer.albedo_id,
                 normal_id: gbuffer.normal_id,
                 material_id: gbuffer.material_id,
@@ -569,6 +617,7 @@ impl Pass for LightingPass {
             .expect("debug_flags RwLock poisoned")
             .to_gpu();
         debug_flags_buf.write(queue, bytemuck::bytes_of(&gpu_flags));
+        let use_mask = gpu_flags.disable_shadow_mask == 0 && gpu_flags.disable_direct == 0;
 
         if self.pipeline.is_none() {
             let module = self
@@ -594,6 +643,7 @@ impl Pass for LightingPass {
                     texture_entry(16, wgpu::TextureViewDimension::D2, FILTERABLE),
                     texture_entry(17, wgpu::TextureViewDimension::D2, wgpu::TextureSampleType::Depth),
                     texture_entry(18, wgpu::TextureViewDimension::D2, FILTERABLE),
+                    texture_entry(19, wgpu::TextureViewDimension::D2Array, FILTERABLE),
                 ],
             });
 
@@ -638,6 +688,27 @@ impl Pass for LightingPass {
                 multiview_mask: None,
                 cache: None,
             });
+            let mask_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shadow_mask_pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_shadow_mask"),
+                    targets: &[(); SHADOW_MASK_LAYERS].map(|()| target(SHADOW_MASK_FORMAT)),
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
 
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("lighting_sampler"),
@@ -647,18 +718,33 @@ impl Pass for LightingPass {
             });
 
             self.pipeline = Some(pipeline);
+            self.mask_pipeline = Some(mask_pipeline);
             self.gbuffer_bgl = Some(gbuffer_bgl);
             self.sampler = Some(sampler);
+            self.mask_placeholder = Some(ShadowMask::new(device, (1, 1)));
         }
 
-        let (Some(pipeline), Some(gbuffer_bgl), Some(sampler)) = (&self.pipeline, &self.gbuffer_bgl, &self.sampler)
-        else {
+        let (width, height) = ctx.surface_size;
+        let mask_size = (width.div_ceil(2), height.div_ceil(2));
+        if self.shadow_mask.as_ref().is_none_or(|mask| mask.size != mask_size) {
+            self.shadow_mask = Some(ShadowMask::new(device, mask_size));
+        }
+
+        let (Some(pipeline), Some(mask_pipeline), Some(gbuffer_bgl), Some(sampler), Some(mask), Some(placeholder)) = (
+            &self.pipeline,
+            &self.mask_pipeline,
+            &self.gbuffer_bgl,
+            &self.sampler,
+            &self.shadow_mask,
+            &self.mask_placeholder,
+        ) else {
             return;
         };
 
-        let key = [albedo_view, ao_view, glass_depth_view, glass_transmittance_view].map(|v| std::ptr::from_ref(v) as usize);
-        if self.gbuffer_bg.as_ref().is_none_or(|(k, _)| *k != key) {
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let key = [albedo_view, ao_view, glass_depth_view, glass_transmittance_view, &mask.view]
+            .map(|v| std::ptr::from_ref(v) as usize);
+        if self.gbuffer_bg.as_ref().is_none_or(|(k, _, _)| *k != key) {
+            let bind_group = |mask_view| device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("lighting_gbuffer_bg"),
                 layout: gbuffer_bgl,
                 entries: &[
@@ -678,12 +764,35 @@ impl Pass for LightingPass {
                         binding: 18,
                         resource: wgpu::BindingResource::TextureView(glass_transmittance_view),
                     },
+                    wgpu::BindGroupEntry { binding: 19, resource: wgpu::BindingResource::TextureView(mask_view) },
                 ],
             });
-            self.gbuffer_bg = Some((key, bind_group));
+            self.gbuffer_bg = Some((key, bind_group(&mask.view), bind_group(&placeholder.view)));
         }
-        let Some((_, gbuffer_bg)) = self.gbuffer_bg.as_ref() else { return };
+        let Some((_, gbuffer_bg, mask_gbuffer_bg)) = self.gbuffer_bg.as_ref() else { return };
         let Some(lighting_bgs) = self.bindings.bind_groups(device, ctx) else { return };
+
+        if use_mask {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow_mask"),
+                color_attachments: &mask.layers.iter().map(|view| {
+                    Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { store: wgpu::StoreOp::Store, load: wgpu::LoadOp::Clear(wgpu::Color::WHITE) },
+                    })
+                }).collect::<Vec<_>>(),
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(mask_pipeline);
+            pass.set_bind_group(0, mask_gbuffer_bg, &[]);
+            for (i, bind_group) in lighting_bgs.iter().enumerate() {
+                pass.set_bind_group(i as u32 + 1, *bind_group, &[]);
+            }
+            pass.draw(0..3, 0..1);
+        }
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("lighting"),

@@ -202,6 +202,7 @@ pub fn layer_toggles(ui: &mut egui::Ui, flags: &mut RenderDebugFlags) {
     ui.checkbox(&mut flags.shadows, "Shadows");
     ui.checkbox(&mut flags.ambient_occlusion, "Ambient occlusion");
     ui.checkbox(&mut flags.contact_shadows, "Contact shadows");
+    ui.checkbox(&mut flags.shadow_mask, "Half-resolution shadows");
     ui.checkbox(&mut flags.emissive_lights, "Emissive lights");
     ui.checkbox(&mut flags.specular, "Specular");
     ui.checkbox(&mut flags.reflections, "Reflections");

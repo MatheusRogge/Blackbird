@@ -55,12 +55,39 @@ pub struct GpuSkyLight {
 /// Local lights with a shadow map in the atlas, one slot each; lights point at theirs through
 /// `shadow_slot`. Everything about a slot's map (origin, planes, tiles) is in the `shadow` pass's
 /// `LocalShadowParams`, written when the map is rendered, since rendering can lag the light.
-/// `count` is one past the last used slot.
+/// `count` is one past the last used slot. The `SHADOW_MASK_LAYERS` most important slots get a
+/// layer of `lighting`'s half-resolution shadow mask: `mask_slots[layer]` is the slot in it and
+/// `mask_layer[slot / 4][slot % 4]` the layer of a slot, `SHADOW_SLOT_NONE` for neither.
 #[repr(C)]
-#[derive(Copy, Clone, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShadowedLights {
     pub count: u32,
     pub _pad: [u32; 3],
+    pub mask_slots: [u32; SHADOW_MASK_LAYERS],
+    pub mask_layer: [[u32; 4]; MAX_SHADOWED_LIGHTS / 4],
+}
+
+impl ShadowedLights {
+    /// Masks the first `SHADOW_MASK_LAYERS` of `slots` (most important first).
+    pub fn new(count: u32, slots: impl IntoIterator<Item = u32>) -> Self {
+        let mut lights = Self {
+            count,
+            _pad: [0; 3],
+            mask_slots: [SHADOW_SLOT_NONE; SHADOW_MASK_LAYERS],
+            mask_layer: [[SHADOW_SLOT_NONE; 4]; MAX_SHADOWED_LIGHTS / 4],
+        };
+        for (layer, slot) in slots.into_iter().take(SHADOW_MASK_LAYERS).enumerate() {
+            lights.mask_slots[layer] = slot;
+            lights.mask_layer[slot as usize / 4][slot as usize % 4] = layer as u32;
+        }
+        lights
+    }
+}
+
+impl Default for ShadowedLights {
+    fn default() -> Self {
+        Self::new(0, [])
+    }
 }
 
 /// A single-face spot light shadow: the light's direction and tan of half the field of view.
@@ -126,6 +153,9 @@ pub const SHADOW_KIND_POINT: u32 = 0;
 pub const SHADOW_KIND_SPOT: u32 = 1;
 pub const SHADOW_KIND_AREA: u32 = 2;
 pub const SHADOW_SLOT_NONE: u32 = u32::MAX;
+/// Layers of `lighting`'s half-resolution shadow mask (one shadowed light each). Mirrored in
+/// `lighting.wgsl`.
+pub const SHADOW_MASK_LAYERS: usize = 4;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]

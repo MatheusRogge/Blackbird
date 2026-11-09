@@ -14,6 +14,9 @@
 // none) and the light it lets through (rgb), for contact shadows.
 @group(0) @binding(17) var t_glass_depth: texture_depth_2d;
 @group(0) @binding(18) var t_glass_transmittance: texture_2d<f32>;
+// Half-resolution shadow mask (`fs_shadow_mask`), a layer per masked light. Only `fs_main` reads
+// it: the mask pass binds a placeholder here.
+@group(0) @binding(19) var t_shadow_mask: texture_2d_array<f32>;
 
 // Probe atlases + params
 const PROBES_PER_ROW: u32 = 30u;
@@ -78,6 +81,7 @@ struct DebugFlags {
     disable_reflections: u32,
     disable_ssr:      u32,
     disable_contact_shadows: u32,
+    disable_shadow_mask: u32,
 }
 
 @group(4) @binding(0) var<uniform> debug: DebugFlags;
@@ -86,6 +90,10 @@ struct DebugFlags {
 // slot's maps and the light they were rendered for are in `local_shadow.faces`.
 struct ShadowedLights {
     count: u32,
+    // The slot in each shadow mask layer, and each slot's layer (slot / 4, slot % 4);
+    // SHADOW_SLOT_NONE for none.
+    mask_slots: vec4<u32>,
+    mask_layer: array<vec4<u32>, 8>,
 }
 
 // Mirrors rendering::light::SHADOW_SLOT_NONE.
@@ -326,6 +334,27 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> ve
 fn local_shadow_of(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
     if debug.disable_shadows != 0u || slot == SHADOW_SLOT_NONE { return vec3f(1.0); }
     return light_shadow(slot, pos, N, pixel);
+}
+
+// Mirrors rendering::light::SHADOW_MASK_LAYERS.
+const SHADOW_MASK_LAYERS: u32 = 4u;
+// This pixel's upsampled shadow mask, one entry per layer, when `mask_ready` (set by `fs_main`
+// only, so forward shading always looks shadows up itself).
+var<private> mask_vis: array<vec3<f32>, 4>;
+var<private> mask_ready: bool = false;
+
+// Shadow map and contact visibility of a local light (`slot`, toward `L_ws` over `max_length`):
+// from the shadow mask if the light has a layer there, else looked up here. `shadow_N` offsets the
+// shadow map lookup, `geo_N` starts the contact march (see `contact_shadow`).
+fn local_visibility(slot: u32, pos_ws: vec3<f32>, shadow_N: vec3<f32>, pixel: vec2<f32>, geo_N: vec3<f32>, L_ws: vec3<f32>, max_length: f32, contact_glass: bool) -> vec3<f32> {
+    if mask_ready && slot != SHADOW_SLOT_NONE {
+        let layer = shadowed.mask_layer[slot / 4u][slot % 4u];
+        if layer != SHADOW_SLOT_NONE {
+            return mask_vis[layer];
+        }
+    }
+    return min(local_shadow_of(slot, pos_ws, shadow_N, pixel),
+        contact_shadow(select(vec3f(0.0), geo_N, slot != SHADOW_SLOT_NONE), pos_ws, L_ws, max_length, contact_glass));
 }
 
 fn octahedral_encode(n: vec3<f32>) -> vec2<f32> {
@@ -919,8 +948,8 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
             continue;
         }
 
-        let vis = min(local_shadow_of(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel),
-            contact_shadow(select(vec3f(0.0), geo_N, light.shadow_slot != SHADOW_SLOT_NONE), pos_ws, view_to_world_dir(to_light / dist), dist, contact_glass));
+        let vis = local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
+            view_to_world_dir(to_light / dist), dist, contact_glass);
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
         color += sphere_light_brdf(surf_vs, to_light, dist, light.source_radius) * light.color * vis
             * (light.intensity * falloff);
@@ -938,8 +967,8 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let L  = to_light / dist;
         let cd = dot(-L, normalize(light.direction_vs));
         let t  = clamp((cd - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
-        let vis = min(local_shadow_of(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel),
-            contact_shadow(select(vec3f(0.0), geo_N, light.shadow_slot != SHADOW_SLOT_NONE), pos_ws, view_to_world_dir(to_light / dist), dist, contact_glass));
+        let vis = local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
+            view_to_world_dir(L), dist, contact_glass);
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
         color += sphere_light_brdf(surf_vs, to_light, dist, light.source_radius) * light.color * vis
             * (light.intensity * t * t * falloff);
@@ -971,8 +1000,8 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let area     = 4.0 * half_r * half_u;
         let normal   = normalize(cross(r_dir, u_dir));
         let radiance = light.color * light.intensity
-            * min(local_shadow_of(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel),
-                contact_shadow(select(vec3f(0.0), geo_N, light.shadow_slot != SHADOW_SLOT_NONE), pos_ws, view_to_world_dir(L), sqrt(dist2), contact_glass));
+            * local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
+                view_to_world_dir(L), sqrt(dist2), contact_glass);
         let facing   = area_facing(light, -L, normal);
         color += diffuse_brdf(surf_vs, L) * radiance * (facing * area / (dist2 + area));
 
@@ -1243,12 +1272,112 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
     }
 
     if debug.disable_direct == 0u {
+        if debug.disable_shadow_mask == 0u && shadowed.mask_slots.x != SHADOW_SLOT_NONE {
+            upsample_shadow_mask(frag_xy, pos_ws, N, depth_vs);
+        }
         color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, depth_vs, false, geometric_normal(frag_xy, pos_ws, view_dir), true);
     }
 
     color += emissive;
     out.lit = vec4<f32>(color * cp.exposure, 1.0);
     return out;
+}
+
+// Shadow mask texels further than this fraction of the view depth from a pixel's tangent plane
+// don't contribute to it.
+const MASK_PLANE_TOLERANCE: f32 = 0.02;
+
+// The shadow mask at full-resolution `pixel`. Mask texel q holds pixel 2q, so an even pixel reads
+// its own texel and the others interpolate their 2 or 4 neighbours, weighted by how close each
+// one's surface is to this pixel's tangent plane and normal, so shadows don't bleed across depth
+// edges or creases. Where none is close it takes the closest.
+fn upsample_shadow_mask(pixel: vec2<i32>, pos_ws: vec3<f32>, N: vec3<f32>, depth_vs: f32) {
+    let size = vec2<i32>(textureDimensions(t_shadow_mask));
+    let p = vec2f(pixel) * 0.5;
+    let base = vec2<i32>(floor(p));
+    let f = p - floor(p);
+    var weights = vec4f(0.0);
+    var texels: array<vec2<i32>, 4>;
+    var closest = 0u;
+    var closest_dist = 1e30;
+    for (var i = 0u; i < 4u; i++) {
+        let o = vec2<i32>(i32(i & 1u), i32(i >> 1u));
+        let bilinear = mix(1.0 - f.x, f.x, f32(o.x)) * mix(1.0 - f.y, f.y, f32(o.y));
+        texels[i] = min(base + o, size - 1);
+        if bilinear == 0.0 {
+            continue;
+        }
+        let at = gbuffer_pos_ws(texels[i] * 2);
+        let plane_dist = select(abs(dot(at.xyz - pos_ws, N)), 1e20, at.w == 0.0);
+        let n = normalize(textureLoad(t_normal, texels[i] * 2, 0).rgb * 2.0 - 1.0);
+        weights[i] = bilinear * saturate(1.0 - plane_dist / (MASK_PLANE_TOLERANCE * depth_vs))
+            * pow(saturate(dot(n, N)), 4.0);
+        if plane_dist < closest_dist {
+            closest_dist = plane_dist;
+            closest = i;
+        }
+    }
+    let total = weights.x + weights.y + weights.z + weights.w;
+    if total < 1e-3 {
+        weights = vec4f(0.0);
+        weights[closest] = 1.0;
+    } else {
+        weights /= total;
+    }
+    for (var layer = 0u; layer < SHADOW_MASK_LAYERS; layer++) {
+        if shadowed.mask_slots[layer] == SHADOW_SLOT_NONE {
+            break;
+        }
+        var vis = vec3f(0.0);
+        for (var i = 0u; i < 4u; i++) {
+            if weights[i] > 0.0 {
+                vis += weights[i] * textureLoad(t_shadow_mask, texels[i], layer, 0).rgb;
+            }
+        }
+        mask_vis[layer] = vis;
+    }
+    mask_ready = true;
+}
+
+struct ShadowMaskOutput {
+    @location(0) layer0: vec4<f32>,
+    @location(1) layer1: vec4<f32>,
+    @location(2) layer2: vec4<f32>,
+    @location(3) layer3: vec4<f32>,
+}
+
+// The shadow mask: shadow map and contact visibility (`local_visibility`) of the lights in
+// `shadowed.mask_slots`, one per target, at every other pixel in both axes. Lights are seen from
+// their shadow origin, so area lights' contact rays aim at their centre rather than the closest
+// point. Out of a light's range it's 1.
+@fragment
+fn fs_shadow_mask(in: VertexOutput) -> ShadowMaskOutput {
+    var vis = array<vec3<f32>, 4>(vec3f(1.0), vec3f(1.0), vec3f(1.0), vec3f(1.0));
+    let size = vec2<i32>(i32(cp.screen_w), i32(cp.screen_h));
+    let pixel = min(vec2<i32>(in.pos.xy) * 2, size - 1);
+    let at = gbuffer_pos_ws(pixel);
+    if at.w != 0.0 {
+        let pos_ws = at.xyz;
+        let N = normalize(textureLoad(t_normal, pixel, 0).rgb * 2.0 - 1.0);
+        let view_dir = normalize(camera.inv_view[3].xyz - pos_ws);
+        let geo_N = geometric_normal(pixel, pos_ws, view_dir);
+        let frag = vec2f(pixel) + 0.5;
+        for (var layer = 0u; layer < SHADOW_MASK_LAYERS; layer++) {
+            let slot = shadowed.mask_slots[layer];
+            if slot == SHADOW_SLOT_NONE {
+                break;
+            }
+            let face = local_shadow.faces[slot * 6u];
+            let to_light = face.light.xyz - pos_ws;
+            let dist = length(to_light);
+            if face.shape.x == 0.0 || dist >= face.shape.w {
+                continue;
+            }
+            let L = to_light / dist;
+            vis[layer] = local_visibility(slot, pos_ws, select(N, -N, dot(N, L) < 0.0), frag, geo_N, L, dist, true);
+        }
+    }
+    return ShadowMaskOutput(vec4f(vis[0], 1.0), vec4f(vis[1], 1.0), vec4f(vis[2], 1.0), vec4f(vis[3], 1.0));
 }
 
 // ---------------------------------------------------------------------------------------------

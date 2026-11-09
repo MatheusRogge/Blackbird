@@ -12,7 +12,8 @@ pub struct DebugFlagsGpu {
     pub disable_reflections: u32,
     pub disable_ssr:      u32,
     pub disable_contact_shadows: u32,
-    pub _pad: [u32; 3],
+    pub disable_shadow_mask: u32,
+    pub _pad: [u32; 2],
 }
 
 /// What the `lighting` pass outputs: the lit image, or one G-buffer target as-is.
@@ -71,6 +72,9 @@ pub struct RenderDebugFlags {
     pub ambient_occlusion: bool,
     /// Short screen-space shadow rays toward the sky light and shadowed local lights (`lighting`).
     pub contact_shadows: bool,
+    /// Local light shadows (maps and contact) of the most important lights at half resolution,
+    /// upsampled (`lighting`'s shadow mask). Off: every pixel looks its shadows up itself.
+    pub shadow_mask: bool,
     pub view:     GBufferView,
 
     pub show_bvh:        bool,
@@ -101,6 +105,7 @@ impl Default for RenderDebugFlags {
             particles: true,
             ambient_occlusion: true,
             contact_shadows: true,
+            shadow_mask: true,
             view:     GBufferView::Lit,
 
             show_bvh:        false,
@@ -130,7 +135,8 @@ impl RenderDebugFlags {
             disable_reflections: !self.reflections as u32,
             disable_ssr:      !self.ssr as u32,
             disable_contact_shadows: !self.contact_shadows as u32,
-            _pad: [0; 3],
+            disable_shadow_mask: !self.shadow_mask as u32,
+            _pad: [0; 2],
         }
     }
 }
