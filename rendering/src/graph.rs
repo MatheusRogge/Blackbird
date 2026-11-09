@@ -488,6 +488,7 @@ impl RenderGraph {
         self.profiler.stats()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn execute(
         &mut self,
         device: &wgpu::Device,
