@@ -174,11 +174,17 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> ve
     let rot = mat2x2<f32>(cos(angle), sin(angle), -sin(angle), cos(angle));
     // Tangent of the field of view to texels of this face.
     let to_texels = size / (2.0 * tan_half);
+    // Glass in the tint atlas (alpha: its distance along the face axis, like `clip.w`) shadows the
+    // receiver when it's in front by more than one tint texel, so glass doesn't tint itself.
+    let tint_atlas = vec2f(textureDimensions(t_local_glass_tint));
+    let tint_texel = 2.0 * dist * tan_half / (f.rect.z * tint_atlas.x);
+    let glass_reference = clip.w - tint_texel;
 
     var radius_texels = 1.5;
     if light.w > 0.0 {
         // Blocker search over where occluders as far as two thirds of the way back to the light
         // can still partly hide it: light size × (receiver − blocker) / (receiver × blocker).
+        // Glass counts as a blocker too, so its shadows soften with distance like opaque ones.
         let receiver = clip.w;
         let search_texels = clamp(2.0 * light.w / receiver * to_texels, 1.5, MAX_PENUMBRA_TEXELS);
         let atlas = vec2f(textureDimensions(t_local_shadow));
@@ -194,6 +200,11 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> ve
                 blockers += 1.0;
                 blocker_depth += shape.z * shape.w / (shape.w - z * (shape.w - shape.z));
             }
+            let glass = textureLoad(t_local_glass_tint, vec2<i32>((f.rect.xy + tap * f.rect.z) * tint_atlas), 0).a;
+            if glass < glass_reference {
+                blockers += 1.0;
+                blocker_depth += glass;
+            }
         }
         if blockers == 0.0 {
             radius_texels = 0.0;
@@ -203,25 +214,24 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> ve
         }
     }
 
-    var lit = 12.0;
-    if radius_texels > 0.0 {
-        let radius = radius_texels / size;
-        let max_dz = max_dz_per_texel * radius_texels;
-        lit = 0.0;
-        for (var i = 0u; i < 12u; i++) {
-            let offset = rot * POISSON[i] * radius;
-            let tap = clamp(uv + offset, vec2f(half_texel), vec2f(1.0 - half_texel));
-            let depth = ndc.z + clamp(dot(slope, offset), -max_dz, max_dz);
-            lit += textureSampleCompareLevel(t_local_shadow, s_shadow, f.rect.xy + tap * f.rect.z, depth);
-        }
-        if lit == 0.0 {
-            return vec3f(0.0);
+    if radius_texels == 0.0 {
+        return local_glass_tint(uv, f.rect, glass_reference);
+    }
+    // Each tap is the opaque comparison times the glass transmittance there, so glass shadows get
+    // the same kernel (and penumbra) as opaque ones.
+    let radius = radius_texels / size;
+    let max_dz = max_dz_per_texel * radius_texels;
+    var lit = vec3f(0.0);
+    for (var i = 0u; i < 12u; i++) {
+        let offset = rot * POISSON[i] * radius;
+        let tap = clamp(uv + offset, vec2f(half_texel), vec2f(1.0 - half_texel));
+        let depth = ndc.z + clamp(dot(slope, offset), -max_dz, max_dz);
+        let opaque = textureSampleCompareLevel(t_local_shadow, s_shadow, f.rect.xy + tap * f.rect.z, depth);
+        if opaque > 0.0 {
+            lit += opaque * local_glass_tint(tap, f.rect, glass_reference);
         }
     }
-    // One glass-tint texel of slack, so glass doesn't tint itself.
-    let tint_size = f.rect.z * f32(textureDimensions(t_local_glass_tint).x);
-    let tint_texel = 2.0 * dist * tan_half / tint_size;
-    return lit / 12.0 * local_glass_tint(uv, f.rect, clip.w - tint_texel);
+    return lit / 12.0;
 }
 
 // Visibility of a local light at this pixel, tinted by glass: its shadow if it has a shadow slot,
