@@ -148,8 +148,23 @@ fn hit_color(hit_px: vec2<f32>, hit_uv: vec2<f32>, hit_depth: f32, glass: bool) 
     return textureSampleLevel(t_lit, s_linear, hit_uv, 0.0).rgb;
 }
 
+struct SsrOutput {
+    // Premultiplied hit colour, a: confidence.
+    @location(0) color: vec4<f32>,
+    // World distance from the surface to the hit, 0 without one: ssr_temporal reprojects the
+    // reflection, which moves like a point this far behind the surface.
+    @location(1) ray_length: f32,
+}
+
+var<private> ray_length: f32 = 0.0;
+
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOutput) -> SsrOutput {
+    let color = trace_reflection(in);
+    return SsrOutput(color, select(0.0, ray_length, color.a > 0.0));
+}
+
+fn trace_reflection(in: VertexOutput) -> vec4<f32> {
     let px = vec2<i32>(in.pos.xy);
     let dims = vec2<f32>(textureDimensions(t_hiz));
 
@@ -215,6 +230,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     let hit_uv = hit_px / dims;
     let color = hit_color(hit_px, hit_uv, hit.y, glass);
+    let hit4 = camera.inv_view_proj * vec4f(hit_uv.x * 2.0 - 1.0, 1.0 - hit_uv.y * 2.0, hit.y, 1.0);
+    ray_length = distance(hit4.xyz / hit4.w, pos);
 
     let edge = min(hit_uv, 1.0 - hit_uv);
     let confidence = smoothstep(0.0, 0.08, min(edge.x, edge.y))

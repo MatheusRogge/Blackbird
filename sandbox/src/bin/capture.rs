@@ -14,6 +14,11 @@
 //!   --point x,y,z,I[,r]  add a white point light of I candela (range 10), source radius r (default 0)
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
 //!   --burst N            every particle emitter bursts N particles on the second frame
+//!   --move dx,dy,dz      over the last --move-frames frames, move the camera by this much per frame
+//!   --turn D             ... and turn it left by D degrees per frame
+//!   --move-frames N      default 0
+//!   --no-animation       keep scene animations (e.g. flickering lamps) at their first frame
+//!   --sequence           also write each moving frame, as <out>_<frame>.png
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -52,6 +57,11 @@ struct Options {
     points: Vec<(Vec3, f32, f32)>,
     stats: bool,
     flags: RenderDebugFlags,
+    step: Vec3,
+    turn: f32,
+    move_frames: u32,
+    sequence: bool,
+    animate: bool,
 }
 
 fn parse_vec3(s: &str) -> Result<Vec3> {
@@ -80,6 +90,11 @@ fn parse_args() -> Result<Options> {
         points: Vec::new(),
         stats: false,
         flags: RenderDebugFlags::default(),
+        step: Vec3::zero(),
+        turn: 0.0,
+        move_frames: 0,
+        sequence: false,
+        animate: true,
     };
 
     while let Some(arg) = args.next() {
@@ -98,6 +113,11 @@ fn parse_args() -> Result<Options> {
             "--exposure" => options.exposure = Some(value()?.parse()?),
             "--reloads" => options.reloads = value()?.parse()?,
             "--burst" => options.burst = value()?.parse()?,
+            "--move" => options.step = parse_vec3(&value()?)?,
+            "--turn" => options.turn = value()?.parse::<f32>()?.to_radians(),
+            "--move-frames" => options.move_frames = value()?.parse()?,
+            "--sequence" => options.sequence = true,
+            "--no-animation" => options.animate = false,
             "--point" => {
                 let v = value()?;
                 let parts: Vec<&str> = v.split(',').collect();
@@ -247,6 +267,15 @@ fn clear_scene(world: &mut World) {
     remove::<ParticleEmitter>(world);
 }
 
+fn move_camera(world: &mut World, step: Vec3, turn: f32) {
+    let Some(camera) = world.get_entities_mut::<Camera>().into_iter().next() else { return };
+    let forward = camera.target - camera.eye;
+    let (sin, cos) = turn.sin_cos();
+    let forward = Vec3::new(forward.x * cos + forward.z * sin, forward.y, forward.z * cos - forward.x * sin);
+    camera.eye += step;
+    camera.target = camera.eye + forward;
+}
+
 fn shader(name: &str) -> Result<ShaderAsset> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shaders").join(name);
     let source = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -288,8 +317,14 @@ fn main() -> Result<()> {
     }
     for frame in 0..options.frames {
         world.tick_all(CAPTURE_FRAME_TIME);
-        for scene in &mut scenes {
-            scene.animate(&mut world, CAPTURE_FRAME_TIME);
+        if options.animate {
+            for scene in &mut scenes {
+                scene.animate(&mut world, CAPTURE_FRAME_TIME);
+            }
+        }
+        let moving = frame + options.move_frames >= options.frames;
+        if moving {
+            move_camera(&mut world, options.step, options.turn);
         }
         if frame == 1 && options.burst > 0 {
             for emitter in world.get_entities_mut::<ParticleEmitter>() {
@@ -300,10 +335,17 @@ fn main() -> Result<()> {
         if options.stats {
             eprintln!("{}", renderer.frame_stats());
         }
+        if moving && options.sequence {
+            let stem = options.out.with_extension("");
+            save(&renderer, &PathBuf::from(format!("{}_{frame:04}.png", stem.display())))?;
+        }
     }
+    save(&renderer, &options.out)
+}
 
+fn save(renderer: &Renderer, path: &Path) -> Result<()> {
     let frame = renderer.read_frame()?;
-    image::save_buffer(&options.out, &frame.rgba, frame.width, frame.height, image::ExtendedColorType::Rgba8)?;
-    println!("wrote {}", options.out.display());
+    image::save_buffer(path, &frame.rgba, frame.width, frame.height, image::ExtendedColorType::Rgba8)?;
+    println!("wrote {}", path.display());
     Ok(())
 }

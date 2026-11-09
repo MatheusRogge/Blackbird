@@ -200,7 +200,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
 
         let prev_frame = FrameHistory::default();
         let prev_glass_frame = FrameHistory::default();
-        let (ssr_pass, ssr_id) = SsrPass::new(
+        let (ssr_pass, ssr_id, ssr_ray_length_id) = SsrPass::new(
             &mut graph,
             SsrInputs {
                 depth_id: gbuffer_outputs.depth_id,
@@ -220,6 +220,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         let (ssr_temporal_pass, ssr_resolved_id) = SsrTemporalPass::new(
             &mut graph,
             ssr_id,
+            ssr_ray_length_id,
             gbuffer_outputs.depth_id,
             lighting_outputs.specular_weight_id,
             camera_buffer_id,

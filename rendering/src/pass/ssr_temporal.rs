@@ -1,5 +1,5 @@
-//! Temporal accumulation of SSR: blends the jittered per-frame `ssr` output into a reprojected
-//! history (`ssr_temporal.wgsl`). `composite` reads the result instead of raw `ssr`.
+//! Temporal accumulation of SSR: blends the jittered per-frame `ssr` output into a history
+//! reprojected by `ssr`'s ray lengths (`ssr_temporal.wgsl`). `composite` reads the result instead of raw `ssr`.
 
 use engine_core::world::World;
 
@@ -23,6 +23,7 @@ pub struct SsrTemporalPass {
     node_id: Option<NodeId>,
     shader: ShaderAsset,
     ssr_id: ResourceId,
+    ray_length_id: ResourceId,
     depth_id: ResourceId,
     specular_weight_id: ResourceId,
     camera_buffer_id: ResourceId,
@@ -37,6 +38,7 @@ impl SsrTemporalPass {
     pub fn new(
         graph: &mut RenderGraph,
         ssr_id: ResourceId,
+        ray_length_id: ResourceId,
         depth_id: ResourceId,
         specular_weight_id: ResourceId,
         camera_buffer_id: ResourceId,
@@ -52,6 +54,7 @@ impl SsrTemporalPass {
             node_id: None,
             shader,
             ssr_id,
+            ray_length_id,
             depth_id,
             specular_weight_id,
             camera_buffer_id,
@@ -99,6 +102,7 @@ impl SsrTemporalPass {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                texture(6, float),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -171,7 +175,7 @@ impl PassDesc for SsrTemporalPass {
     }
 
     fn reads(&self) -> Vec<ResourceId> {
-        vec![self.ssr_id, self.depth_id, self.specular_weight_id, self.camera_buffer_id]
+        vec![self.ssr_id, self.ray_length_id, self.depth_id, self.specular_weight_id, self.camera_buffer_id]
     }
 
     fn writes(&self) -> Vec<ResourceId> {
@@ -197,10 +201,11 @@ impl Pass for SsrTemporalPass {
         ctx: &PassContext<'_>,
         _world: &World,
     ) {
-        let (Some(&output_view), Some(&output), Some(&ssr), Some(&depth), Some(&weight), Some(&camera)) = (
+        let (Some(&output_view), Some(&output), Some(&ssr), Some(&ray_length), Some(&depth), Some(&weight), Some(&camera)) = (
             ctx.views.get(&self.output_id),
             ctx.textures.get(&self.output_id),
             ctx.views.get(&self.ssr_id),
+            ctx.views.get(&self.ray_length_id),
             ctx.views.get(&self.depth_id),
             ctx.views.get(&self.specular_weight_id),
             ctx.buffers.get(&self.camera_buffer_id),
@@ -216,7 +221,7 @@ impl Pass for SsrTemporalPass {
         }
         let (Some((pipeline, layout, sampler)), Some(history)) = (&self.pipeline, &self.history) else { return };
 
-        let key: Vec<usize> = [ssr, depth, weight].iter().map(|v| std::ptr::from_ref(*v) as usize).collect();
+        let key: Vec<usize> = [ssr, ray_length, depth, weight].iter().map(|v| std::ptr::from_ref(*v) as usize).collect();
         if self.bind_group.as_ref().is_none_or(|(k, _)| *k != key) {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ssr_temporal"),
@@ -228,6 +233,7 @@ impl Pass for SsrTemporalPass {
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(weight) },
                     wgpu::BindGroupEntry { binding: 4, resource: camera.binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sampler) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(ray_length) },
                 ],
             });
             self.bind_group = Some((key, bind_group));

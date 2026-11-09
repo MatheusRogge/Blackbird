@@ -1,7 +1,10 @@
 // Temporal accumulation for SSR (rendering::pass::ssr_temporal). The ray start is jittered per frame
 // in ssr.wgsl; this blends each frame into a reprojected history, so the jitter averages out
-// instead of showing as noise. History is clipped to the current neighbourhood's colour spread
-// (variance clipping), so disocclusions and moving reflections don't ghost.
+// instead of showing as noise. A reflection moves with the reflected point's mirror image, which
+// lies the hit's ray length behind the surface along the view ray, so the history is reprojected
+// from there (Stachowiak, "Stochastic Screen-Space Reflections", 2015); reprojecting the surface
+// itself smeared reflections whenever the camera moved. History is clipped to the current
+// neighbourhood's colour spread (variance clipping), so disocclusions don't ghost.
 
 // Premultiplied SSR colour, a: confidence. Written by ssr.wgsl.
 @group(0) @binding(0) var t_ssr:             texture_2d<f32>;
@@ -12,6 +15,8 @@
 @group(0) @binding(3) var t_specular_weight: texture_2d<f32>;
 @group(0) @binding(4) var<uniform> camera:   CameraUniform;
 @group(0) @binding(5) var s_linear:          sampler;
+// World distance from the surface to the SSR hit, 0 without one. Written by ssr.wgsl.
+@group(0) @binding(6) var t_ray_length:      texture_2d<f32>;
 
 struct CameraUniform {
     view_proj:      mat4x4<f32>,
@@ -48,12 +53,42 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return current;
     }
 
-    // Reproject by the surface's own motion: exact for the camera moving over a static scene;
-    // reflections move a little differently, which the clip below absorbs.
+    var m1 = vec4f(0.0);
+    var m2 = vec4f(0.0);
+    var lo = vec4f(1e10);
+    var hi = vec4f(-1e10);
+    // Jittered rays miss now and then: average the hits around the pixel.
+    var ray_sum = 0.0;
+    var ray_hits = 0.0;
     let dims = vec2<f32>(textureDimensions(t_ssr));
+    let last = vec2<i32>(dims) - 1;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let p = clamp(px + vec2<i32>(x, y), vec2<i32>(0), last);
+            let s = textureLoad(t_ssr, p, 0);
+            m1 += s;
+            m2 += s * s;
+            if x != 0 || y != 0 {
+                lo = min(lo, s);
+                hi = max(hi, s);
+            }
+            let ray = textureLoad(t_ray_length, p, 0).r;
+            if ray > 0.0 {
+                ray_sum += ray;
+                ray_hits += 1.0;
+            }
+        }
+    }
+
     let uv = in.pos.xy / dims;
     let world4 = camera.inv_view_proj * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    let prev = camera.prev_view_proj * vec4f(world4.xyz / world4.w, 1.0);
+    let surface = world4.xyz / world4.w;
+    let eye = camera.inv_view[3].xyz;
+    var point = surface;
+    if ray_hits > 0.0 {
+        point += normalize(surface - eye) * (ray_sum / ray_hits);
+    }
+    let prev = camera.prev_view_proj * vec4f(point, 1.0);
     if prev.w <= 0.0 {
         return current;
     }
@@ -62,22 +97,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return current;
     }
 
-    var m1 = vec4f(0.0);
-    var m2 = vec4f(0.0);
-    var lo = vec4f(1e10);
-    var hi = vec4f(-1e10);
-    let last = vec2<i32>(dims) - 1;
-    for (var y = -1; y <= 1; y++) {
-        for (var x = -1; x <= 1; x++) {
-            let s = textureLoad(t_ssr, clamp(px + vec2<i32>(x, y), vec2<i32>(0), last), 0);
-            m1 += s;
-            m2 += s * s;
-            if x != 0 || y != 0 {
-                lo = min(lo, s);
-                hi = max(hi, s);
-            }
-        }
-    }
     // A ray that lands on a tiny highlight none of its neighbours see is a firefly: keep it
     // within the neighbours' range so it can't brand itself into the history.
     let current_clamped = clamp(current, lo, hi);

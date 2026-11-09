@@ -1,6 +1,7 @@
 //! Screen-space reflections: builds a Hi-Z pyramid of the G-buffer depth (`hiz.wgsl`, embedded),
 //! then traces each reflection ray through it (`ssr.wgsl`). Writes premultiplied hit colour with
-//! confidence in alpha, which `ssr_temporal` accumulates and `composite` blends. Hits read last
+//! confidence in alpha, which `ssr_temporal` accumulates and `composite` blends, and each hit's
+//! ray length, which `ssr_temporal` reprojects reflections by. Hits read last
 //! frame's `composite` output (`prev_frame`), reprojected, so reflections show reflections. The
 //! Hi-Z also holds the `ao` pass's glass depth, and glass hits read last frame's `transparent`
 //! output instead.
@@ -18,6 +19,7 @@ use crate::{
 const HIZ_SHADER: &str = include_str!("hiz.wgsl");
 const HIZ_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const RAY_LENGTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
 
 pub struct SsrInputs {
     pub depth_id: ResourceId,
@@ -65,6 +67,7 @@ pub struct SsrPass {
     shader: ShaderAsset,
     inputs: SsrInputs,
     output_id: ResourceId,
+    ray_length_id: ResourceId,
     pipelines: Option<Pipelines>,
     hiz: Option<Hiz>,
     /// Keyed by the input view addresses (screen textures move on resize).
@@ -72,21 +75,27 @@ pub struct SsrPass {
 }
 
 impl SsrPass {
-    pub fn new(graph: &mut RenderGraph, inputs: SsrInputs, shader: ShaderAsset) -> (Self, ResourceId) {
-        let output_id = graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
-            format: OUTPUT_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        });
+    /// Returns the pass, its colour output and its ray length output (world units, 0 = no hit).
+    pub fn new(graph: &mut RenderGraph, inputs: SsrInputs, shader: ShaderAsset) -> (Self, ResourceId, ResourceId) {
+        let mut screen = |format| {
+            graph.alloc_resource_id(ResourceDescriptor::ScreenTexture {
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            })
+        };
+        let output_id = screen(OUTPUT_FORMAT);
+        let ray_length_id = screen(RAY_LENGTH_FORMAT);
         let pass = Self {
             node_id: None,
             shader,
             inputs,
             output_id,
+            ray_length_id,
             pipelines: None,
             hiz: None,
             trace_bg: None,
         };
-        (pass, output_id)
+        (pass, output_id, ray_length_id)
     }
 
     fn create_pipelines(&self, device: &wgpu::Device) -> Pipelines {
@@ -113,7 +122,8 @@ impl SsrPass {
         let unfilterable = wgpu::TextureSampleType::Float { filterable: false };
         let float = wgpu::TextureSampleType::Float { filterable: true };
 
-        let pipeline = |label, module: &wgpu::ShaderModule, layout: &wgpu::BindGroupLayout, fs, format: wgpu::TextureFormat| {
+        let pipeline = |label, module: &wgpu::ShaderModule, layout: &wgpu::BindGroupLayout, fs, formats: &[wgpu::TextureFormat]| {
+            let targets: Vec<_> = formats.iter().map(|&f| Some(f.into())).collect();
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(label),
                 bind_group_layouts: &[Some(layout)],
@@ -131,7 +141,7 @@ impl SsrPass {
                 fragment: Some(wgpu::FragmentState {
                     module,
                     entry_point: Some(fs),
-                    targets: &[Some(format.into())],
+                    targets: &targets,
                     compilation_options: Default::default(),
                 }),
                 primitive: wgpu::PrimitiveState::default(),
@@ -177,7 +187,7 @@ impl SsrPass {
             entries: &[texture(1, unfilterable)],
         });
         Pipelines {
-            trace: pipeline("ssr", &trace_module, &trace_layout, "fs_main", OUTPUT_FORMAT),
+            trace: pipeline("ssr", &trace_module, &trace_layout, "fs_main", &[OUTPUT_FORMAT, RAY_LENGTH_FORMAT]),
             trace_layout,
             sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("ssr"),
@@ -185,8 +195,8 @@ impl SsrPass {
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             }),
-            hiz_copy: pipeline("hiz_copy", &hiz_module, &hiz_copy_layout, "fs_copy", HIZ_FORMAT),
-            hiz_reduce: pipeline("hiz_reduce", &hiz_module, &hiz_reduce_layout, "fs_reduce", HIZ_FORMAT),
+            hiz_copy: pipeline("hiz_copy", &hiz_module, &hiz_copy_layout, "fs_copy", &[HIZ_FORMAT]),
+            hiz_reduce: pipeline("hiz_reduce", &hiz_module, &hiz_reduce_layout, "fs_reduce", &[HIZ_FORMAT]),
             hiz_copy_layout,
             hiz_reduce_layout,
         }
@@ -234,15 +244,21 @@ impl SsrPass {
     }
 }
 
-fn fullscreen(encoder: &mut wgpu::CommandEncoder, label: &str, target: &wgpu::TextureView, pipeline: &wgpu::RenderPipeline, bind_group: &wgpu::BindGroup) {
+fn fullscreen(encoder: &mut wgpu::CommandEncoder, label: &str, targets: &[&wgpu::TextureView], pipeline: &wgpu::RenderPipeline, bind_group: &wgpu::BindGroup) {
+    let attachments: Vec<_> = targets
+        .iter()
+        .map(|&view| {
+            Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+            })
+        })
+        .collect();
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: target,
-            depth_slice: None,
-            resolve_target: None,
-            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-        })],
+        color_attachments: &attachments,
         ..Default::default()
     });
     pass.set_pipeline(pipeline);
@@ -261,7 +277,7 @@ impl PassDesc for SsrPass {
     }
 
     fn writes(&self) -> Vec<ResourceId> {
-        vec![self.output_id]
+        vec![self.output_id, self.ray_length_id]
     }
 }
 
@@ -285,8 +301,9 @@ impl Pass for SsrPass {
     ) {
         let i = &self.inputs;
         let view = |id| ctx.views.get(id).copied();
-        let (Some(output), Some(depth), Some(glass_depth), Some(normal), Some(lit), Some(weight)) = (
+        let (Some(output), Some(ray_length), Some(depth), Some(glass_depth), Some(normal), Some(lit), Some(weight)) = (
             view(&self.output_id),
+            view(&self.ray_length_id),
             view(&i.depth_id),
             view(&i.glass_depth_id),
             view(&i.normal_id),
@@ -321,9 +338,9 @@ impl Pass for SsrPass {
             hiz.copy_bg = Some((depth_key, bind_group));
         }
         let Some((_, copy_bg)) = &hiz.copy_bg else { return };
-        fullscreen(encoder, "hiz_copy", &hiz.levels[0], &pipelines.hiz_copy, copy_bg);
+        fullscreen(encoder, "hiz_copy", &[&hiz.levels[0]], &pipelines.hiz_copy, copy_bg);
         for (level, bind_group) in hiz.reduce_bgs.iter().enumerate() {
-            fullscreen(encoder, "hiz_reduce", &hiz.levels[level + 1], &pipelines.hiz_reduce, bind_group);
+            fullscreen(encoder, "hiz_reduce", &[&hiz.levels[level + 1]], &pipelines.hiz_reduce, bind_group);
         }
 
         let prev_frame = i.prev_frame.get();
@@ -354,6 +371,6 @@ impl Pass for SsrPass {
             self.trace_bg = Some((key, bind_group));
         }
         let Some((_, trace_bg)) = &self.trace_bg else { return };
-        fullscreen(encoder, "ssr", output, &pipelines.trace, trace_bg);
+        fullscreen(encoder, "ssr", &[output, ray_length], &pipelines.trace, trace_bg);
     }
 }
