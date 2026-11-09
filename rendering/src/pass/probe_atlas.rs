@@ -5,7 +5,9 @@ use bytemuck::{Pod, Zeroable};
 use engine_core::world::World;
 
 use crate::{
+    bounds::Aabb,
     camera::Camera,
+    mesh::Mesh,
     debug_flags::RenderDebugFlags,
     graph::{NodeId, RenderGraph},
     pass::{Pass, PassContext, PassDesc},
@@ -188,18 +190,39 @@ impl Pass for ProbeAtlasPass {
             dim[0].max(dim[1]).max(dim[2]) as f32 * probe_spacing
         };
 
-        // Snap the grid origin so probes always sit at world-aligned multiples of
-        // probe_spacing (offset from anchor). The active window slides in discrete
-        // steps to keep the camera inside the grid.
+        // Probes sit at world-aligned multiples of probe_spacing (offset from anchor). The grid
+        // centres on the camera, kept inside the scene's bounds: a scene that fits gets one fixed
+        // grid covering all of it, a larger one a grid that slides only as far as its edges.
+        // Following the camera alone left far parts of a fitting scene outside the grid, without
+        // indirect light, until the camera walked towards them.
         let cell_origin: [i32; 3] = {
             let cameras = world.get_entities::<Camera>();
             let eye = cameras.first().map(|c| c.eye).unwrap_or_default();
+            let mut scene = Aabb::empty();
+            for handle in world.get_entity_handles::<Mesh>() {
+                if let Some(draw) = ctx.geometry.get(handle.id) {
+                    let bounds = draw.bounds.transformed(handle.entity.transform);
+                    if !bounds.is_empty() {
+                        scene.extend(bounds.min);
+                        scene.extend(bounds.max);
+                    }
+                }
+            }
             let dim = self.config.grid_dim;
-            let snap = |cam: f32, anc: f32, steps: u32| -> i32 {
-                let half = steps as f32 * probe_spacing * 0.5;
-                ((cam - anc - half) / probe_spacing).floor() as i32
-            };
-            [snap(eye.x, anchor[0], dim[0]), snap(eye.y, anchor[1], dim[1]), snap(eye.z, anchor[2], dim[2])]
+            std::array::from_fn(|i| {
+                let steps = dim[i] as i32 - 1;
+                let centred = ((eye[i] - anchor[i]) / probe_spacing - steps as f32 * 0.5).floor() as i32;
+                if scene.is_empty() {
+                    return centred;
+                }
+                let first = ((scene.min[i] - anchor[i]) / probe_spacing).floor() as i32;
+                let last = ((scene.max[i] - anchor[i]) / probe_spacing).ceil() as i32 - steps;
+                if last <= first {
+                    (first + last).div_euclid(2)
+                } else {
+                    centred.clamp(first, last)
+                }
+            })
         };
         let grid_origin: [f32; 3] = std::array::from_fn(|i| anchor[i] + cell_origin[i] as f32 * probe_spacing);
 
