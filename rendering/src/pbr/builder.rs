@@ -3,9 +3,10 @@ use std::sync::{Arc, RwLock};
 use crate::{
     debug_flags::RenderDebugFlags,
     graph::RenderGraph,
-    light::SharedShadowCasters,
+    light::{SharedShadowCasters, shadow_lod::SharedSurfaceSamples},
     pass::{
         ao::AoPass,
+        depth_readback::DepthReadbackPass,
         bvh_upload::BvhUploadPass,
         camera::CameraPass,
         cluster_assignment::ClusterAssignmentPass,
@@ -109,8 +110,9 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         let debug_flags = graph.debug_flags_arc();
 
         let shadow_casters: SharedShadowCasters = Arc::default();
+        let surface_samples: SharedSurfaceSamples = Arc::default();
         let (light_upload_pass, light_buffers) =
-            LightUploadPass::new(&mut graph, Arc::clone(&debug_flags), Arc::clone(&shadow_casters));
+            LightUploadPass::new(&mut graph, Arc::clone(&debug_flags), Arc::clone(&shadow_casters), Arc::clone(&surface_samples));
         graph.add_pass(device, light_upload_pass);
 
         let (bvh_pass, bvh_outputs) = BvhUploadPass::new(&mut graph);
@@ -149,6 +151,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             self.gbuffer_shader,
         );
         graph.add_pass(device, gbuffer_pass);
+        graph.add_pass(device, DepthReadbackPass::new(gbuffer_outputs.depth_id, surface_samples));
 
         let (ao_pass, ao_outputs) = AoPass::new(
             &mut graph,

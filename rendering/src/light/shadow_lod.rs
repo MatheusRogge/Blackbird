@@ -1,6 +1,10 @@
-//! How much shadow-map resolution each face of a local light needs from the current view: a
-//! sample grid through the camera frustum, where each point knows the world size of a screen
-//! pixel there, and each face wants one shadow texel per pixel for the points it covers.
+//! How much shadow-map resolution each face of a local light needs from the current view: sample
+//! points that each know the world size of a screen pixel there, and each face wants one shadow
+//! texel per pixel for the points it covers. The points are the visible surfaces, read back from
+//! the depth buffer (`pass::depth_readback`) a few frames late, or a grid through the camera
+//! frustum while that's missing or the camera has moved on from it.
+
+use std::sync::{Arc, Mutex};
 
 use ultraviolet::Vec3;
 
@@ -25,13 +29,42 @@ const FACE_AXES: [(Vec3, Vec3, Vec3); 6] = [
     (Vec3::new(0.0, 0.0, -1.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)),
 ];
 
-/// World points through the view frustum, each with the world size of a screen pixel there.
+/// A readback's samples are used while the camera stays within this distance (m) of where they
+/// were taken and its forward direction within this cosine.
+const MAX_READBACK_TRAVEL: f32 = 1.0;
+const MIN_READBACK_ALIGNMENT: f32 = 0.9;
+
+/// World points, each with the world size of a screen pixel there.
 pub struct ViewSamples {
     points: Vec<(Vec3, f32)>,
 }
 
+/// The latest depth readback's samples and the camera they were seen from.
+pub struct SurfaceSamples {
+    pub samples: Arc<ViewSamples>,
+    pub eye: Vec3,
+    pub forward: Vec3,
+}
+
+pub type SharedSurfaceSamples = Arc<Mutex<Option<SurfaceSamples>>>;
+
+impl SurfaceSamples {
+    /// `samples`, unless `camera` has moved or turned too far since they were seen.
+    pub fn for_camera(&self, camera: &Camera) -> Option<Arc<ViewSamples>> {
+        let forward = (camera.target - camera.eye).normalized();
+        let close = (camera.eye - self.eye).mag() <= MAX_READBACK_TRAVEL && forward.dot(self.forward) >= MIN_READBACK_ALIGNMENT;
+        close.then(|| Arc::clone(&self.samples))
+    }
+}
+
 impl ViewSamples {
-    pub fn new(camera: &Camera, (width, height): (u32, u32)) -> Self {
+    pub fn from_points(points: Vec<(Vec3, f32)>) -> Self {
+        Self { points }
+    }
+
+    /// A grid through the frustum: points in space rather than surfaces, so it overestimates
+    /// wherever the view is open.
+    pub fn frustum(camera: &Camera, (width, height): (u32, u32)) -> Self {
         let aspect = camera.aspect_or(width as f32 / height.max(1) as f32);
         let tan_y = (camera.fovy * 0.5).tan();
         let tan_x = tan_y * aspect;
@@ -137,7 +170,7 @@ mod tests {
 
     #[test]
     fn faces_toward_the_view_need_more() {
-        let samples = ViewSamples::new(&camera(Vec3::new(0.0, 0.0, 5.0), Vec3::zero()), (1280, 720));
+        let samples = ViewSamples::frustum(&camera(Vec3::new(0.0, 0.0, 5.0), Vec3::zero()), (1280, 720));
         let shape = FaceShape { origin: Vec3::zero(), range: 10.0, spot: None, front: None };
         let c = face_coverage(&samples, &shape);
         // The camera looks down −z from +z: the +z face holds the view's near samples.
@@ -148,7 +181,7 @@ mod tests {
 
     #[test]
     fn one_sided_lights_skip_the_face_behind() {
-        let samples = ViewSamples::new(&camera(Vec3::new(3.0, 1.0, 3.0), Vec3::zero()), (1280, 720));
+        let samples = ViewSamples::frustum(&camera(Vec3::new(3.0, 1.0, 3.0), Vec3::zero()), (1280, 720));
         let shape = FaceShape { origin: Vec3::zero(), range: 10.0, spot: None, front: Some(Vec3::unit_x()) };
         let c = face_coverage(&samples, &shape);
         assert_eq!(c[1], 0.0);
@@ -157,7 +190,7 @@ mod tests {
 
     #[test]
     fn a_light_out_of_view_gets_the_floor() {
-        let samples = ViewSamples::new(&camera(Vec3::zero(), Vec3::new(0.0, 0.0, -1.0)), (1280, 720));
+        let samples = ViewSamples::frustum(&camera(Vec3::zero(), Vec3::new(0.0, 0.0, -1.0)), (1280, 720));
         let shape = FaceShape { origin: Vec3::new(0.0, 0.0, 50.0), range: 5.0, spot: None, front: None };
         assert!(face_coverage(&samples, &shape).iter().all(|&v| v > 0.0 && v < 0.01));
     }

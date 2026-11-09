@@ -2,6 +2,7 @@ pub mod ao;
 pub mod bvh_upload;
 pub mod camera;
 pub mod debug_overlay;
+pub mod depth_readback;
 pub mod fullscreen;
 pub mod cluster_assignment;
 pub mod gbuffer;
