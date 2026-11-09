@@ -1,4 +1,3 @@
-use super::shadow_atlas::Tile;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -64,7 +63,7 @@ pub struct ShadowedLights {
     pub _pad: [u32; 3],
 }
 
-/// A single-tile spot light shadow: the light's direction and tan of half the field of view.
+/// A single-face spot light shadow: the light's direction and tan of half the field of view.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SpotShadow {
     pub direction: ultraviolet::Vec3,
@@ -77,11 +76,13 @@ pub struct ShadowCaster {
     /// `kind << 16 | index` into that kind's light list (`SHADOW_KIND_*`), CPU-side identity.
     pub entry: u32,
     pub origin: ultraviolet::Vec3,
-    /// Far plane of the faces: the light's range.
+    /// Far plane of the faces: the light's range, rounded up to a power of two
+    /// (`shadow_slots::shadow_range`).
     pub range: f32,
-    /// `None`: a cube, six faces in `tiles`. `Some`: one face in `tiles[0]`.
+    /// `None`: a cube, six faces. `Some`: one face.
     pub spot: Option<SpotShadow>,
-    pub tiles: [Tile; 6],
+    /// The emitting side of a one-sided light: cube faces wholly behind it get no map.
+    pub front: Option<ultraviolet::Vec3>,
     /// The light's half size (half extent for area lights, source radius for point and spot
     /// lights), which sets the penumbra.
     pub half_size: f32,
@@ -95,6 +96,13 @@ const LOCAL_SHADOW_NEAR: f32 = 0.02;
 impl ShadowCaster {
     pub fn faces(&self) -> usize {
         if self.spot.is_some() { 1 } else { 6 }
+    }
+
+    /// Which of its six face slots get maps.
+    pub fn faces_enabled(&self) -> [bool; 6] {
+        std::array::from_fn(|f| {
+            f < self.faces() && !self.front.is_some_and(|n| self.spot.is_none() && super::virtual_shadow::face_behind(f, n))
+        })
     }
 
     /// Near and far planes of its faces' projections.
@@ -111,8 +119,8 @@ impl ShadowCaster {
 pub type SharedShadowCasters = std::sync::Arc<std::sync::Mutex<[Option<ShadowCaster>; MAX_SHADOWED_LIGHTS]>>;
 
 /// Mirrored by `MAX_SHADOWED_LIGHTS` in `lighting.wgsl` (with `LocalShadowParams` holding 6 faces
-/// per slot). Lights share the tiles of one atlas (`shadow_atlas`), so this only bounds the
-/// uniforms and the per-frame selection.
+/// per slot). Lights share the physical pages of one atlas (`virtual_shadow`), so this only bounds
+/// the uniforms, the page table and the per-frame selection.
 pub const MAX_SHADOWED_LIGHTS: usize = 32;
 pub const SHADOW_KIND_POINT: u32 = 0;
 pub const SHADOW_KIND_SPOT: u32 = 1;

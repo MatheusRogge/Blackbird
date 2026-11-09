@@ -3,10 +3,10 @@ use std::sync::{Arc, RwLock};
 use crate::{
     debug_flags::RenderDebugFlags,
     graph::RenderGraph,
-    light::{SharedShadowCasters, shadow_lod::SharedSurfaceSamples},
+    light::{SharedShadowCasters, virtual_shadow::SharedPageRequests},
     pass::{
         ao::AoPass,
-        depth_readback::DepthReadbackPass,
+        shadow_pages::ShadowPagesPass,
         bvh_upload::BvhUploadPass,
         camera::CameraPass,
         cluster_assignment::ClusterAssignmentPass,
@@ -110,9 +110,9 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         let debug_flags = graph.debug_flags_arc();
 
         let shadow_casters: SharedShadowCasters = Arc::default();
-        let surface_samples: SharedSurfaceSamples = Arc::default();
+        let page_requests: SharedPageRequests = Arc::default();
         let (light_upload_pass, light_buffers) =
-            LightUploadPass::new(&mut graph, Arc::clone(&debug_flags), Arc::clone(&shadow_casters), Arc::clone(&surface_samples));
+            LightUploadPass::new(&mut graph, Arc::clone(&debug_flags), Arc::clone(&shadow_casters));
         graph.add_pass(device, light_upload_pass);
 
         let (bvh_pass, bvh_outputs) = BvhUploadPass::new(&mut graph);
@@ -140,7 +140,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         graph.add_pass(device, probe_update_pass);
 
         let (shadow_pass, shadow_outputs) =
-            ShadowPass::new(&mut graph, self.shadow_shader, light_buffers.shadowed_buffer_id, shadow_casters);
+            ShadowPass::new(&mut graph, self.shadow_shader, light_buffers.shadowed_buffer_id, shadow_casters, Arc::clone(&page_requests));
         graph.add_pass(device, shadow_pass);
 
         let (gbuffer_pass, gbuffer_outputs) = GBufferPass::new(
@@ -151,7 +151,10 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             self.gbuffer_shader,
         );
         graph.add_pass(device, gbuffer_pass);
-        graph.add_pass(device, DepthReadbackPass::new(gbuffer_outputs.depth_id, surface_samples));
+        graph.add_pass(
+            device,
+            ShadowPagesPass::new(gbuffer_outputs.depth_id, camera_buffer_id, shadow_outputs.local_shadow_params_id, page_requests),
+        );
 
         let (ao_pass, ao_outputs) = AoPass::new(
             &mut graph,

@@ -28,11 +28,14 @@ pub enum GBufferView {
     Emissive,
     /// Cube shadow map visibility of the first three shadowed local lights, one per channel.
     LocalShadows,
+    /// Virtual shadow map mip each pixel's local shadow resolved to, for the most important
+    /// shadowed light reaching it: red = mip 0 (finest) through violet = the coarsest page.
+    ShadowDetail,
 }
 
 impl GBufferView {
-    pub const ALL: [Self; 6] =
-        [Self::Lit, Self::Albedo, Self::Normal, Self::Material, Self::Emissive, Self::LocalShadows];
+    pub const ALL: [Self; 7] =
+        [Self::Lit, Self::Albedo, Self::Normal, Self::Material, Self::Emissive, Self::LocalShadows, Self::ShadowDetail];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -42,6 +45,7 @@ impl GBufferView {
             Self::Material => "Roughness / metallic / AO",
             Self::Emissive => "Emissive",
             Self::LocalShadows => "Local light shadows",
+            Self::ShadowDetail => "Local shadow detail",
         }
     }
 }

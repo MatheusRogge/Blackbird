@@ -102,6 +102,7 @@ pub(crate) struct LightingBindings {
     local_shadow_params_id: ResourceId,
     glass_tint_id: ResourceId,
     local_glass_tint_id: ResourceId,
+    local_pages_id: ResourceId,
 
     irradiance_atlas_ids: [ResourceId; 2],
     visibility_atlas_ids: [ResourceId; 2],
@@ -148,6 +149,7 @@ impl LightingBindings {
             local_shadow_params_id: shadow.local_shadow_params_id,
             glass_tint_id: shadow.glass_tint_id,
             local_glass_tint_id: shadow.local_glass_tint_id,
+            local_pages_id: shadow.local_pages_id,
             irradiance_atlas_ids: probe_atlas.irradiance_atlas_ids,
             visibility_atlas_ids: probe_atlas.visibility_atlas_ids,
             probe_params_id: probe_atlas.probe_params_id,
@@ -182,6 +184,7 @@ impl LightingBindings {
             self.local_shadow_params_id,
             self.glass_tint_id,
             self.local_glass_tint_id,
+            self.local_pages_id,
             self.irradiance_atlas_ids[0],
             self.irradiance_atlas_ids[1],
             self.visibility_atlas_ids[0],
@@ -226,6 +229,7 @@ impl LightingBindings {
                     uniform_entry(4, fragment),
                     texture_entry(5, wgpu::TextureViewDimension::D2Array, FILTERABLE),
                     texture_entry(6, wgpu::TextureViewDimension::D2, FILTERABLE),
+                    storage_entry(7),
                 ],
             });
             let probe = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -314,6 +318,7 @@ impl LightingBindings {
             let local_params = buffer(&self.local_shadow_params_id)?;
             let glass_tint = view(&self.glass_tint_id)?;
             let local_glass_tint = view(&self.local_glass_tint_id)?;
+            let local_pages = buffer(&self.local_pages_id)?;
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("lighting_shadow_bg"),
                 layout: &layouts.shadow,
@@ -328,6 +333,7 @@ impl LightingBindings {
                     wgpu::BindGroupEntry { binding: 4, resource: local_params.binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(glass_tint) },
                     wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(local_glass_tint) },
+                    wgpu::BindGroupEntry { binding: 7, resource: local_pages.binding() },
                 ],
             });
             self.shadow_bg = Some((shadow_ptr, bind_group));

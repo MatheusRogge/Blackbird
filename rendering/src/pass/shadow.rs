@@ -13,7 +13,7 @@ use crate::{
     graph::{NodeId, RenderGraph},
     light::{
         MAX_SHADOWED_LIGHTS, ShadowCaster, SharedShadowCasters, SkyLight,
-        shadow_atlas::{ATLAS_SIZE, Tile},
+        virtual_shadow::{ATLAS_SIZE, PAGE_SIZE, PAGES_PER_FACE, SharedPageRequests, TABLE_LEN, VirtualShadows, page_origin},
     },
     mesh::Mesh,
     pass::{
@@ -77,35 +77,33 @@ const CUBE_FACES: [(Vec3, Vec3); 6] = [
     (Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.0, -1.0, 0.0)),
 ];
 
-/// One local light face as it was last rendered: its view-projection, where its tile sits in the
-/// atlas, and the light it was rendered for (identical on every face of a slot). Rendering can lag
-/// the light by a few frames (`LOCAL_SHADOW_TEXEL_BUDGET`), so the shader reads all of it from here.
+/// One local light face: its view-projection and the light its pages are rendered for (identical
+/// on every face of a slot). A changed light resets its pages and re-renders its coarsest ones the
+/// same frame, so pages and face always agree.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct LocalShadowFace {
     pub view_proj: [[f32; 4]; 4],
-    /// `Tile::rect`: atlas UV offset (xy) and scale (z), tile size in texels (w). w = 0: no map
-    /// (not rendered yet, or a face behind a one-sided light), so the face is unshadowed.
-    pub rect: [f32; 4],
+    /// x: 1 if the face has pages (0: no shadowed light, or a face behind a one-sided light,
+    /// unshadowed). yzw unused.
+    pub info: [u32; 4],
     /// Shadow origin in world space (xyz), light half size (w).
     pub light: [f32; 4],
     /// Face count (6 cube, 1 spot), tan of half the field of view, near plane, far plane.
     pub shape: [f32; 4],
 }
 
-/// Most atlas texels re-rendered per frame (two 2048² faces). Lights whose maps are new come first
-/// by rank, then stale ones (moved, or nearby geometry moved) by rank over frames waited, so none
-/// starves. At least one light renders per frame however big.
-const LOCAL_SHADOW_TEXEL_BUDGET: u64 = 2 * 2048 * 2048;
+/// Pages rendered per frame besides the pinned coarse ones, which always render.
+const LOCAL_PAGE_BUDGET: usize = 64;
+/// Page views (`ShadowView`) one frame can render: every pinned page of every slot plus the budget.
+const LOCAL_VIEWS: usize = LOCAL_SHADOW_FACES + LOCAL_PAGE_BUDGET;
 
-/// What a slot's maps were last rendered for.
+/// What a slot's pages are rendered for.
 #[derive(Copy, Clone)]
 struct RenderedSlot {
     caster: ShadowCaster,
     /// `ShadowPass::render_local_shadows`' signature of the meshes in the light's range.
     geometry: u64,
-    /// Frame since which the maps have been out of date, while they wait for the budget.
-    stale_since: Option<u64>,
 }
 
 /// Every local light face, slot-major (`slot * 6 + face`). Mirrors `LocalShadowParams` in
@@ -113,6 +111,8 @@ struct RenderedSlot {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct LocalShadowParams {
+    /// x: world size of a screen pixel per metre of view depth, which picks a lookup's mip.
+    pub lod: [f32; 4],
     pub faces: [LocalShadowFace; LOCAL_SHADOW_FACES],
 }
 
@@ -137,6 +137,9 @@ pub struct ShadowOutputs {
     pub glass_tint_id: ResourceId,
     /// `GLASS_TINT_FORMAT` `ATLAS_SIZE`² atlas, laid out like the depth atlas.
     pub local_glass_tint_id: ResourceId,
+    /// Storage `u32` per virtual page (`virtual_shadow::TABLE_LEN`): physical page + 1, 0 if not
+    /// resident.
+    pub local_pages_id: ResourceId,
 }
 
 type AlbedoCache = HashMap<u64, (wgpu::Texture, wgpu::BindGroup)>;
@@ -264,6 +267,10 @@ pub struct ShadowPass {
     local_params_id: ResourceId,
     local_vp_id: ResourceId,
     local_glass_tint_id: ResourceId,
+    local_pages_id: ResourceId,
+    virtual_shadows: VirtualShadows,
+    /// The latest page requests from `pass::shadow_pages`, taken once applied.
+    page_requests: SharedPageRequests,
     local_bind_group: Option<wgpu::BindGroup>,
     /// Unculled, depth-biased variants of the two pipelines: cube faces see both sides of walls.
     local_pipeline: Option<wgpu::RenderPipeline>,
@@ -287,6 +294,7 @@ impl ShadowPass {
         shader: ShaderAsset,
         shadowed_buffer_id: ResourceId,
         casters: SharedShadowCasters,
+        page_requests: SharedPageRequests,
     ) -> (Self, ShadowOutputs) {
         let shadow_map_id = graph.alloc_resource_id(ResourceDescriptor::FixedTexture {
             size: wgpu::Extent3d {
@@ -320,7 +328,7 @@ impl ShadowPass {
         });
 
         let local_vp_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
-            size: CASCADE_VP_STRIDE * LOCAL_SHADOW_FACES as u64,
+            size: CASCADE_VP_STRIDE * LOCAL_VIEWS as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -331,6 +339,10 @@ impl ShadowPass {
         };
         let glass_tint_id = graph.alloc_resource_id(tint_map(GLASS_TINT_SIZE, NUM_CASCADES as u32));
         let local_glass_tint_id = graph.alloc_resource_id(tint_map(ATLAS_SIZE, 1));
+        let local_pages_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
+            size: (TABLE_LEN * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
 
         let outputs = ShadowOutputs {
             shadow_map_id,
@@ -339,6 +351,7 @@ impl ShadowPass {
             local_shadow_params_id: local_params_id,
             glass_tint_id,
             local_glass_tint_id,
+            local_pages_id,
         };
 
         (
@@ -368,6 +381,9 @@ impl ShadowPass {
                 local_params_id,
                 local_vp_id,
                 local_glass_tint_id,
+                local_pages_id,
+                virtual_shadows: VirtualShadows::default(),
+                page_requests,
                 local_bind_group: None,
                 local_pipeline: None,
                 local_masked_pipeline: None,
@@ -383,9 +399,12 @@ impl ShadowPass {
 }
 
 impl ShadowPass {
-    /// Renders the faces of shadowed lights whose maps are missing or out of date (the light, or
-    /// a mesh in its range, changed) into their atlas tiles, within `LOCAL_SHADOW_TEXEL_BUDGET`,
-    /// and uploads all faces.
+    /// Local light shadows as virtual shadow maps (`light::virtual_shadow`): resets the pages of
+    /// slots whose light, or whose geometry in range, changed; applies the latest page requests
+    /// (`pass::shadow_pages`); renders pending pages, all pinned coarse pages plus up to
+    /// `LOCAL_PAGE_BUDGET` others, into their physical pages; and uploads the faces and the
+    /// changed parts of the page table.
+    #[allow(clippy::too_many_arguments)]
     fn render_local_shadows(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -394,9 +413,13 @@ impl ShadowPass {
         meshes: &[EntityHandle<'_, Mesh>],
         masked: &[&EntityHandle<'_, Mesh>],
         glass: &[EntityHandle<'_, Mesh>],
+        pixel_per_depth: f32,
     ) {
-        let (Some(&vp_buf), Some(&params_buf)) = (ctx.buffers.get(&self.local_vp_id), ctx.buffers.get(&self.local_params_id))
-        else {
+        let (Some(&vp_buf), Some(&params_buf), Some(&table_buf)) = (
+            ctx.buffers.get(&self.local_vp_id),
+            ctx.buffers.get(&self.local_params_id),
+            ctx.buffers.get(&self.local_pages_id),
+        ) else {
             return;
         };
         let (Some(&depth_view), Some(&tint_view)) = (ctx.views.get(&self.local_map_id), ctx.views.get(&self.local_glass_tint_id))
@@ -425,7 +448,7 @@ impl ShadowPass {
         };
 
         // A light's maps only depend on the meshes reaching into its range, so a moving object
-        // re-renders the lights around it rather than all of them.
+        // resets the lights around it rather than all of them.
         let mesh_keys: Vec<(u64, Aabb)> = meshes
             .iter()
             .chain(glass)
@@ -451,173 +474,174 @@ impl ShadowPass {
                 .fold(generation.wrapping_mul(0x9e37_79b9_7f4a_7c15), |sum, (key, _)| sum.wrapping_add(*key))
         };
 
-        // (order, slot, geometry signature): new maps first by rank (order < 1), then stale ones by
-        // rank over frames waited (order > 1).
         self.frame += 1;
         let casters = *self.casters.lock().expect("shadow_casters poisoned");
-        let mut pending: Vec<(f32, usize, u64)> = Vec::new();
         for (slot, caster) in casters.iter().enumerate() {
             let Some(caster) = caster else {
-                self.rendered[slot] = None;
-                clear_faces(&mut self.local_params.faces, slot);
+                if self.rendered[slot].take().is_some() {
+                    self.virtual_shadows.release_slot(slot);
+                }
                 continue;
             };
             let geometry = signature(caster);
-            match &mut self.rendered[slot] {
-                Some(r) if r.caster.entry == caster.entry && r.caster.tiles[..r.caster.faces()] == caster.tiles[..caster.faces()] => {
-                    if r.caster.renders_like(caster) && r.geometry == geometry {
-                        r.stale_since = None;
-                        continue;
-                    }
-                    let waited = (self.frame - *r.stale_since.get_or_insert(self.frame)) as f32;
-                    pending.push((1.0 + (caster.rank as f32 + 1.0) / (1.0 + waited), slot, geometry));
-                }
-                _ => {
-                    // The tiles hold nothing of this light yet: unshadowed until rendered.
-                    self.rendered[slot] = None;
-                    clear_faces(&mut self.local_params.faces, slot);
-                    pending.push((caster.rank as f32 / MAX_SHADOWED_LIGHTS as f32, slot, geometry));
-                }
+            let unchanged = self.rendered[slot].is_some_and(|r| r.caster.renders_like(caster) && r.geometry == geometry);
+            if !unchanged {
+                self.virtual_shadows.reset_slot(slot, caster.faces_enabled(), self.frame);
             }
+            self.rendered[slot] = Some(RenderedSlot { caster: *caster, geometry });
         }
-        pending.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some(mask) = self.page_requests.lock().expect("page requests poisoned").take() {
+            self.virtual_shadows.request(&mask, self.frame);
+        }
 
-        // (face index, tile, view-projection) of every face to render this frame.
-        let mut faces: Vec<(usize, Tile, Mat4)> = Vec::new();
-        let mut texels = 0;
-        for (_, slot, geometry) in pending {
-            let Some(caster) = casters[slot] else { continue };
-            let tiles = &caster.tiles[..caster.faces()];
-            let cost: u64 = tiles.iter().map(|t| u64::from(t.size).pow(2)).sum();
-            if texels > 0 && texels + cost > LOCAL_SHADOW_TEXEL_BUDGET {
-                continue;
-            }
-            texels += cost;
-            self.rendered[slot] = Some(RenderedSlot { caster, geometry, stale_since: None });
-
-            let (near, far) = caster.planes();
-            let tan_half_fov = caster.spot.map_or(1.0, |s| s.tan_half_fov);
-            let light = [caster.origin.x, caster.origin.y, caster.origin.z, caster.half_size];
-            let shape = [caster.faces() as f32, tan_half_fov, near, far];
-            for (face, &tile) in tiles.iter().enumerate() {
-                let vp = match caster.spot {
-                    Some(spot) => {
-                        let fov = 2.0 * spot.tan_half_fov.atan();
-                        let up = if spot.direction.y.abs() > 0.99 { Vec3::unit_x() } else { Vec3::unit_y() };
-                        ultraviolet::projection::perspective_wgpu_dx(fov, 1.0, near, far)
-                            * Mat4::look_at(caster.origin, caster.origin + spot.direction, up)
-                    }
-                    None => {
-                        let (dir, up) = CUBE_FACES[face];
-                        ultraviolet::projection::perspective_wgpu_dx(std::f32::consts::FRAC_PI_2, 1.0, near, far)
-                            * Mat4::look_at(caster.origin, caster.origin + dir, up)
-                    }
-                };
+        self.local_params.lod = [pixel_per_depth, 0.0, 0.0, 0.0];
+        for (slot, rendered) in self.rendered.iter().enumerate() {
+            for face in 0..6 {
                 let index = slot * 6 + face;
-                let cols = vp.cols;
-                let view_proj: [[f32; 4]; 4] = [cols[0].into(), cols[1].into(), cols[2].into(), cols[3].into()];
-                let rect = if tile.size > 0 { tile.rect() } else { [0.0; 4] };
-                self.local_params.faces[index] = LocalShadowFace { view_proj, rect, light, shape };
-                if tile.size == 0 {
+                let Some(RenderedSlot { caster, .. }) = rendered else {
+                    self.local_params.faces[index] = LocalShadowFace::zeroed();
                     continue;
-                }
-                let view = ShadowView { view_proj, light: [caster.origin.x, caster.origin.y, caster.origin.z, 1.0] };
-                vp_buf.write_at(queue, CASCADE_VP_STRIDE * index as u64, bytemuck::bytes_of(&view));
-                faces.push((index, tile, vp));
+                };
+                let (near, far) = caster.planes();
+                let tan_half_fov = caster.spot.map_or(1.0, |s| s.tan_half_fov);
+                let cols = face_view_proj(caster, face).cols;
+                self.local_params.faces[index] = LocalShadowFace {
+                    view_proj: [cols[0].into(), cols[1].into(), cols[2].into(), cols[3].into()],
+                    info: [u32::from(self.virtual_shadows.face_enabled(index as u32)), 0, 0, 0],
+                    light: [caster.origin.x, caster.origin.y, caster.origin.z, caster.half_size],
+                    shape: [caster.faces() as f32, tan_half_fov, near, far],
+                };
             }
         }
         params_buf.write(queue, bytemuck::bytes_of(&self.local_params));
-        if faces.is_empty() {
-            return;
+
+        let mut jobs = self.virtual_shadows.pending(LOCAL_PAGE_BUDGET);
+        jobs.truncate(LOCAL_VIEWS);
+        // (physical page, view-projection, uniform offset) of every page to render this frame.
+        let mut pages: Vec<(u16, Mat4, u32)> = Vec::with_capacity(jobs.len());
+        for (i, &(key, page)) in jobs.iter().enumerate() {
+            let slot = key.face as usize / 6;
+            let Some(RenderedSlot { caster, .. }) = self.rendered[slot] else { continue };
+            let vp = key.view_proj(face_view_proj(&caster, key.face as usize % 6));
+            let cols = vp.cols;
+            let view = ShadowView {
+                view_proj: [cols[0].into(), cols[1].into(), cols[2].into(), cols[3].into()],
+                light: [caster.origin.x, caster.origin.y, caster.origin.z, 1.0],
+            };
+            let offset = CASCADE_VP_STRIDE * i as u64;
+            vp_buf.write_at(queue, offset, bytemuck::bytes_of(&view));
+            pages.push((page, vp, offset as u32));
         }
 
-        let viewport = |pass: &mut wgpu::RenderPass<'_>, tile: Tile| {
-            pass.set_viewport(tile.x as f32, tile.y as f32, tile.size as f32, tile.size as f32, 0.0, 1.0);
-            pass.set_scissor_rect(tile.x, tile.y, tile.size, tile.size);
-        };
+        if !pages.is_empty() {
+            let viewport = |pass: &mut wgpu::RenderPass<'_>, page: u16| {
+                let (x, y) = page_origin(page);
+                pass.set_viewport(x as f32, y as f32, PAGE_SIZE as f32, PAGE_SIZE as f32, 0.0, 1.0);
+                pass.set_scissor_rect(x, y, PAGE_SIZE, PAGE_SIZE);
+            };
 
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("shadow_local_faces"),
-            color_attachments: &[],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: depth_view,
-                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
-                stencil_ops: None,
-            }),
-            ..Default::default()
-        });
-        for &(index, tile, vp) in &faces {
-            let offset = (CASCADE_VP_STRIDE * index as u64) as u32;
-            viewport(&mut pass, tile);
-            pass.set_pipeline(clear_depth);
-            pass.draw(0..3, 0..1);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow_local_pages"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            for &(page, vp, offset) in &pages {
+                viewport(&mut pass, page);
+                pass.set_pipeline(clear_depth);
+                pass.draw(0..3, 0..1);
 
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bind_group, &[offset]);
-            pass.set_bind_group(1, instance_bg, &[]);
-            pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
-            pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-            let opaque = visible(meshes.iter().filter(|h| !h.entity.is_masked()), ctx.geometry, vp);
-            for batch in batches(&mut self.instances, opaque.map(|(_, draw)| ((), draw))) {
-                pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bind_group, &[offset]);
+                pass.set_bind_group(1, instance_bg, &[]);
+                pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
+                pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
+                let opaque = visible(meshes.iter().filter(|h| !h.entity.is_masked()), ctx.geometry, vp);
+                for batch in batches(&mut self.instances, opaque.map(|(_, draw)| ((), draw))) {
+                    pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
+                }
+
+                pass.set_pipeline(masked_pipeline);
+                pass.set_bind_group(0, bind_group, &[offset]);
+                pass.set_bind_group(1, instance_bg, &[]);
+                let draws = visible(masked.iter().copied(), ctx.geometry, vp).map(|(h, d)| (albedo_key(h.entity), d));
+                let mut current_texture = None;
+                for batch in batches(&mut self.instances, draws) {
+                    if current_texture != Some(batch.key) {
+                        let Some((_, texture_bg)) = self.masked_textures.get(&batch.key).or(self.masked_textures.get(&0)) else {
+                            continue;
+                        };
+                        pass.set_bind_group(2, texture_bg, &[]);
+                        current_texture = Some(batch.key);
+                    }
+                    pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
+                }
             }
+            drop(pass);
 
-            pass.set_pipeline(masked_pipeline);
-            pass.set_bind_group(0, bind_group, &[offset]);
-            pass.set_bind_group(1, instance_bg, &[]);
-            let draws = visible(masked.iter().copied(), ctx.geometry, vp).map(|(h, d)| (albedo_key(h.entity), d));
-            let mut current_texture = None;
-            for batch in batches(&mut self.instances, draws) {
-                if current_texture != Some(batch.key) {
-                    let Some((_, texture_bg)) = self.masked_textures.get(&batch.key).or(self.masked_textures.get(&0)) else {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow_local_glass_tint"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: tint_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                ..Default::default()
+            });
+            for &(page, vp, offset) in &pages {
+                viewport(&mut pass, page);
+                pass.set_pipeline(clear_tint);
+                pass.draw(0..3, 0..1);
+                if glass.is_empty() {
+                    continue;
+                }
+                pass.set_pipeline(glass_pipeline);
+                pass.set_bind_group(0, bind_group, &[offset]);
+                pass.set_bind_group(1, instance_bg, &[]);
+                pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
+                pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
+                let draws = visible(glass.iter(), ctx.geometry, vp).map(|(h, d)| (albedo_key(h.entity), d));
+                for batch in batches(&mut self.instances, draws) {
+                    let Some((_, texture_bg)) = self.glass_textures.get(&batch.key).or(self.glass_textures.get(&0)) else {
                         continue;
                     };
                     pass.set_bind_group(2, texture_bg, &[]);
-                    current_texture = Some(batch.key);
+                    pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
                 }
-                pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
             }
         }
-        drop(pass);
+        for &(page, ..) in &pages {
+            self.virtual_shadows.rendered(page);
+        }
 
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("shadow_local_glass_tint"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: tint_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-            })],
-            ..Default::default()
-        });
-        for &(index, tile, vp) in &faces {
-            viewport(&mut pass, tile);
-            pass.set_pipeline(clear_tint);
-            pass.draw(0..3, 0..1);
-            if glass.is_empty() {
-                continue;
-            }
-            pass.set_pipeline(glass_pipeline);
-            pass.set_bind_group(0, bind_group, &[(CASCADE_VP_STRIDE * index as u64) as u32]);
-            pass.set_bind_group(1, instance_bg, &[]);
-            pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
-            pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-            let draws = visible(glass.iter(), ctx.geometry, vp).map(|(h, d)| (albedo_key(h.entity), d));
-            for batch in batches(&mut self.instances, draws) {
-                let Some((_, texture_bg)) = self.glass_textures.get(&batch.key).or(self.glass_textures.get(&0)) else {
-                    continue;
-                };
-                pass.set_bind_group(2, texture_bg, &[]);
-                pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
-            }
+        for face in self.virtual_shadows.take_dirty_faces() {
+            let range = face as usize * PAGES_PER_FACE as usize..(face as usize + 1) * PAGES_PER_FACE as usize;
+            let offset = range.start as u64 * 4;
+            table_buf.write_at(queue, offset, bytemuck::cast_slice(&self.virtual_shadows.table()[range]));
         }
     }
 }
 
-/// Marks every face of `slot` as having no map.
-fn clear_faces(faces: &mut [LocalShadowFace], slot: usize) {
-    for face in &mut faces[slot * 6..slot * 6 + 6] {
-        face.rect = [0.0; 4];
+/// View-projection of `face` of `caster` (a spot's single face, or a cube face).
+fn face_view_proj(caster: &ShadowCaster, face: usize) -> Mat4 {
+    let (near, far) = caster.planes();
+    match caster.spot {
+        Some(spot) => {
+            let fov = 2.0 * spot.tan_half_fov.atan();
+            let up = if spot.direction.y.abs() > 0.99 { Vec3::unit_x() } else { Vec3::unit_y() };
+            ultraviolet::projection::perspective_wgpu_dx(fov, 1.0, near, far)
+                * Mat4::look_at(caster.origin, caster.origin + spot.direction, up)
+        }
+        None => {
+            let (dir, up) = CUBE_FACES[face];
+            ultraviolet::projection::perspective_wgpu_dx(std::f32::consts::FRAC_PI_2, 1.0, near, far)
+                * Mat4::look_at(caster.origin, caster.origin + dir, up)
+        }
     }
 }
 
@@ -738,6 +762,7 @@ impl PassDesc for ShadowPass {
             self.local_vp_id,
             self.glass_tint_id,
             self.local_glass_tint_id,
+            self.local_pages_id,
         ]
     }
 }
@@ -1202,7 +1227,8 @@ impl Pass for ShadowPass {
             );
         }
 
-        self.render_local_shadows(encoder, queue, ctx, &meshes, &masked, &glass);
+        let pixel_per_depth = 2.0 * (camera.fovy * 0.5).tan() / ctx.surface_size.1.max(1) as f32;
+        self.render_local_shadows(encoder, queue, ctx, &meshes, &masked, &glass, pixel_per_depth);
         self.instances.finish(queue);
 
         let params = ShadowParams {

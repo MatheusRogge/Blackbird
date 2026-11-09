@@ -10,7 +10,7 @@
 //!   --exposure E         linear exposure override
 //!   --no-specular --no-reflections --no-ssr --no-reflection-probe --no-emissive-lights --no-indirect --no-direct --no-shadows --no-particles
 //!   --no-ao --no-contact-shadows
-//!   --view lit|albedo|normal|material|emissive|shadows
+//!   --view lit|albedo|normal|material|emissive|shadows|shadow-detail
 //!   --point x,y,z,I[,r]  add a white point light of I candela (range 10), source radius r (default 0)
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
 //!   --burst N            every particle emitter bursts N particles on the second frame
@@ -126,6 +126,7 @@ fn parse_args() -> Result<Options> {
                     "material" => GBufferView::Material,
                     "emissive" => GBufferView::Emissive,
                     "shadows" => GBufferView::LocalShadows,
+                    "shadow-detail" => GBufferView::ShadowDetail,
                     other => bail!("unknown view {other}"),
                 }
             }

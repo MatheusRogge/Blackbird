@@ -2,7 +2,6 @@ pub mod ao;
 pub mod bvh_upload;
 pub mod camera;
 pub mod debug_overlay;
-pub mod depth_readback;
 pub mod fullscreen;
 pub mod cluster_assignment;
 pub mod gbuffer;
@@ -21,6 +20,7 @@ pub mod prev_frame;
 pub mod ssr;
 pub mod ssr_temporal;
 pub mod shadow;
+pub mod shadow_pages;
 pub mod transparent;
 
 use crate::{

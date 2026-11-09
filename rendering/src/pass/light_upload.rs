@@ -15,9 +15,7 @@ use crate::{
         MAX_AREA_LIGHTS, MAX_POINT_LIGHTS, MAX_SKY_LIGHTS, MAX_SPOT_LIGHTS, PointLight, SkyLight,
         SpotLight, SHADOW_KIND_AREA, SHADOW_KIND_POINT, SHADOW_KIND_SPOT, SHADOW_SLOT_NONE, ShadowedLights,
         SharedShadowCasters, SpotShadow,
-        shadow_lod::{FaceShape, SharedSurfaceSamples, ViewSamples, face_coverage},
         shadow_slots::{ShadowCandidate, ShadowSlots},
-        MAX_SHADOWED_LIGHTS,
     },
     mesh::Mesh,
     pass::{PassContext, Pass, PassDesc},
@@ -57,8 +55,6 @@ pub struct LightUploadPass {
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
     /// The slots picked this frame, for `ShadowPass` to render.
     shadow_casters: SharedShadowCasters,
-    /// The depth readback's visible surfaces (`pass::depth_readback`), for shadow tile sizes.
-    surface_samples: SharedSurfaceSamples,
     shadow_slots: ShadowSlots,
 }
 
@@ -67,7 +63,6 @@ impl LightUploadPass {
         graph: &mut RenderGraph,
         debug_flags: Arc<RwLock<RenderDebugFlags>>,
         shadow_casters: SharedShadowCasters,
-        surface_samples: SharedSurfaceSamples,
     ) -> (Self, LightBuffers) {
         let point_buffer_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: (MAX_POINT_LIGHTS * size_of::<GpuPointLight>()) as u64,
@@ -114,7 +109,6 @@ impl LightUploadPass {
             emissive_means: HashMap::new(),
             debug_flags,
             shadow_casters,
-            surface_samples,
             shadow_slots: ShadowSlots::default(),
             buffers: LightBuffers {
                 point_buffer_id,
@@ -299,7 +293,6 @@ impl Pass for LightUploadPass {
                 spot,
                 half_size,
                 front,
-                coverage: [0.0; 6],
             }
         };
         let four_pi = 4.0 * std::f32::consts::PI;
@@ -335,11 +328,6 @@ impl Pass for LightUploadPass {
         candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
         if !shadows {
             candidates.clear();
-        }
-        let readback = self.surface_samples.lock().expect("surface samples poisoned").as_ref().and_then(|s| s.for_camera(camera));
-        let samples = readback.unwrap_or_else(|| Arc::new(ViewSamples::frustum(camera, ctx.surface_size)));
-        for c in candidates.iter_mut().take(MAX_SHADOWED_LIGHTS) {
-            c.coverage = face_coverage(&samples, &FaceShape { origin: c.origin, range: c.range, spot: c.spot, front: c.front });
         }
 
         let slots = self.shadow_slots.update(&candidates);

@@ -100,15 +100,66 @@ const POISSON: array<vec2<f32>, 12> = array<vec2<f32>, 12>(
     vec2f( 0.896,  0.412), vec2f(-0.322, -0.933), vec2f(-0.792, -0.598),
 );
 
-// Visibility of shadowed light `slot` at world position `pos` (normal `N`), from its faces in the
-// shadow atlas: a cube picks the face by the dominant axis of the light-to-point direction, a spot
-// has one. The face is projected with its own view-projection so the lookup matches what was
-// rasterized, and every tap stays inside the face's tile. Area and sphere lights get penumbrae
-// from their size (PCSS): a blocker search finds the average occluder depth, and the PCF radius
-// is the light's size × (receiver − blocker) / blocker, so shadows are sharp at contact and
-// soften away from it.
+// Local light shadows are virtual shadow maps (rendering::light::virtual_shadow): each face is a
+// VSM_SIZE² map with VSM_MIPS mips in VSM_PAGE² pages, of which the ones visible pixels asked for
+// (rendering::pass::shadow_pages) are backed by physical pages of the atlas. `local_pages` holds a
+// physical page + 1 per virtual page, 0 where none is resident; the coarsest mip always is.
+const VSM_SIZE: f32 = 8192.0;
+const VSM_PAGES0: u32 = 64u;
+const VSM_MIPS: u32 = 7u;
+const VSM_PAGES_PER_FACE: u32 = 5461u;
+const VSM_PAGE: f32 = 128.0;
+const VSM_POOL_SIDE: u32 = 32u;
+@group(2) @binding(7) var<storage, read> local_pages: array<u32>;
+// The mip the last `light_shadow` call resolved to (-1 if it had no map), for the Shadow detail
+// debug view.
+var<private> vsm_resolved_mip: f32 = -1.0;
+
+fn vsm_mip_offset(mip: u32) -> u32 {
+    var offset = 0u;
+    for (var m = 0u; m < mip; m++) {
+        let n = VSM_PAGES0 >> m;
+        offset += n * n;
+    }
+    return offset;
+}
+
+// Where face UV `uv` of face `face_index` is in the atlas (xy, atlas UV) at `mip`, or at the
+// nearest coarser mip with a resident page (z), with w = 1; w = 0 if no page is resident at all.
+// The position is kept half a texel inside its page, so bilinear taps never read a neighbour's.
+fn vsm_lookup(face_index: u32, uv: vec2<f32>, mip: u32) -> vec4<f32> {
+    let atlas = f32(textureDimensions(t_local_shadow).x);
+    for (var m = mip; m < VSM_MIPS; m++) {
+        let n = VSM_PAGES0 >> m;
+        let p = clamp(uv, vec2f(0.0), vec2f(1.0)) * f32(n);
+        let page = min(vec2<u32>(p), vec2<u32>(n - 1u));
+        let entry = local_pages[face_index * VSM_PAGES_PER_FACE + vsm_mip_offset(m) + page.y * n + page.x];
+        if entry != 0u {
+            let physical = entry - 1u;
+            let inside = clamp(p - vec2f(page), vec2f(0.5 / VSM_PAGE), vec2f(1.0 - 0.5 / VSM_PAGE));
+            let origin = vec2f(f32(physical % VSM_POOL_SIDE), f32(physical / VSM_POOL_SIDE));
+            return vec4f((origin + inside) * VSM_PAGE / atlas, f32(m), 1.0);
+        }
+    }
+    return vec4f(0.0);
+}
+
+// The mip `kernel_texels` (texels at `mip`) needs to fit within MAX_PENUMBRA_TEXELS, and the
+// kernel in that mip's texels: wide penumbrae move to coarser mips rather than shrink.
+fn vsm_kernel_mip(mip: u32, kernel_texels: f32) -> vec2<f32> {
+    let up = u32(clamp(ceil(log2(max(kernel_texels / MAX_PENUMBRA_TEXELS, 1.0))), 0.0, f32(VSM_MIPS - 1u - mip)));
+    return vec2f(f32(mip + up), kernel_texels / f32(1u << up));
+}
+
+// Visibility of shadowed light `slot` at world position `pos` (normal `N`), from its virtual
+// shadow map: a cube picks the face by the dominant axis of the light-to-point direction, a spot
+// has one. The lookup mip is the one whose texels match a screen pixel here (the rule the page
+// requests use), or the nearest coarser resident one. Area and sphere lights get penumbrae from
+// their size (PCSS): a blocker search finds the average occluder depth, opaque or glass, and the
+// PCF radius is the light's size × (receiver − blocker) / blocker, so shadows are sharp at contact
+// and soften away from it. Search and filter move to coarser mips when wider than
+// MAX_PENUMBRA_TEXELS, so a penumbra keeps its world size whatever the mip.
 fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
-    // Origin and shape as the maps were rendered, which can lag the light by a few frames.
     let first = local_shadow.faces[slot * 6u];
     let light = first.light;
     let shape = first.shape;
@@ -125,31 +176,51 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> ve
             face = select(5u, 4u, d.z > 0.0);
         }
     }
-    let f = local_shadow.faces[slot * 6u + face];
-    // No map: not rendered yet, or behind a one-sided light (which gives no light there anyway).
-    if f.rect.w == 0.0 {
+    let face_index = slot * 6u + face;
+    let f = local_shadow.faces[face_index];
+    // No pages: no shadowed light, or behind a one-sided light (which gives no light there anyway).
+    if shape.x == 0.0 || f.info.x == 0u {
         return vec3f(1.0);
     }
-    let size = f.rect.w;
     let tan_half = shape.y;
-
-    // World size of a texel at this distance: offset by ~1.5 of them along the normal.
-    let texel = 2.0 * dist * tan_half / size;
     let vp = f.view_proj;
-    let p = pos + N * (1.5 * texel);
-    let clip = vp * vec4f(p, 1.0);
+
+    let eye = camera.inv_view[3].xyz;
+    let footprint = max(dot(pos - eye, -camera.inv_view[2].xyz), 0.0) * local_shadow.lod.x;
+    let texel0 = 2.0 * (vp * vec4f(pos, 1.0)).w * tan_half / VSM_SIZE;
+    let wanted = u32(clamp(floor(log2(max(footprint / texel0, 1.0))), 0.0, f32(VSM_MIPS - 1u)));
+
+    // Offset ~1.5 texels along the normal, at the mip actually resident there.
+    var mip = wanted;
+    var resolved = vec4f(0.0);
+    var p = pos;
+    var clip = vec4f(0.0);
+    var uv = vec2f(0.0);
+    for (var attempt = 0u; attempt < 2u; attempt++) {
+        let texel = 2.0 * dist * tan_half / (VSM_SIZE / f32(1u << mip));
+        p = pos + N * (1.5 * texel);
+        clip = vp * vec4f(p, 1.0);
+        uv = (clip.xy / clip.w) * vec2f(0.5, -0.5) + 0.5;
+        resolved = vsm_lookup(face_index, uv, mip);
+        if resolved.w == 0.0 || u32(resolved.z) == mip {
+            break;
+        }
+        mip = u32(resolved.z);
+    }
     let ndc = clip.xyz / clip.w;
-    let uv = ndc.xy * vec2f(0.5, -0.5) + 0.5;
     // Outside a spot's map is outside its cone, where it gives no light anyway. A cube lookup can
-    // land just past its face's edge (normal offset); the tap clamp below keeps it on the face.
-    if shape.x < 1.5 && (clip.w <= 0.0 || any(abs(ndc.xy) > vec2f(1.0))) {
+    // land just past its face's edge (normal offset); `vsm_lookup` clamps it onto the face.
+    if resolved.w == 0.0 || (shape.x < 1.5 && (clip.w <= 0.0 || any(abs(ndc.xy) > vec2f(1.0)))) {
         return vec3f(1.0);
     }
+    vsm_resolved_mip = f32(mip);
+    let size = VSM_SIZE / f32(1u << mip);
+    let texel = 2.0 * dist * tan_half / size;
 
-    // Receiver-plane depth bias: the depth slope of the receiver's tangent plane in shadow-map UV,
-    // from two projected tangent points, so each tap of a wide kernel is compared against the
-    // plane's depth under that tap instead of the center's (no self-shadowing grain on surfaces
-    // tilted away from the light). The slope is clamped where the plane turns edge-on.
+    // Receiver-plane depth bias: the depth slope of the receiver's tangent plane in face UV, from
+    // two projected tangent points, so each tap of a wide kernel is compared against the plane's
+    // depth under that tap instead of the center's (no self-shadowing grain on surfaces tilted
+    // away from the light). The slope is clamped where the plane turns edge-on.
     let t1 = normalize(cross(N, select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(N.y) > 0.9)));
     let t2 = cross(N, t1);
     let c1 = vp * vec4f(p + t1 * texel, 1.0);
@@ -164,74 +235,84 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> ve
         slope = vec2f(dz1 * du2.y - dz2 * du1.y, du1.x * dz2 - du2.x * dz1) / det;
     }
     // The slope's offset is capped at the depth change of moving along the light ray by as far
-    // as the tap moved sideways: per texel here, times the kernel radius below.
+    // as the tap moved sideways: per texel of `mip` here, times the kernel radius below.
     let cap = vp * vec4f(p - (d / dist) * texel, 1.0);
     let max_dz_per_texel = abs(cap.z / cap.w - ndc.z);
 
-    // Taps stay half a texel inside the tile, so bilinear comparisons never read a neighbour's.
-    let half_texel = 0.5 / size;
     let angle = fract(52.9829189 * fract(dot(pixel, vec2f(0.06711056, 0.00583715)))) * 6.28318531;
     let rot = mat2x2<f32>(cos(angle), sin(angle), -sin(angle), cos(angle));
-    // Tangent of the field of view to texels of this face.
+    // Tangent of the field of view to texels of this face at `mip`.
     let to_texels = size / (2.0 * tan_half);
     // Glass in the tint atlas (alpha: its distance along the face axis, like `clip.w`) shadows the
-    // receiver when it's in front by more than one tint texel, so glass doesn't tint itself.
+    // receiver when it's in front by more than one texel, so glass doesn't tint itself.
+    let atlas = vec2f(textureDimensions(t_local_shadow));
     let tint_atlas = vec2f(textureDimensions(t_local_glass_tint));
-    let tint_texel = 2.0 * dist * tan_half / (f.rect.z * tint_atlas.x);
-    let glass_reference = clip.w - tint_texel;
+    let glass_reference = clip.w - texel;
 
     var radius_texels = 1.5;
+    var filter_mip = mip;
     if light.w > 0.0 {
         // Blocker search over where occluders as far as two thirds of the way back to the light
         // can still partly hide it: light size × (receiver − blocker) / (receiver × blocker).
         // Glass counts as a blocker too, so its shadows soften with distance like opaque ones.
+        // The search stays at `mip`, capped at MAX_PENUMBRA_TEXELS: at a coarser mip, a tilted
+        // receiver's own coarse depth reads as an occluder.
         let receiver = clip.w;
         let search_texels = clamp(2.0 * light.w / receiver * to_texels, 1.5, MAX_PENUMBRA_TEXELS);
-        let atlas = vec2f(textureDimensions(t_local_shadow));
+        let max_dz = max_dz_per_texel * search_texels;
         var blockers = 0.0;
         var blocker_depth = 0.0;
         for (var i = 0u; i < 12u; i++) {
             let offset = rot * POISSON[i] * (search_texels / size);
-            let tap = clamp(uv + offset, vec2f(half_texel), vec2f(1.0 - half_texel));
-            let max_dz = max_dz_per_texel * search_texels;
+            let at = vsm_lookup(face_index, uv + offset, mip);
+            if at.w == 0.0 {
+                continue;
+            }
             let reference = ndc.z + clamp(dot(slope, offset), -max_dz, max_dz);
-            let z = textureLoad(t_local_shadow, vec2<i32>((f.rect.xy + tap * f.rect.z) * atlas), 0);
+            let z = textureLoad(t_local_shadow, vec2<i32>(at.xy * atlas), 0);
             if z < reference {
                 blockers += 1.0;
                 blocker_depth += shape.z * shape.w / (shape.w - z * (shape.w - shape.z));
             }
-            let glass = textureLoad(t_local_glass_tint, vec2<i32>((f.rect.xy + tap * f.rect.z) * tint_atlas), 0).a;
+            let glass = textureLoad(t_local_glass_tint, vec2<i32>(at.xy * tint_atlas), 0).a;
             if glass < glass_reference {
                 blockers += 1.0;
                 blocker_depth += glass;
             }
         }
         if blockers == 0.0 {
-            radius_texels = 0.0;
-        } else {
-            let blocker = blocker_depth / blockers;
-            radius_texels = clamp(light.w * max(receiver - blocker, 0.0) / (receiver * blocker) * to_texels, 1.5, MAX_PENUMBRA_TEXELS);
+            return local_glass_tint(resolved.xy, glass_reference);
         }
+        let blocker = blocker_depth / blockers;
+        let radius = vsm_kernel_mip(mip, light.w * max(receiver - blocker, 0.0) / (receiver * blocker) * to_texels);
+        filter_mip = u32(radius.x);
+        radius_texels = max(radius.y, 1.5);
     }
 
-    if radius_texels == 0.0 {
-        return local_glass_tint(uv, f.rect, glass_reference);
-    }
     // Each tap is the opaque comparison times the glass transmittance there, so glass shadows get
-    // the same kernel (and penumbra) as opaque ones.
-    let radius = radius_texels / size;
-    let max_dz = max_dz_per_texel * radius_texels;
+    // the same kernel (and penumbra) as opaque ones. A coarser filter mip stores depth at coarser
+    // texel centres, off the receiver plane by up to its texel's depth slope, so the reference
+    // moves toward the light by that much more than the normal offset at `mip` covers.
+    let filter_scale = f32(1u << (filter_mip - mip));
+    let radius = radius_texels * filter_scale / size;
+    let max_dz = max_dz_per_texel * filter_scale * radius_texels;
+    let coarse_bias = max_dz_per_texel * (filter_scale - 1.0);
     var lit = vec3f(0.0);
+    var taps = 0.0;
     for (var i = 0u; i < 12u; i++) {
         let offset = rot * POISSON[i] * radius;
-        let tap = clamp(uv + offset, vec2f(half_texel), vec2f(1.0 - half_texel));
-        let depth = ndc.z + clamp(dot(slope, offset), -max_dz, max_dz);
-        let opaque = textureSampleCompareLevel(t_local_shadow, s_shadow, f.rect.xy + tap * f.rect.z, depth);
+        let at = vsm_lookup(face_index, uv + offset, filter_mip);
+        if at.w == 0.0 {
+            continue;
+        }
+        taps += 1.0;
+        let depth = ndc.z + clamp(dot(slope, offset), -max_dz, max_dz) - coarse_bias;
+        let opaque = textureSampleCompareLevel(t_local_shadow, s_shadow, at.xy, depth);
         if opaque > 0.0 {
-            lit += opaque * local_glass_tint(tap, f.rect, glass_reference);
+            lit += opaque * local_glass_tint(at.xy, glass_reference);
         }
     }
-    return lit / 12.0;
+    return lit / max(taps, 1.0);
 }
 
 // Visibility of a local light at this pixel, tinted by glass: its shadow if it has a shadow slot,
@@ -558,16 +639,15 @@ struct ShadowParams {
 @group(2) @binding(0) var<uniform> sp:       ShadowParams;
 @group(2) @binding(1) var          t_shadow: texture_depth_2d_array;
 @group(2) @binding(2) var          s_shadow: sampler_comparison;
-// Shadow atlas of every local light face (rendering::light::shadow_atlas).
+// Physical pages of the local lights' virtual shadow maps (rendering::light::virtual_shadow).
 @group(2) @binding(3) var          t_local_shadow: texture_depth_2d;
 
-// Mirrors rendering::pass::shadow::LocalShadowFace, as last rendered. rect: atlas UV offset (xy)
-// and scale (z), tile size in texels (w; 0 on a slot's first face = not rendered yet). light:
-// shadow origin (xyz), half size (w). shape: face count (6 cube, 1 spot), tan of half the field of
-// view, near, far.
+// Mirrors rendering::pass::shadow::LocalShadowFace. info.x: 1 if the face has pages. light:
+// shadow origin (xyz), half size (w). shape: face count (6 cube, 1 spot; 0 = no light), tan of
+// half the field of view, near, far.
 struct LocalShadowFace {
     view_proj: mat4x4<f32>,
-    rect:      vec4<f32>,
+    info:      vec4<u32>,
     light:     vec4<f32>,
     shape:     vec4<f32>,
 }
@@ -575,6 +655,8 @@ struct LocalShadowFace {
 // Mirrors rendering::pass::shadow::LocalShadowParams: six faces per slot (+X −X +Y −Y +Z −Z; a
 // spot light uses the first).
 struct LocalShadowParams {
+    // x: world size of a screen pixel per metre of view depth.
+    lod:   vec4<f32>,
     faces: array<LocalShadowFace, 192>,
 }
 
@@ -604,20 +686,16 @@ fn glass_tint(t: texture_2d_array<f32>, uv: vec2<f32>, layer: u32, depth: f32) -
     return tint;
 }
 
-// `glass_tint` for a face of the local tint atlas: taps stay inside the face's tile (`rect`, in
-// atlas UV; the tint atlas shares the depth atlas's layout at its own resolution).
-fn local_glass_tint(uv: vec2<f32>, rect: vec4<f32>, depth: f32) -> vec3<f32> {
-    let atlas = f32(textureDimensions(t_local_glass_tint).x);
-    let size = i32(rect.z * atlas);
-    let origin = vec2<i32>(rect.xy * atlas);
-    let p = uv * f32(size) - 0.5;
+// `glass_tint` at `atlas_uv` in the local tint atlas (from `vsm_lookup`, which keeps it half a
+// texel inside its page, so the 4 taps stay on that page).
+fn local_glass_tint(atlas_uv: vec2<f32>, depth: f32) -> vec3<f32> {
+    let p = atlas_uv * vec2f(textureDimensions(t_local_glass_tint)) - 0.5;
     let base = floor(p);
     let f = p - base;
     var tint = vec3f(0.0);
     for (var i = 0u; i < 4u; i++) {
         let o = vec2f(f32(i & 1u), f32(i >> 1u));
-        let texel = clamp(vec2<i32>(base + o), vec2<i32>(0), vec2<i32>(size - 1));
-        let s = textureLoad(t_local_glass_tint, origin + texel, 0);
+        let s = textureLoad(t_local_glass_tint, vec2<i32>(base + o), 0);
         let w = mix(1.0 - f.x, f.x, o.x) * mix(1.0 - f.y, f.y, o.y);
         tint += select(vec3f(1.0), s.rgb, s.a < depth) * w;
     }
@@ -1076,6 +1154,24 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
     let pos_ws4 = camera.inv_view_proj * vec4f(ndc_x, ndc_y, depth_v, 1.0);
     let pos_ws  = pos_ws4.xyz / pos_ws4.w;
 
+    if debug.view == 6u {
+        let colors = array<vec3<f32>, 7>(
+            vec3f(1.0, 0.0, 0.0), vec3f(1.0, 0.5, 0.0), vec3f(1.0, 1.0, 0.0), vec3f(0.0, 1.0, 0.0),
+            vec3f(0.0, 1.0, 1.0), vec3f(0.0, 0.0, 1.0), vec3f(0.5, 0.0, 1.0),
+        );
+        for (var slot = 0u; slot < shadowed.count; slot++) {
+            vsm_resolved_mip = -1.0;
+            let first = local_shadow.faces[slot * 6u];
+            if first.shape.x == 0.0 || distance(pos_ws, first.light.xyz) > first.shape.w {
+                continue;
+            }
+            light_shadow(slot, pos_ws, N, in.pos.xy);
+            if vsm_resolved_mip >= 0.0 {
+                return unreflective(colors[u32(vsm_resolved_mip)] * 0.5 + albedo * 0.5);
+            }
+        }
+        return unreflective(albedo * 0.3);
+    }
     if debug.view == 5u {
         var vis = vec3f(1.0);
         for (var slot = 0u; slot < min(shadowed.count, 3u); slot++) {
