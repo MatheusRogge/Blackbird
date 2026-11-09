@@ -57,6 +57,10 @@ pub struct ProbeGridParams {
     pub normal_bias: f32,                // offset 52
     pub view_bias: f32,                  // offset 56
     pub _pad: f32,                       // offset 60
+    /// `grid_origin` in probe cells from the anchor. Probes are stored in the atlas by world cell
+    /// modulo `grid_dim`, so a probe keeps its slot while the grid slides past it.
+    pub cell_origin: [i32; 3],           // offset 64
+    pub _pad1: u32,                      // offset 76
 }
 
 pub struct ProbeAtlasOutputs {
@@ -187,22 +191,17 @@ impl Pass for ProbeAtlasPass {
         // Snap the grid origin so probes always sit at world-aligned multiples of
         // probe_spacing (offset from anchor). The active window slides in discrete
         // steps to keep the camera inside the grid.
-        let grid_origin = {
+        let cell_origin: [i32; 3] = {
             let cameras = world.get_entities::<Camera>();
             let eye = cameras.first().map(|c| c.eye).unwrap_or_default();
             let dim = self.config.grid_dim;
-
-            let snap = |cam: f32, anc: f32, steps: u32| -> f32 {
+            let snap = |cam: f32, anc: f32, steps: u32| -> i32 {
                 let half = steps as f32 * probe_spacing * 0.5;
-                anc + ((cam - anc - half) / probe_spacing).floor() * probe_spacing
+                ((cam - anc - half) / probe_spacing).floor() as i32
             };
-
-            [
-                snap(eye.x, anchor[0], dim[0]),
-                snap(eye.y, anchor[1], dim[1]),
-                snap(eye.z, anchor[2], dim[2]),
-            ]
+            [snap(eye.x, anchor[0], dim[0]), snap(eye.y, anchor[1], dim[1]), snap(eye.z, anchor[2], dim[2])]
         };
+        let grid_origin: [f32; 3] = std::array::from_fn(|i| anchor[i] + cell_origin[i] as f32 * probe_spacing);
 
         let params = ProbeGridParams {
             grid_dim: cfg.grid_dim,
@@ -217,6 +216,8 @@ impl Pass for ProbeAtlasPass {
             normal_bias,
             view_bias,
             _pad: 0.0,
+            cell_origin,
+            _pad1: 0,
         };
 
         params_buf.write(queue, bytemuck::bytes_of(&params));

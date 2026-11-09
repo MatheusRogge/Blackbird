@@ -32,6 +32,8 @@ struct ProbeGridParams {
     normal_bias:            f32,
     view_bias:              f32,
     _pad:                   f32,
+    cell_origin:            vec3<i32>,
+    _pad1:                  u32,
 }
 
 struct CameraUniform {
@@ -364,6 +366,14 @@ fn chebyshev_weight(mean_d: f32, mean_d2: f32, dist: f32) -> f32 {
     return variance / (variance + d * d);
 }
 
+// Atlas slot of the probe at grid cell `ci`: its world cell modulo the grid, so a probe keeps its
+// slot (and its history) while the grid slides with the camera. Mirrors probe_update.wgsl.
+fn probe_slot(ci: vec3<i32>) -> u32 {
+    let dim = vec3<i32>(probe_params.grid_dim);
+    let s = ((probe_params.cell_origin + ci) % dim + dim) % dim;
+    return u32(s.x + dim.x * (s.y + dim.y * s.z));
+}
+
 // `dir` is the direction the irradiance is looked up in: the normal for diffuse, or near the
 // reflection vector as a stand-in for glossy reflections. Bias and visibility always follow `N_ws`.
 fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>, dir: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {
@@ -387,8 +397,7 @@ fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>, dir: vec3<f32>, v
                 let ci = base_i + vec3<i32>(dx, dy, dz);
                 if any(ci < vec3<i32>(0)) || any(ci >= dim) { continue; }
 
-                let probe_index = u32(ci.x) + probe_params.grid_dim.x
-                    * (u32(ci.y) + probe_params.grid_dim.y * u32(ci.z));
+                let probe_index = probe_slot(ci);
 
                 let wx = select(1.0 - frac.x, frac.x, dx == 1);
                 let wy = select(1.0 - frac.y, frac.y, dy == 1);

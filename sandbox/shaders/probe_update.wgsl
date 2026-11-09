@@ -13,6 +13,8 @@ struct ProbeGridParams {
     normal_bias:            f32,
     view_bias:              f32,
     _pad:                   f32,
+    cell_origin:            vec3<i32>,
+    _pad1:                  u32,
 }
 
 @group(0) @binding(0) var<storage, read> ray_radiance:   array<vec4<f32>>;
@@ -30,6 +32,34 @@ fn octahedral_decode(uv: vec2<f32>) -> vec3<f32> {
     n.x += select(t, -t, n.x >= 0.0);
     n.y += select(t, -t, n.y >= 0.0);
     return normalize(n);
+}
+
+// Probes are stored by world cell modulo the grid (mirrors `probe_slot` in lighting.wgsl), so
+// a probe keeps its history while the grid slides with the camera. The slot's visibility texels
+// carry a tag of the world cell they hold (blue channel); a slot whose tag doesn't match was
+// just handed to a probe entering the grid, and starts over instead of blending a probe ~60 m
+// away into it.
+fn probe_cell(probe_index: u32) -> vec3<i32> {
+    let dim = probe_params.grid_dim;
+    let local = vec3<u32>(probe_index % dim.x, (probe_index / dim.x) % dim.y, probe_index / (dim.x * dim.y));
+    return probe_params.cell_origin + vec3<i32>(local);
+}
+
+fn probe_slot(cell: vec3<i32>) -> u32 {
+    let dim = vec3<i32>(probe_params.grid_dim);
+    let s = (cell % dim + dim) % dim;
+    return u32(s.x + dim.x * (s.y + dim.y * s.z));
+}
+
+// Which wrap of the grid the cell is in, packed into an integer f16 holds exactly; 0 = empty.
+fn probe_tag(cell: vec3<i32>) -> f32 {
+    let dim = vec3<i32>(probe_params.grid_dim);
+    let wrap = (cell - (cell % dim + dim) % dim) / dim;
+    return f32(1 + (wrap.x & 15) + ((wrap.y & 7) << 4u) + ((wrap.z & 15) << 7u));
+}
+
+fn slot_is_fresh(slot: u32, tag: f32) -> bool {
+    return textureLoad(vis_prev, visibility_atlas_coord(slot, 0u, 0u), 0).b != tag;
 }
 
 fn irradiance_atlas_coord(probe_index: u32, tx: u32, ty: u32) -> vec2<i32> {
@@ -53,6 +83,9 @@ fn update_irradiance(@builtin(global_invocation_id) gid: vec3<u32>) {
     let probe_index = gid.z;
 
     if probe_index >= probe_params.probe_count      { return; }
+    let cell = probe_cell(probe_index);
+    let slot = probe_slot(cell);
+    let hysteresis = select(probe_params.hysteresis, 0.0, slot_is_fresh(slot, probe_tag(cell)));
     if tx          >= probe_params.irradiance_texel_size { return; }
     if ty          >= probe_params.irradiance_texel_size { return; }
 
@@ -71,9 +104,9 @@ fn update_irradiance(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     irradiance /= max(weight_sum, 1e-5);
 
-    let coord = irradiance_atlas_coord(probe_index, tx, ty);
+    let coord = irradiance_atlas_coord(slot, tx, ty);
     let prev  = textureLoad(irr_prev, coord, 0).rgb;
-    let out   = mix(irradiance, prev, probe_params.hysteresis);
+    let out   = mix(irradiance, prev, hysteresis);
     textureStore(irr_next, coord, vec4f(out, 1.0));
 }
 
@@ -84,6 +117,10 @@ fn update_visibility(@builtin(global_invocation_id) gid: vec3<u32>) {
     let probe_index = gid.z;
 
     if probe_index >= probe_params.probe_count       { return; }
+    let cell = probe_cell(probe_index);
+    let slot = probe_slot(cell);
+    let tag = probe_tag(cell);
+    let hysteresis = select(probe_params.hysteresis, 0.0, slot_is_fresh(slot, tag));
     if tx          >= probe_params.visibility_texel_size { return; }
     if ty          >= probe_params.visibility_texel_size { return; }
 
@@ -106,9 +143,9 @@ fn update_visibility(@builtin(global_invocation_id) gid: vec3<u32>) {
     mean_d  /= max(weight_sum, 1e-5);
     mean_d2 /= max(weight_sum, 1e-5);
 
-    let coord    = visibility_atlas_coord(probe_index, tx, ty);
+    let coord    = visibility_atlas_coord(slot, tx, ty);
     let prev     = textureLoad(vis_prev, coord, 0).rg;
-    let out_d    = mix(mean_d,  prev.r, probe_params.hysteresis);
-    let out_d2   = mix(mean_d2, prev.g, probe_params.hysteresis);
-    textureStore(vis_next, coord, vec4f(out_d, out_d2, 0.0, 1.0));
+    let out_d    = mix(mean_d,  prev.r, hysteresis);
+    let out_d2   = mix(mean_d2, prev.g, hysteresis);
+    textureStore(vis_next, coord, vec4f(out_d, out_d2, tag, 1.0));
 }
