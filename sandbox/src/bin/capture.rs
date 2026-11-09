@@ -14,11 +14,12 @@
 //!   --point x,y,z,I[,r]  add a white point light of I candela (range 10), source radius r (default 0)
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
 //!   --burst N            every particle emitter bursts N particles on the second frame
-//!   --move dx,dy,dz      over the last --move-frames frames, move the camera by this much per frame
+//!   --move dx,dy,dz      over --move-frames frames before the end (and before --hold), move the camera by this much per frame
 //!   --turn D             ... and turn it left by D degrees per frame
 //!   --move-frames N      default 0
 //!   --no-animation       keep scene animations (e.g. flickering lamps) at their first frame
-//!   --sequence           also write each moving frame, as <out>_<frame>.png
+//!   --hold N             ... then keep it still for the last N frames (default 0)
+//!   --sequence           also write each frame from the start of the move, as <out>_<frame>.png
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -60,6 +61,7 @@ struct Options {
     step: Vec3,
     turn: f32,
     move_frames: u32,
+    hold: u32,
     sequence: bool,
     animate: bool,
 }
@@ -93,6 +95,7 @@ fn parse_args() -> Result<Options> {
         step: Vec3::zero(),
         turn: 0.0,
         move_frames: 0,
+        hold: 0,
         sequence: false,
         animate: true,
     };
@@ -116,6 +119,7 @@ fn parse_args() -> Result<Options> {
             "--move" => options.step = parse_vec3(&value()?)?,
             "--turn" => options.turn = value()?.parse::<f32>()?.to_radians(),
             "--move-frames" => options.move_frames = value()?.parse()?,
+            "--hold" => options.hold = value()?.parse()?,
             "--sequence" => options.sequence = true,
             "--no-animation" => options.animate = false,
             "--point" => {
@@ -322,8 +326,8 @@ fn main() -> Result<()> {
                 scene.animate(&mut world, CAPTURE_FRAME_TIME);
             }
         }
-        let moving = frame + options.move_frames >= options.frames;
-        if moving {
+        let recorded = frame + options.move_frames + options.hold >= options.frames;
+        if recorded && frame + options.hold < options.frames {
             move_camera(&mut world, options.step, options.turn);
         }
         if frame == 1 && options.burst > 0 {
@@ -335,7 +339,7 @@ fn main() -> Result<()> {
         if options.stats {
             eprintln!("{}", renderer.frame_stats());
         }
-        if moving && options.sequence {
+        if recorded && options.sequence {
             let stem = options.out.with_extension("");
             save(&renderer, &PathBuf::from(format!("{}_{frame:04}.png", stem.display())))?;
         }
