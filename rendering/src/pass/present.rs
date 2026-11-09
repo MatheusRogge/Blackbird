@@ -191,6 +191,9 @@ impl Pass for PresentPass {
             ..Default::default()
         });
 
+        let (x, y) = ctx.output_origin;
+        let (w, h) = ctx.surface_size;
+        pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.draw(0..3, 0..1);

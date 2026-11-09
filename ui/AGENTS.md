@@ -14,6 +14,8 @@ EguiRenderer::new(device, surface_format, layers: Vec<Box<dyn UiLayer>>,
                   ui_wants_pointer: Arc<AtomicBool>, ui_wants_keyboard: Arc<AtomicBool>)
 renderer.on_events(&[InputEvent])          // translate engine input → egui RawInput
 renderer.execute(device, queue, encoder, view, (w, h), &World)
+renderer.scene_viewport() -> Option<[u32; 4]>   // last frame's SCENE_VIEWPORT_ID rect, in pixels
+pub const SCENE_VIEWPORT_ID: &str;              // egui temp data key (an egui::Rect in points)
 ```
 
 ## How it is wired
@@ -24,6 +26,9 @@ renderer.execute(device, queue, encoder, view, (w, h), &World)
 4. After the pass it stores `egui_wants_pointer_input()` / `egui_wants_keyboard_input()` into the shared atomics. The game thread reads them through `Engine::ui_wants_pointer()` / `ui_wants_keyboard()`, one frame late.
 
 Layers get `&World` under the render thread's **read** lock. Don't mutate game state from a layer. Share an `Arc<Mutex<_>>` with a plugin instead (that is how `editor` does it), and use `try_lock` so the render thread never blocks on the game thread.
+
+## Scene viewport
+A host whose UI shows the scene in only part of the window (the editor's viewport between its panels) stores that rect each frame as egui temp data under `SCENE_VIEWPORT_ID`. `EguiOverlay::scene_viewport` hands it (in physical pixels) to `Renderer::render`, which then renders the graph at that size and has `present` draw it there; without it the scene fills the window. It's read before the graph runs, so it is a frame old. The F1 overlay (`rendering::DebugLayer`) anchors to the same rect.
 
 ## Input translation notes
 - Mouse positions are divided by `pixels_per_point` (set from `InputEvent::ScaleFactorChanged`).

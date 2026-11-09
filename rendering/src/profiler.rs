@@ -29,16 +29,18 @@ pub struct DrawCounts {
 #[derive(Debug, Clone, Default)]
 pub struct FrameStats {
     pub frame: u64,
-    pub last_ms: f32,
-    pub avg_ms: f32,
+    /// Time between frames (60-frame average): what the frame rate is made of, GPU waits included.
+    pub frame_ms: f32,
     pub fps: f32,
+    /// CPU time recording the render graph (60-frame average).
+    pub cpu_ms: f32,
     pub passes: Vec<PassStats>,
     pub memory: ArenaStats,
 }
 
 impl fmt::Display for FrameStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "frame={} fps={:.1} cpu={:.2}ms (avg={:.2}ms)", self.frame, self.fps, self.last_ms, self.avg_ms)?;
+        write!(f, "frame={} fps={:.1} frame={:.2}ms cpu={:.2}ms", self.frame, self.fps, self.frame_ms, self.cpu_ms)?;
         let m = &self.memory;
         write!(
             f,
@@ -60,7 +62,11 @@ impl fmt::Display for FrameStats {
 
 pub struct FrameProfiler {
     frame: u64,
-    frame_times: VecDeque<f32>,
+    /// CPU time of each frame's graph recording.
+    cpu_times: VecDeque<f32>,
+    /// Time from each frame's start to the next's.
+    frame_intervals: VecDeque<f32>,
+    last_frame_start: Option<Instant>,
     pass_times: HashMap<&'static str, VecDeque<f32>>,
     pass_order: Vec<&'static str>,
     pass_draws: HashMap<&'static str, DrawCounts>,
@@ -74,7 +80,9 @@ impl Default for FrameProfiler {
     fn default() -> Self {
         Self {
             frame: 0,
-            frame_times: VecDeque::with_capacity(HISTORY),
+            cpu_times: VecDeque::with_capacity(HISTORY),
+            frame_intervals: VecDeque::with_capacity(HISTORY),
+            last_frame_start: None,
             pass_times: HashMap::new(),
             pass_order: Vec::new(),
             pass_draws: HashMap::new(),
@@ -87,16 +95,17 @@ impl Default for FrameProfiler {
 
 impl FrameProfiler {
     pub fn begin_frame(&mut self) {
-        self.frame_start = Instant::now();
+        let now = Instant::now();
+        if let Some(last) = self.last_frame_start {
+            push_capped(&mut self.frame_intervals, (now - last).as_secs_f32() * 1000.0);
+        }
+        self.last_frame_start = Some(now);
+        self.frame_start = now;
     }
 
     pub fn record_pass(&mut self, name: &'static str, duration: Duration) {
         let ms = duration.as_secs_f32() * 1000.0;
-        let history = self.pass_times.entry(name).or_insert_with(|| VecDeque::with_capacity(HISTORY));
-        if history.len() >= HISTORY {
-            history.pop_front();
-        }
-        history.push_back(ms);
+        push_capped(self.pass_times.entry(name).or_insert_with(|| VecDeque::with_capacity(HISTORY)), ms);
         if !self.pass_order.contains(&name) {
             self.pass_order.push(name);
         }
@@ -110,15 +119,11 @@ impl FrameProfiler {
     }
 
     pub fn end_frame(&mut self) {
-        let elapsed_ms = self.frame_start.elapsed().as_secs_f32() * 1000.0;
-        if self.frame_times.len() >= HISTORY {
-            self.frame_times.pop_front();
-        }
-        self.frame_times.push_back(elapsed_ms);
+        push_capped(&mut self.cpu_times, self.frame_start.elapsed().as_secs_f32() * 1000.0);
         self.frame += 1;
 
-        let avg_ms = rolling_avg(&self.frame_times);
-        let fps = if avg_ms > 0.0 { 1000.0 / avg_ms } else { 0.0 };
+        let frame_ms = rolling_avg(&self.frame_intervals);
+        let fps = if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 };
 
         let passes = self.pass_order.iter().filter_map(|&name| {
             let history = self.pass_times.get(name)?;
@@ -133,9 +138,9 @@ impl FrameProfiler {
 
         self.last_stats = FrameStats {
             frame: self.frame,
-            last_ms: elapsed_ms,
-            avg_ms,
+            frame_ms,
             fps,
+            cpu_ms: rolling_avg(&self.cpu_times),
             passes,
             memory: ArenaStats::default(),
         };
@@ -263,6 +268,13 @@ impl GpuProfiler {
         self.pending = false;
         Some(self.names.iter().copied().zip(self.last_gpu_times_ms.iter().copied()).collect())
     }
+}
+
+fn push_capped(history: &mut VecDeque<f32>, ms: f32) {
+    if history.len() >= HISTORY {
+        history.pop_front();
+    }
+    history.push_back(ms);
 }
 
 fn rolling_avg(history: &VecDeque<f32>) -> f32 {

@@ -168,7 +168,8 @@ pub fn draw(ctx: &egui::Context, state: &mut EditorState, world: &World, viewpor
     else {
         return;
     };
-    let view = View::new(camera, ctx.content_rect());
+    // The renderer draws the scene into the viewport only, at its aspect ratio.
+    let view = View::new(camera, viewport);
 
     let target = selected_target(state);
     if let Some(target) = target
@@ -344,9 +345,9 @@ fn draw_add_menu(ctx: &egui::Context, state: &mut EditorState, world: &World, vi
 }
 
 /// Adds `kind` where the ray through `at` (the viewport centre if `None`) meets the scene.
-pub fn place(ctx: &egui::Context, state: &mut EditorState, world: &World, kind: AddKind, at: Option<Pos2>) {
+pub fn place(state: &mut EditorState, world: &World, kind: AddKind, viewport: Rect, at: Option<Pos2>) {
     let Some(camera) = state.editor_camera_key.and_then(|key| world.get_entity::<Camera>(key)) else { return };
-    let view = View::new(camera, ctx.content_rect());
+    let view = View::new(camera, viewport);
     let placement = placement(world, state, &view, at.unwrap_or(view.screen.center()));
     state.add(kind, placement);
 }

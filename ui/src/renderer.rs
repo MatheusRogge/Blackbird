@@ -133,7 +133,22 @@ impl EguiRenderer {
     }
 }
 
+/// egui temp data (an `egui::Rect`, in points) where a host draws the 3D scene, set each frame by a
+/// UI layer (the editor's viewport). The renderer then renders the scene only at that size and
+/// draws it there (`scene_viewport`), and overlays like the F1 timings anchor to it.
+pub const SCENE_VIEWPORT_ID: &str = "blackbird_scene_viewport";
+
 impl EguiRenderer {
+    /// The scene viewport the layers set last frame, in physical pixels (x, y, width, height).
+    pub fn scene_viewport(&self) -> Option<[u32; 4]> {
+        let rect = self.ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::unique(SCENE_VIEWPORT_ID)))?;
+        let ppp = self.pixels_per_point;
+        let min = (rect.min.to_vec2() * ppp).round();
+        let max = (rect.max.to_vec2() * ppp).round();
+        (max.x > min.x && max.y > min.y && min.x >= 0.0 && min.y >= 0.0)
+            .then_some([min.x as u32, min.y as u32, (max.x - min.x) as u32, (max.y - min.y) as u32])
+    }
+
     pub fn execute(
         &mut self,
         device: &wgpu::Device,

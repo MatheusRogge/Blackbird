@@ -495,6 +495,7 @@ impl RenderGraph {
         output: ResourceId,
         surface_view: &wgpu::TextureView,
         surface_size: (u32, u32),
+        output_origin: (u32, u32),
         world: &World,
     ) -> wgpu::CommandBuffer {
         if let Some(times) = self.gpu_profiler.as_mut().and_then(GpuProfiler::try_read_results) {
@@ -673,6 +674,7 @@ impl RenderGraph {
                 bind_group,
                 upstream,
                 surface_size,
+                output_origin,
                 geometry,
                 frame,
             };

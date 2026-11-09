@@ -42,9 +42,9 @@ impl UiLayer for EditorUiLayer {
             (root.available_rect_before_wrap(), add)
         });
         if let Some(kind) = add {
-            gizmo::place(ctx, &mut state, world, kind, Some(viewport.center()));
+            gizmo::place(&mut state, world, kind, viewport, Some(viewport.center()));
         }
-        ctx.data_mut(|d| d.insert_temp(egui::Id::unique(debug_layer::VIEWPORT_RECT_ID), viewport));
+        ctx.data_mut(|d| d.insert_temp(egui::Id::unique(engine::ui::SCENE_VIEWPORT_ID), viewport));
         gizmo::draw(ctx, &mut state, world, viewport);
         draw_gi_window(ctx, &mut state, &self.debug_flags);
         build::draw_log_window(ctx, &mut state);

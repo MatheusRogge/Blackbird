@@ -1,6 +1,8 @@
 //! Rendering dev tools: an overlay (F1) with two tabs, per-pass CPU and GPU times and memory
 //! stats, and folded away below them the render layer toggles, debug visualisations and GI settings.
 //! `gi_controls` and `layer_toggles` are shared with hosts that put these settings in their own UI.
+//! The overlay sits in the top-right of the host's scene viewport (`ui::SCENE_VIEWPORT_ID`), read a
+//! frame late since this layer runs first; the whole window without one.
 
 use std::sync::{Arc, RwLock};
 
@@ -15,10 +17,6 @@ const LABEL_WIDTH: f32 = 64.0;
 const HEADER_HEIGHT: f32 = 20.0;
 const ROW_HEIGHT: f32 = 26.0;
 
-/// egui temp data (`egui::Rect`) a host can set each frame to the area the scene is drawn in;
-/// the overlay sits in its top-right corner (the whole window otherwise). Read a frame late, since
-/// this layer runs before the host's.
-pub const VIEWPORT_RECT_ID: &str = "blackbird_viewport_rect";
 const TOGGLE_KEY: egui::Key = egui::Key::F1;
 /// Width of a pass's GPU time bar at the frame's slowest pass.
 const BAR_WIDTH: f32 = 70.0;
@@ -53,7 +51,7 @@ impl UiLayer for DebugLayer {
 
         if self.visible {
             let viewport = ctx
-                .data(|d| d.get_temp::<egui::Rect>(egui::Id::unique(VIEWPORT_RECT_ID)))
+                .data(|d| d.get_temp::<egui::Rect>(egui::Id::unique(ui::SCENE_VIEWPORT_ID)))
                 .unwrap_or_else(|| ctx.content_rect());
             egui::Area::new(egui::Id::unique("frame_timings"))
                 .order(egui::Order::Foreground)
@@ -111,16 +109,26 @@ impl UiLayer for DebugLayer {
     }
 }
 
-/// Frame rate, frame time, CPU and GPU totals, and each pass's CPU (60-frame average) and GPU
+/// Frame rate and time (between frames), CPU recording time, GPU total, and each pass's CPU (60-frame average) and GPU
 /// time (a few frames old) with a bar scaled to the slowest pass.
 fn frame_timings(ui: &mut egui::Ui, stats: &FrameStats) {
-    let cpu: f32 = stats.passes.iter().map(|p| p.avg_ms).sum();
     let gpu_times: Vec<f32> = stats.passes.iter().filter_map(|p| p.gpu_ms).collect();
     let gpu = (!gpu_times.is_empty()).then(|| gpu_times.iter().sum::<f32>());
-    ui.label(egui::RichText::new(format!("{:5.1} fps   {:6.2} ms frame", stats.fps, stats.avg_ms)).strong());
-    ui.label(match gpu {
-        Some(gpu) => format!("cpu {cpu:6.2} ms   gpu {gpu:6.2} ms"),
-        None => format!("cpu {cpu:6.2} ms   gpu    n/a"),
+    ui.label(egui::RichText::new(format!("{:5.1} fps   {:6.2} ms frame", stats.fps, stats.frame_ms)).strong());
+    ui.horizontal(|ui| {
+        ui.label(format!("cpu {:6.2} ms", stats.cpu_ms));
+        match gpu {
+            Some(gpu) => {
+                ui.label(format!("gpu {gpu:6.2} ms"));
+                // The GPU work alone fills (most of) the frame: the frame rate is the GPU's.
+                if gpu > 0.85 * stats.frame_ms {
+                    ui.label(egui::RichText::new("GPU-bound").color(ui.visuals().warn_fg_color));
+                }
+            }
+            None => {
+                ui.label("gpu    n/a");
+            }
+        }
     });
     if stats.passes.is_empty() {
         return;

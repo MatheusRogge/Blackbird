@@ -37,7 +37,12 @@ pub struct PassContext<'a> {
     pub buffers: HashMap<ResourceId, BufferRange<'a>>,
     pub bind_group: Option<&'a wgpu::BindGroup>,
     pub upstream: HashMap<NodeId, &'a wgpu::BindGroup>,
+    /// Size the graph renders at (screen textures, aspect ratio).
     pub surface_size: (u32, u32),
+    /// Top-left pixel of the region of the output texture the graph draws into: passes writing
+    /// the output set their viewport to it (`surface_size` from here). (0, 0) unless a host shows
+    /// the scene in part of the window.
+    pub output_origin: (u32, u32),
     pub geometry: &'a GeometryArena,
     pub frame: &'a FrameArena,
 }

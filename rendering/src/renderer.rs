@@ -21,6 +21,12 @@ pub trait OverlayPass: Send + 'static {
         size: (u32, u32),
         world: &World,
     );
+
+    /// Where in the window the scene should be drawn (x, y, width, height in pixels), from the
+    /// last frame's UI; `None` for the whole window.
+    fn scene_viewport(&self) -> Option<[u32; 4]> {
+        None
+    }
 }
 
 pub trait RenderGraphBuilder: Send + 'static {
@@ -96,6 +102,8 @@ pub struct Renderer {
     max_texture_dimension: u32,
 
     graph: RenderGraph,
+    /// Size the graph renders at: the window, or the part a host shows the scene in.
+    scene_size: (u32, u32),
 
     surface_id: ResourceId,
 }
@@ -218,6 +226,7 @@ impl Renderer {
             device,
             queue,
             target,
+            scene_size: (config.width, config.height),
             config,
             graph,
             surface_id,
@@ -258,7 +267,8 @@ impl Renderer {
             Target::Offscreen { texture } => *texture = create_offscreen(&self.device, &self.config),
         }
 
-        self.graph.on_resize(width, height);
+        self.graph.on_resize(self.config.width, self.config.height);
+        self.scene_size = (self.config.width, self.config.height);
     }
 
     pub fn render(&mut self, world: &World, overlay: Option<&mut dyn OverlayPass>) {
@@ -290,7 +300,22 @@ impl Renderer {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let size = (self.config.width, self.config.height);
 
-        let cmd = self.graph.execute(&self.device, &self.queue, self.surface_id, &view, size, world);
+        // A host that shows the scene in part of the window (the editor's viewport) gets it
+        // rendered at that size only, instead of the whole window behind its panels.
+        let [x, y, w, h] = overlay
+            .as_ref()
+            .and_then(|o| o.scene_viewport())
+            .map(|[x, y, w, h]| {
+                let (x, y) = (x.min(size.0 - 1), y.min(size.1 - 1));
+                [x, y, w.min(size.0 - x).max(1), h.min(size.1 - y).max(1)]
+            })
+            .unwrap_or([0, 0, size.0, size.1]);
+        if self.scene_size != (w, h) {
+            self.scene_size = (w, h);
+            self.graph.on_resize(w, h);
+        }
+
+        let cmd = self.graph.execute(&self.device, &self.queue, self.surface_id, &view, (w, h), (x, y), world);
 
         if let Some(overlay) = overlay {
             let linear_fmt = self.config.format.remove_srgb_suffix();

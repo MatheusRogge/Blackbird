@@ -38,6 +38,10 @@ impl rendering::renderer::OverlayPass for EguiOverlay {
     ) {
         self.0.execute(device, queue, encoder, view, size, world);
     }
+
+    fn scene_viewport(&self) -> Option<[u32; 4]> {
+        self.0.scene_viewport()
+    }
 }
 
 /// Lets an application intercept the window's close button, e.g. to ask about unsaved work.
