@@ -4,7 +4,7 @@ wgpu 30 renderer (Vulkan backend forced). Contains the render graph, every rende
 
 ## Features
 - `rendering_2d` (default): the `rendering_2d` module.
-- `debug`: `DebugLayer` (an egui `UiLayer` with frame stats + `RenderDebugFlags` toggles/DDGI tuning). Pulls in `egui` + `ui`.
+- `debug`: `DebugLayer` (an egui `UiLayer`: F1 overlay with frame timing and memory tabs, `RenderDebugFlags` toggles / DDGI tuning folded below). Pulls in `egui` + `ui`.
 
 ## Module map
 
@@ -29,7 +29,7 @@ wgpu 30 renderer (Vulkan backend forced). Contains the render graph, every rende
 | `cache` | `PipelineCache`, `PipelineLayoutCache`, `BindGroupCache` helpers |
 | `profiler` | `FrameProfiler` (CPU per-pass, 60-frame avg; keeps the latest GPU time per pass name and puts it in every frame's `PassStats::gpu_ms`), `GpuProfiler` (timestamp queries, async readback; `resolve` takes the frame's pass names, `try_read_results` returns (name, ms) pairs; recreated when the pass count changes), `FrameStats`, `PassStats` |
 | `debug_flags` | `RenderDebugFlags` (shared `Arc<RwLock<_>>`), `DebugFlagsGpu`, `emissive_lights` toggle, `particles` toggle (CPU only: `particle_sim` uploads no emitters), `ambient_occlusion` toggle (CPU only: `ao` clears its output to 1), `contact_shadows` toggle (`DebugFlagsGpu::disable_contact_shadows`; the struct is padded to 48 bytes), `specular` toggle (all specular), `reflections` toggle (SSR + probe fallback, keeps direct highlights), `ssr` toggle (SSR only, leaving the probe fallback), `reflection_probe` toggle (camera-following probe; off = DDGI irradiance fallback), `GBufferView` (Lit / Albedo / Normal / Material / Emissive / LocalShadows / ShadowDetail (the virtual shadow mip each pixel's most important local light resolved to, red = mip 0 to violet = coarsest; `capture --view shadow-detail`): `lighting` outputs that G-buffer target instead of the lit image. It still goes through `present`'s ACES and the sRGB surface, so values are ordered correctly but not exact) |
-| `debug_layer` | `DebugLayer` (feature `debug`): egui frame stats, arena occupancy, debug flag toggles, and the "Texture aliasing" timeline (passes × physical textures, fed by `ArenaStats.screen_textures: Arc<AliasingReport>`) |
+| `debug_layer` | `DebugLayer` (feature `debug`): hidden until F1 (not while typing), then a translucent overlay in the top-right of the viewport with two tabs. **Timings**: fps, frame time, CPU and GPU totals, and per pass the CPU time (60-frame average) and GPU time (timestamp queries, a few frames old) with a bar scaled to the slowest pass (orange from half of it). **Memory**: arena occupancy and the "Texture aliasing" window toggle (passes × physical textures, fed by `ArenaStats.screen_textures: Arc<AliasingReport>`). Below either, folded: "Render settings" (`layer_toggles`, then "Global illumination" with `gi_controls`), scrolling within the viewport height left. Hosts set the viewport through egui temp data `VIEWPORT_RECT_ID` (an `egui::Rect`, read a frame late; the whole window otherwise). `gi_controls` / `layer_toggles` are public so hosts can show them in their own UI (the editor's Global Illumination window) |
 
 ## Render graph
 

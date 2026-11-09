@@ -63,6 +63,60 @@ pub struct BuildSettings {
     pub include: Vec<String>,
 }
 
+/// The editor's View menu, restored when the project opens. Editor only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ViewSettings {
+    pub grid: bool,
+    /// Markers of unselected lights and objects.
+    pub gizmos: bool,
+    pub animation: bool,
+    pub reflections: bool,
+    pub ssr: bool,
+    pub reflection_probe: bool,
+    pub ambient_occlusion: bool,
+    pub contact_shadows: bool,
+    pub particles: bool,
+}
+
+impl Default for ViewSettings {
+    fn default() -> Self {
+        Self {
+            grid: true,
+            gizmos: true,
+            animation: false,
+            reflections: true,
+            ssr: true,
+            reflection_probe: true,
+            ambient_occlusion: true,
+            contact_shadows: true,
+            particles: true,
+        }
+    }
+}
+
+/// DDGI probe settings, used by the editor and the player alike.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GiSettings {
+    /// Share of the previous probe value kept per update; higher is smoother but slower to react.
+    pub hysteresis: f32,
+    /// How far shading points move along their normal before sampling the probes.
+    pub normal_bias: f32,
+    /// How far shading points move toward the camera before sampling the probes.
+    pub view_bias: f32,
+    /// Distance between probes, in world units.
+    pub probe_spacing: f32,
+    /// A world point probes are aligned to.
+    pub grid_anchor: [f32; 3],
+}
+
+impl Default for GiSettings {
+    fn default() -> Self {
+        Self { hysteresis: 0.97, normal_bias: 0.2, view_bias: 0.1, probe_spacing: 5.0, grid_anchor: [0.0; 3] }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub name: String,
@@ -73,6 +127,10 @@ pub struct Project {
     pub camera: CameraSettings,
     #[serde(default)]
     pub build: BuildSettings,
+    #[serde(default)]
+    pub view: ViewSettings,
+    #[serde(default)]
+    pub gi: GiSettings,
 }
 
 impl Project {
@@ -87,6 +145,8 @@ impl Project {
             default_scene: None,
             camera: CameraSettings::default(),
             build: BuildSettings::default(),
+            view: ViewSettings::default(),
+            gi: GiSettings::default(),
         };
         project.save(dir)?;
         Ok(project)
@@ -160,5 +220,27 @@ impl Project {
             .collect();
         scenes.sort();
         scenes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn older_manifests_get_default_view_and_gi() {
+        let project = Project::parse(br#"{"name": "old", "version": "0.1.0", "default_scene": null}"#).unwrap();
+        assert_eq!(project.view, ViewSettings::default());
+        assert_eq!(project.gi, GiSettings::default());
+    }
+
+    #[test]
+    fn view_and_gi_round_trip() {
+        let mut project = Project::parse(br#"{"name": "p", "version": "0.1.0", "default_scene": null}"#).unwrap();
+        project.view.grid = false;
+        project.view.gizmos = false;
+        project.gi.probe_spacing = 2.5;
+        let json = serde_json::to_vec(&project).unwrap();
+        assert_eq!(Project::parse(&json).unwrap(), project);
     }
 }

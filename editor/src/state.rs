@@ -9,7 +9,7 @@ use ultraviolet::{Mat4, Vec3};
 pub use engine::gltf::camera::PhysicalCamera;
 pub use engine::gltf::lights::LightData;
 pub use engine::gltf::objects::{ObjectKind, SceneObject as ObjectData, Shape, ShapeMaterial};
-pub use project::CameraSettings;
+pub use project::{CameraSettings, GiSettings, ViewSettings};
 
 use crate::animation::{EditorClip, Timeline};
 use crate::asset_browser::AssetBrowserState;
@@ -302,11 +302,18 @@ pub struct EditorState {
     /// the scene on save.
     pub deleted_nodes: HashSet<usize>,
     pub gizmo_mode: GizmoMode,
-    /// Light markers for unselected lights. The selection's gizmo is always drawn.
-    pub show_gizmos: bool,
 
     pub editor_camera_key: Option<EntityKey>,
     pub camera_settings: CameraSettings,
+    /// The View menu (`gizmos`: markers for unselected lights and objects; the selection's gizmo
+    /// is always drawn) and the GI settings, mirrored from the renderer's debug flags by the UI each
+    /// frame and saved in `project.json` with the camera settings.
+    pub view_settings: ViewSettings,
+    pub gi_settings: GiSettings,
+    /// Set when a project's settings are loaded: the UI pushes them into the debug flags once.
+    pub apply_view_settings: bool,
+    /// The Global Illumination window (View menu).
+    pub show_gi_panel: bool,
 
     pub lights: Vec<SceneLight>,
     pub objects: Vec<EditorObject>,
@@ -370,13 +377,16 @@ impl EditorState {
             node_baselines: HashMap::new(),
             deleted_nodes: HashSet::new(),
             gizmo_mode: GizmoMode::default(),
-            show_gizmos: true,
             camera_preview_node: None,
             main_camera: None,
             particle_bursts: Vec::new(),
             burst_size: 100,
             editor_camera_key: None,
             camera_settings: CameraSettings::default(),
+            view_settings: ViewSettings::default(),
+            gi_settings: GiSettings::default(),
+            apply_view_settings: true,
+            show_gi_panel: false,
             lights: Vec::new(),
             objects: Vec::new(),
             entity_objects: HashMap::new(),

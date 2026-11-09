@@ -12,7 +12,7 @@ The user-facing facade. Owns the `Engine` state object, the `Plugin` system, and
 | `window` | + `assets`, `rendering` + `winit` + `pollster`, `windowed::WindowedApplication`, frame stats |
 | `ui` | + `ui` crate, `WindowedApplication::add_ui_layer` |
 | `full` | assets + gltf + window + ui |
-| `debug` | window + ui + `rendering/debug`: inserts `rendering::DebugLayer` as the first UI layer |
+| `debug` | window + ui + `rendering/debug`: inserts `rendering::DebugLayer` (F1 frame timing overlay) as the first UI layer |
 | `logging` | `engine::logging`: `env_logger` to stderr + optional file + in-memory `LogHistory` |
 
 Check that feature combos still build after you change cfg-gated code (`cargo check -p engine --no-default-features`, `--features window`, `--features full`). `window` without `ui` is what production `player` builds use, and `gltf` without `window` is what `build_tool` uses.

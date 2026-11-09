@@ -508,7 +508,7 @@ fn paint_player_starts(painter: &egui::Painter, view: &View, state: &EditorState
             continue;
         }
         let selected = state.selected == Some(Selection::Object(object.id));
-        if !state.show_gizmos && !selected {
+        if !state.view_settings.gizmos && !selected {
             continue;
         }
         let outline = if selected { ACTIVE_COLOR } else { Color32::from_gray(230) };
@@ -541,7 +541,7 @@ fn paint_emitters(painter: &egui::Painter, view: &View, state: &EditorState) -> 
     nodes.sort_unstable_by_key(|&(node, _)| node);
     for (node, data) in nodes {
         let selected = state.selected == Some(Selection::GltfNode(node));
-        if !state.show_gizmos && !selected {
+        if !state.view_settings.gizmos && !selected {
             continue;
         }
         let outline = if selected { ACTIVE_COLOR } else { Color32::from_gray(230) };
@@ -604,7 +604,7 @@ fn paint_light_markers(painter: &egui::Painter, view: &View, state: &EditorState
     let mut markers = Vec::new();
     let mut marks = Marks::default();
     for (idx, light) in state.lights.iter().enumerate() {
-        if !state.show_gizmos && selected != Some(idx) {
+        if !state.view_settings.gizmos && selected != Some(idx) {
             continue;
         }
         let stroke_color = if selected == Some(idx) { ACTIVE_COLOR } else { Color32::from_gray(230) };

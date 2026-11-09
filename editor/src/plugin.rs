@@ -342,6 +342,9 @@ impl EditorPlugin {
 
     fn set_project(&mut self, s: &mut EditorState, project: Project, dir: PathBuf) {
         s.camera_settings = project.camera.clone();
+        s.view_settings = project.view.clone();
+        s.gi_settings = project.gi.clone();
+        s.apply_view_settings = true;
         s.project_scenes = Project::list_scenes(&dir);
         s.assets.folder.clear();
         s.assets.selected = None;
@@ -355,9 +358,11 @@ impl EditorPlugin {
     /// Writes `project.json` once project settings have stopped changing for a moment.
     fn sync_project(&mut self) {
         let mut s = self.state.lock().expect("editor state mutex poisoned");
-        let camera = s.camera_settings.clone();
+        let (camera, view, gi) = (s.camera_settings.clone(), s.view_settings.clone(), s.gi_settings.clone());
         let Some(project) = s.project.as_mut() else { return };
         project.camera = camera;
+        project.view = view;
+        project.gi = gi;
         if self.saved_project.as_ref() == Some(project) {
             self.pending_project = None;
             return;

@@ -1,3 +1,7 @@
+//! Rendering dev tools: an overlay (F1) with two tabs, per-pass CPU and GPU times and memory
+//! stats, and folded away below them the render layer toggles, debug visualisations and GI settings.
+//! `gi_controls` and `layer_toggles` are shared with hosts that put these settings in their own UI.
+
 use std::sync::{Arc, RwLock};
 
 use engine_core::world::World;
@@ -11,178 +15,233 @@ const LABEL_WIDTH: f32 = 64.0;
 const HEADER_HEIGHT: f32 = 20.0;
 const ROW_HEIGHT: f32 = 26.0;
 
+/// egui temp data (`egui::Rect`) a host can set each frame to the area the scene is drawn in;
+/// the overlay sits in its top-right corner (the whole window otherwise). Read a frame late, since
+/// this layer runs before the host's.
+pub const VIEWPORT_RECT_ID: &str = "blackbird_viewport_rect";
+const TOGGLE_KEY: egui::Key = egui::Key::F1;
+/// Width of a pass's GPU time bar at the frame's slowest pass.
+const BAR_WIDTH: f32 = 70.0;
+/// Room below the settings for the header and the frame's margins.
+const SETTINGS_MARGIN: f32 = 40.0;
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Tab {
+    Timings,
+    Memory,
+}
+
 pub struct DebugLayer {
     stats: Arc<RwLock<FrameStats>>,
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
+    visible: bool,
+    tab: Tab,
 }
 
 impl DebugLayer {
     pub fn new(stats: Arc<RwLock<FrameStats>>, debug_flags: Arc<RwLock<RenderDebugFlags>>) -> Self {
-        Self { stats, debug_flags }
+        Self { stats, debug_flags, visible: false, tab: Tab::Timings }
     }
 }
 
 impl UiLayer for DebugLayer {
     fn ui(&mut self, ctx: &egui::Context, _world: &World) {
+        if !ctx.egui_wants_keyboard_input() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, TOGGLE_KEY)) {
+            self.visible = !self.visible;
+        }
         let stats = self.stats.read().expect("frame_stats RwLock poisoned").clone();
 
-        egui::Window::new("Rendering Stats")
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(format!(
-                    "frame {:5}   fps {:.1}   cpu {:.2}ms (avg {:.2}ms)",
-                    stats.frame, stats.fps, stats.last_ms, stats.avg_ms
-                ));
-
-                if !stats.passes.is_empty() {
-                    ui.separator();
-                    egui::Grid::new("passes")
-                        .striped(true)
-                        .min_col_width(120.0)
+        if self.visible {
+            let viewport = ctx
+                .data(|d| d.get_temp::<egui::Rect>(egui::Id::unique(VIEWPORT_RECT_ID)))
+                .unwrap_or_else(|| ctx.content_rect());
+            egui::Area::new(egui::Id::unique("frame_timings"))
+                .order(egui::Order::Foreground)
+                .pivot(egui::Align2::RIGHT_TOP)
+                .fixed_pos(viewport.right_top() + egui::vec2(-10.0, 10.0))
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_black_alpha(200))
+                        .corner_radius(6.0)
+                        .inner_margin(10.0)
                         .show(ui, |ui| {
-                            ui.label("pass");
-                            ui.label("cpu (last)");
-                            ui.label("cpu (avg)");
-                            ui.label("gpu");
-                            ui.end_row();
-
-                            for pass in &stats.passes {
-                                ui.label(pass.name);
-                                ui.label(format!("{:.2}ms", pass.last_ms));
-                                ui.label(format!("{:.2}ms", pass.avg_ms));
-                                if let Some(gpu) = pass.gpu_ms {
-                                    ui.label(format!("{:.2}ms", gpu));
-                                } else {
-                                    ui.label("—");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut self.tab, Tab::Timings, "Timings");
+                                ui.selectable_value(&mut self.tab, Tab::Memory, "Memory");
+                            });
+                            ui.separator();
+                            ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+                            match self.tab {
+                                Tab::Timings => frame_timings(ui, &stats),
+                                Tab::Memory => {
+                                    memory(ui, &stats);
+                                    let mut flags = self.debug_flags.write().expect("debug_flags RwLock poisoned");
+                                    ui.checkbox(&mut flags.show_texture_aliasing, "Texture aliasing timeline");
                                 }
-                                ui.end_row();
                             }
+                            ui.add_space(4.0);
+                            // The settings scroll within what's left of the viewport: an area taller
+                            // than the window is clipped, leaving its lower controls out of reach.
+                            let left = viewport.bottom() - 10.0 - ui.min_rect().bottom() - SETTINGS_MARGIN;
+                            egui::CollapsingHeader::new("Render settings").default_open(false).show(ui, |ui| {
+                                ui.style_mut().override_text_style = None;
+                                egui::ScrollArea::vertical().max_height(left.max(80.0)).show(ui, |ui| {
+                                    let mut flags = self.debug_flags.write().expect("debug_flags RwLock poisoned");
+                                    layer_toggles(ui, &mut flags);
+                                    ui.separator();
+                                    egui::CollapsingHeader::new("Global illumination").show(ui, |ui| {
+                                        gi_controls(ui, &mut flags);
+                                    });
+                                });
+                            });
                         });
-                }
-
-                ui.separator();
-                let mem = &stats.memory;
-                let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
-                egui::Grid::new("arenas").striped(true).show(ui, |ui| {
-                    ui.label("upload arena");
-                    ui.label(format!("{:.2} MiB in {} page(s)", mib(mem.upload_bytes), mem.upload_pages));
-                    ui.end_row();
-                    ui.label("geometry");
-                    ui.label(format!(
-                        "{}/{} verts  {}/{} indices  (gen {})",
-                        mem.geometry_vertices.0,
-                        mem.geometry_vertices.1,
-                        mem.geometry_indices.0,
-                        mem.geometry_indices.1,
-                        mem.geometry_generation
-                    ));
-                    ui.end_row();
-                    ui.label("frame arena");
-                    ui.label(format!(
-                        "{:.1}/{:.1} KiB  (gen {})",
-                        mem.frame_bytes.0 as f64 / 1024.0,
-                        mem.frame_bytes.1 as f64 / 1024.0,
-                        mem.frame_generation
-                    ));
-                    ui.end_row();
-                    ui.label("screen textures");
-                    ui.label(format!(
-                        "{} logical ➡ {} physical",
-                        mem.screen_textures.logical(),
-                        mem.screen_textures.physical()
-                    ));
-                    ui.end_row();
                 });
+        }
 
-                ui.separator();
-                ui.label("Layers");
-                if let Ok(mut flags) = self.debug_flags.write() {
-                    ui.checkbox(&mut flags.albedo, "Albedo");
-                    ui.checkbox(&mut flags.indirect, "Indirect (GI)");
-                    ui.checkbox(&mut flags.direct, "Direct lights");
-                    ui.checkbox(&mut flags.shadows, "Shadows");
-                    ui.checkbox(&mut flags.ambient_occlusion, "Ambient occlusion");
-                    ui.checkbox(&mut flags.contact_shadows, "Contact shadows");
-                    ui.checkbox(&mut flags.emissive_lights, "Emissive lights");
-                    ui.checkbox(&mut flags.specular, "Specular");
-                    ui.checkbox(&mut flags.reflections, "Reflections");
-                    ui.add_enabled_ui(flags.reflections, |ui| {
-                        ui.indent("reflections_indent", |ui| {
-                            ui.checkbox(&mut flags.ssr, "Screen-space");
-                            ui.checkbox(&mut flags.reflection_probe, "Reflection probe");
-                        });
-                    });
-                    ui.checkbox(&mut flags.particles, "Particles");
-                    egui::ComboBox::from_label("View")
-                        .selected_text(flags.view.label())
-                        .show_ui(ui, |ui| {
-                            for view in GBufferView::ALL {
-                                ui.selectable_value(&mut flags.view, view, view.label());
-                            }
-                        });
-
-                    ui.separator();
-                    ui.label("Visualization");
-                    ui.checkbox(&mut flags.show_bvh, "BVH AABBs");
-                    if flags.show_bvh {
-                        ui.indent("bvh_indent", |ui| {
-                            ui.checkbox(&mut flags.bvh_leaves_only, "Leaves only");
-                        });
-                    }
-                    ui.checkbox(&mut flags.show_probes, "DDGI Probes");
-                    ui.checkbox(&mut flags.show_texture_aliasing, "Texture aliasing");
-
-                    ui.separator();
-                    ui.label("DDGI");
-                    ui.add(
-                        egui::Slider::new(&mut flags.ddgi_hysteresis, 0.0..=1.0)
-                            .text("Hysteresis"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut flags.ddgi_normal_bias, 0.0..=1.0)
-                            .text("Normal Bias"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut flags.ddgi_view_bias, 0.0..=1.0)
-                            .text("View Bias"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut flags.ddgi_probe_spacing, 0.5..=50.0)
-                            .text("Probe Spacing"),
-                    );
-                    ui.label("Grid Anchor");
-                    egui::Grid::new("grid_anchor").num_columns(2).show(ui, |ui| {
-                        ui.label("X");
-                        ui.add(egui::DragValue::new(&mut flags.ddgi_grid_anchor[0]).speed(0.5));
-                        ui.end_row();
-                        ui.label("Y");
-                        ui.add(egui::DragValue::new(&mut flags.ddgi_grid_anchor[1]).speed(0.5));
-                        ui.end_row();
-                        ui.label("Z");
-                        ui.add(egui::DragValue::new(&mut flags.ddgi_grid_anchor[2]).speed(0.5));
-                        ui.end_row();
-                    });
-                }
-            });
-
-        let mut open = self
-            .debug_flags
-            .read()
-            .expect("debug_flags RwLock poisoned")
-            .show_texture_aliasing;
+        let mut open = self.debug_flags.read().expect("debug_flags RwLock poisoned").show_texture_aliasing;
         if open {
             egui::Window::new("Texture aliasing")
                 .open(&mut open)
                 .resizable(false)
                 .show(ctx, |ui| aliasing_timeline(ui, &stats.memory.screen_textures));
             if !open {
-                self.debug_flags
-                    .write()
-                    .expect("debug_flags RwLock poisoned")
-                    .show_texture_aliasing = false;
+                self.debug_flags.write().expect("debug_flags RwLock poisoned").show_texture_aliasing = false;
             }
         }
     }
+}
+
+/// Frame rate, frame time, CPU and GPU totals, and each pass's CPU (60-frame average) and GPU
+/// time (a few frames old) with a bar scaled to the slowest pass.
+fn frame_timings(ui: &mut egui::Ui, stats: &FrameStats) {
+    let cpu: f32 = stats.passes.iter().map(|p| p.avg_ms).sum();
+    let gpu_times: Vec<f32> = stats.passes.iter().filter_map(|p| p.gpu_ms).collect();
+    let gpu = (!gpu_times.is_empty()).then(|| gpu_times.iter().sum::<f32>());
+    ui.label(egui::RichText::new(format!("{:5.1} fps   {:6.2} ms frame", stats.fps, stats.avg_ms)).strong());
+    ui.label(match gpu {
+        Some(gpu) => format!("cpu {cpu:6.2} ms   gpu {gpu:6.2} ms"),
+        None => format!("cpu {cpu:6.2} ms   gpu    n/a"),
+    });
+    if stats.passes.is_empty() {
+        return;
+    }
+    ui.separator();
+    let slowest = gpu_times.iter().copied().fold(0.0f32, f32::max).max(1e-3);
+    let warn = ui.visuals().warn_fg_color;
+    egui::Grid::new("pass_timings").num_columns(4).spacing([10.0, 2.0]).show(ui, |ui| {
+        ui.label(egui::RichText::new("pass").weak());
+        ui.label(egui::RichText::new("   cpu").weak());
+        ui.label(egui::RichText::new("   gpu").weak());
+        ui.label("");
+        ui.end_row();
+        for pass in &stats.passes {
+            ui.label(pass.name);
+            ui.label(format!("{:6.2}", pass.avg_ms));
+            match pass.gpu_ms {
+                Some(gpu) => {
+                    ui.label(format!("{gpu:6.2}"));
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(BAR_WIDTH, 8.0), egui::Sense::hover());
+                    let width = BAR_WIDTH * (gpu / slowest).min(1.0);
+                    let color = if gpu >= 0.5 * slowest { warn } else { ui.visuals().widgets.inactive.fg_stroke.color };
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(rect.left_center() - egui::vec2(0.0, 3.0), egui::vec2(width, 6.0)),
+                        2.0,
+                        color,
+                    );
+                }
+                None => {
+                    ui.label("     -");
+                    ui.label("");
+                }
+            }
+            ui.end_row();
+        }
+    });
+}
+
+fn memory(ui: &mut egui::Ui, stats: &FrameStats) {
+    let mem = &stats.memory;
+    let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+    egui::Grid::new("arenas").striped(true).show(ui, |ui| {
+        ui.label("upload arena");
+        ui.label(format!("{:.2} MiB in {} page(s)", mib(mem.upload_bytes), mem.upload_pages));
+        ui.end_row();
+        ui.label("geometry");
+        ui.label(format!(
+            "{}/{} verts  {}/{} indices  (gen {})",
+            mem.geometry_vertices.0, mem.geometry_vertices.1, mem.geometry_indices.0, mem.geometry_indices.1, mem.geometry_generation
+        ));
+        ui.end_row();
+        ui.label("frame arena");
+        ui.label(format!(
+            "{:.1}/{:.1} KiB  (gen {})",
+            mem.frame_bytes.0 as f64 / 1024.0,
+            mem.frame_bytes.1 as f64 / 1024.0,
+            mem.frame_generation
+        ));
+        ui.end_row();
+        ui.label("screen textures");
+        ui.label(format!("{} logical ➡ {} physical", mem.screen_textures.logical(), mem.screen_textures.physical()));
+        ui.end_row();
+    });
+}
+
+/// Toggles for each part of the lighting, the G-buffer view, and debug visualisations.
+pub fn layer_toggles(ui: &mut egui::Ui, flags: &mut RenderDebugFlags) {
+    ui.checkbox(&mut flags.albedo, "Albedo");
+    ui.checkbox(&mut flags.indirect, "Indirect (GI)");
+    ui.checkbox(&mut flags.direct, "Direct lights");
+    ui.checkbox(&mut flags.shadows, "Shadows");
+    ui.checkbox(&mut flags.ambient_occlusion, "Ambient occlusion");
+    ui.checkbox(&mut flags.contact_shadows, "Contact shadows");
+    ui.checkbox(&mut flags.emissive_lights, "Emissive lights");
+    ui.checkbox(&mut flags.specular, "Specular");
+    ui.checkbox(&mut flags.reflections, "Reflections");
+    ui.add_enabled_ui(flags.reflections, |ui| {
+        ui.indent("reflections_indent", |ui| {
+            ui.checkbox(&mut flags.ssr, "Screen-space");
+            ui.checkbox(&mut flags.reflection_probe, "Reflection probe");
+        });
+    });
+    ui.checkbox(&mut flags.particles, "Particles");
+    egui::ComboBox::from_label("View").selected_text(flags.view.label()).show_ui(ui, |ui| {
+        for view in GBufferView::ALL {
+            ui.selectable_value(&mut flags.view, view, view.label());
+        }
+    });
+    ui.separator();
+    ui.checkbox(&mut flags.show_bvh, "BVH AABBs");
+    if flags.show_bvh {
+        ui.indent("bvh_indent", |ui| {
+            ui.checkbox(&mut flags.bvh_leaves_only, "Leaves only");
+        });
+    }
+}
+
+/// DDGI probe settings and the probe visualisation.
+pub fn gi_controls(ui: &mut egui::Ui, flags: &mut RenderDebugFlags) {
+    egui::Grid::new("gi_controls").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Hysteresis").on_hover_text("Share of the previous probe value kept per update: higher is smoother but reacts more slowly to changes.");
+        ui.add(egui::Slider::new(&mut flags.ddgi_hysteresis, 0.0..=0.995));
+        ui.end_row();
+        ui.label("Normal bias").on_hover_text("How far shading points move along their normal before sampling the probes, against leaks through walls.");
+        ui.add(egui::Slider::new(&mut flags.ddgi_normal_bias, 0.0..=1.0).suffix(" m"));
+        ui.end_row();
+        ui.label("View bias").on_hover_text("How far shading points move toward the camera before sampling the probes.");
+        ui.add(egui::Slider::new(&mut flags.ddgi_view_bias, 0.0..=1.0).suffix(" m"));
+        ui.end_row();
+        ui.label("Probe spacing").on_hover_text("Distance between probes. The grid has 12 × 6 × 12 probes, so it covers 11 × 5 × 11 spacings.");
+        ui.add(egui::Slider::new(&mut flags.ddgi_probe_spacing, 0.5..=20.0).suffix(" m").logarithmic(true));
+        ui.end_row();
+        ui.label("Grid anchor").on_hover_text("A world point the probes are aligned to.");
+        ui.horizontal(|ui| {
+            for (axis, value) in ["x", "y", "z"].iter().zip(flags.ddgi_grid_anchor.iter_mut()) {
+                ui.add(egui::DragValue::new(value).speed(0.05).prefix(format!("{axis} ")));
+            }
+        });
+        ui.end_row();
+    });
+    ui.checkbox(&mut flags.show_probes, "Show probes");
 }
 
 /// Passes run left to right, each row is one physical texture, and each bar is

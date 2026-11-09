@@ -12,7 +12,7 @@ Standalone runtime for an editor project: boots `project.json`, streams the defa
 | `Unbound` | no manifest (`cargo run -p player -- <project-dir>`) | the project dir given as the first argument |
 
 ## Features
-- `dev` (default): `engine/debug` (rendering stats overlay), log file at `<exe dir>/logs/player.log`, `dev_tools.rs`: Dev Tools window (F1) with build/asset/scene info and a log console, and a free camera (F2; WASD + LMB look).
+- `dev` (default): `engine/debug` (frame timing overlay, also on F1), log file at `<exe dir>/logs/player.log`, `dev_tools.rs`: Dev Tools window (F1) with build/asset/scene info and a log console, and a free camera (F2; WASD + LMB look).
 - `production`: `log/release_max_level_warn`. With `dev` off there is no egui, no dev tools and no log file. Logs go to stderr at warn level. The Windows subsystem is GUI (no console).
 
 Profiles live in the workspace `Cargo.toml`: `development` (dev, opt-level 1) and `production` (release + `panic = "abort"`, fat LTO, stripped).

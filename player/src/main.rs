@@ -5,12 +5,13 @@ mod dev_tools;
 mod game;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, bail};
 use engine::assets::pack::{PackReader, PackSource};
 use engine::assets::{AssetManifest, AssetSource, DirectorySource};
 use engine::logging::{LevelFilter, LogConfig};
+use engine::rendering::debug_flags::RenderDebugFlags;
 use engine::rendering::pbr::RenderGraphPBRBuilder;
 use engine::rendering::shader::ShaderAsset;
 use engine::windowed::WindowedApplication;
@@ -110,7 +111,8 @@ fn main() -> Result<()> {
         ShaderAsset::from_raw(include_str!("../../sandbox/shaders/ssr_temporal.wgsl")),
         ShaderAsset::from_raw(include_str!("../../sandbox/shaders/particle_sim.wgsl")),
         ShaderAsset::from_raw(include_str!("../../sandbox/shaders/ao.wgsl")),
-    );
+    )
+    .with_debug_flags(Arc::new(RwLock::new(gi_flags(&project.gi))));
 
     #[cfg(feature = "dev")]
     let dev = dev_tools::DevState::shared(&project, source.describe(), manifest.as_ref().map(AssetManifest::len));
@@ -139,4 +141,16 @@ fn main() -> Result<()> {
 
     app.run()?;
     Ok(())
+}
+
+/// Render flags lighting the scene with the GI settings it was tuned with in the editor.
+fn gi_flags(gi: &project::GiSettings) -> RenderDebugFlags {
+    RenderDebugFlags {
+        ddgi_hysteresis: gi.hysteresis,
+        ddgi_normal_bias: gi.normal_bias,
+        ddgi_view_bias: gi.view_bias,
+        ddgi_probe_spacing: gi.probe_spacing,
+        ddgi_grid_anchor: gi.grid_anchor,
+        ..RenderDebugFlags::default()
+    }
 }

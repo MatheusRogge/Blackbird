@@ -6,11 +6,13 @@ mod gizmo;
 mod hierarchy;
 mod inspector;
 mod toolbar;
+mod view_settings;
 
 use std::sync::{Arc, RwLock};
 
 use engine_core::world::World;
 use engine::rendering::debug_flags::RenderDebugFlags;
+use engine::rendering::debug_layer;
 use engine::ui::UiLayer;
 
 use crate::state::{Prompt, PromptAnswer, SharedState};
@@ -30,6 +32,7 @@ impl EditorUiLayer {
 impl UiLayer for EditorUiLayer {
     fn ui(&mut self, ctx: &egui::Context, world: &World) {
         let Ok(mut state) = self.state.try_lock() else { return };
+        view_settings::sync(&mut state, &mut self.debug_flags.write().expect("debug_flags poisoned"));
         let (viewport, add) = ctx.root_ui(|root| {
             toolbar::draw(root, &mut state, &self.debug_flags);
             let add = hierarchy::draw(root, &mut state);
@@ -41,7 +44,9 @@ impl UiLayer for EditorUiLayer {
         if let Some(kind) = add {
             gizmo::place(ctx, &mut state, world, kind, Some(viewport.center()));
         }
+        ctx.data_mut(|d| d.insert_temp(egui::Id::unique(debug_layer::VIEWPORT_RECT_ID), viewport));
         gizmo::draw(ctx, &mut state, world, viewport);
+        draw_gi_window(ctx, &mut state, &self.debug_flags);
         build::draw_log_window(ctx, &mut state);
         draw_camera_hints(ctx);
         draw_prompt(ctx, &mut state);
@@ -124,6 +129,28 @@ fn draw_prompt(ctx: &egui::Context, state: &mut crate::state::EditorState) {
 
 fn cancel_pressed(ctx: &egui::Context) -> bool {
     ctx.input(|i| i.key_pressed(egui::Key::Escape))
+}
+
+/// View ▸ Global Illumination: the DDGI probe settings, saved in `project.json` and used by builds.
+fn draw_gi_window(ctx: &egui::Context, state: &mut crate::state::EditorState, debug_flags: &RwLock<RenderDebugFlags>) {
+    let mut open = state.show_gi_panel;
+    egui::Window::new("Global Illumination").open(&mut open).resizable(false).show(ctx, |ui| {
+        let mut flags = debug_flags.write().expect("debug_flags poisoned");
+        debug_layer::gi_controls(ui, &mut flags);
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Reset to defaults").clicked() {
+                let defaults = RenderDebugFlags::default();
+                flags.ddgi_hysteresis = defaults.ddgi_hysteresis;
+                flags.ddgi_normal_bias = defaults.ddgi_normal_bias;
+                flags.ddgi_view_bias = defaults.ddgi_view_bias;
+                flags.ddgi_probe_spacing = defaults.ddgi_probe_spacing;
+                flags.ddgi_grid_anchor = defaults.ddgi_grid_anchor;
+            }
+            ui.label(egui::RichText::new("Saved with the project; builds use them too.").small().weak());
+        });
+    });
+    state.show_gi_panel = open;
 }
 
 fn draw_camera_hints(ctx: &egui::Context) {
