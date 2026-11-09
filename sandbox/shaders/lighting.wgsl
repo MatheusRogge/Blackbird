@@ -52,14 +52,18 @@ struct CameraUniform {
 
 // Mirrors rendering::pass::reflection_probe::ReflectionProbeParams.
 struct ReflectionProbeParams {
-    // xyz: world-space center; w: 1 once captured.
-    center:  vec4<f32>,
+    // Per cube: xyz: world-space center it was captured from; w: 1 once captured.
+    centers: array<vec4<f32>, 2>,
     max_lod: f32,
+    // Share of cube 1 (t_reflection_b): the newer capture fades in over one capture cycle.
+    blend:   f32,
 }
 
 // The camera-following reflection probe, GGX-prefiltered: mip = perceptual roughness × max_lod.
 // rgb: unexposed radiance; a: distance from the center to what was captured in that direction.
+// Two captures, crossfaded (see `blend`).
 @group(3) @binding(5) var t_reflection: texture_cube<f32>;
+@group(3) @binding(8) var t_reflection_b: texture_cube<f32>;
 @group(3) @binding(6) var<uniform> reflection: ReflectionProbeParams;
 @group(3) @binding(7) var s_reflection: sampler;
 
@@ -543,21 +547,32 @@ fn env_brdf_approx(f0: vec3<f32>, roughness: f32, n_dot_v: f32) -> vec3<f32> {
 // center, not from `pos_ws`, so the lookup direction is parallax-corrected with the captured
 // distance: a few fixed-point steps find where the ray from `pos_ws` meets the captured surface.
 fn reflected_radiance(pos_ws: vec3<f32>, N: vec3<f32>, R: vec3<f32>, view_dir: vec3<f32>, roughness: f32) -> vec3<f32> {
-    if reflection.center.w < 0.5 {
+    if reflection.centers[0].w + reflection.centers[1].w < 0.5 {
         return sample_probe_irradiance(pos_ws, N, R, view_dir);
     }
-    let c = reflection.center.xyz;
+    let lod = roughness * reflection.max_lod;
+    var radiance = vec3f(0.0);
+    if reflection.blend < 1.0 {
+        radiance += parallax_probe(t_reflection, reflection.centers[0].xyz, pos_ws, R, lod) * (1.0 - reflection.blend);
+    }
+    if reflection.blend > 0.0 {
+        radiance += parallax_probe(t_reflection_b, reflection.centers[1].xyz, pos_ws, R, lod) * reflection.blend;
+    }
+    return radiance;
+}
+
+fn parallax_probe(cube: texture_cube<f32>, c: vec3<f32>, pos_ws: vec3<f32>, R: vec3<f32>, lod: f32) -> vec3<f32> {
     var dir = R;
-    var t = textureSampleLevel(t_reflection, s_reflection, R, 0.0).a;
+    var t = textureSampleLevel(cube, s_reflection, R, 0.0).a;
     for (var i = 0u; i < 4u; i++) {
         let v = pos_ws + R * t - c;
         dir = select(R, normalize(v), dot(v, v) > 1e-6);
-        let hit = c + dir * textureSampleLevel(t_reflection, s_reflection, dir, 0.0).a;
+        let hit = c + dir * textureSampleLevel(cube, s_reflection, dir, 0.0).a;
         t = max(dot(hit - pos_ws, R), 0.0);
     }
     let v = pos_ws + R * t - c;
     dir = select(R, normalize(v), dot(v, v) > 1e-6);
-    return textureSampleLevel(t_reflection, s_reflection, dir, roughness * reflection.max_lod).rgb;
+    return textureSampleLevel(cube, s_reflection, dir, lod).rgb;
 }
 
 fn range_attenuation(dist: f32, range: f32) -> f32 {

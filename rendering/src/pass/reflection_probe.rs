@@ -39,8 +39,9 @@ pub const PREFILTER_MIPS: u32 = 6;
 const NEAR: f32 = 0.05;
 const FAR: f32 = 500.0;
 /// How far the camera can move from the probe center before the next capture cycle moves the
-/// center to it.
-const RECAPTURE_DISTANCE: f32 = 1.0;
+/// center to it. Each completed cycle fades in over the next, so short steps keep reflections
+/// following the camera smoothly.
+const RECAPTURE_DISTANCE: f32 = 0.25;
 const STRIDE: u64 = 256;
 
 /// Cube faces in Vulkan order (+X −X +Y −Y +Z −Z) as (forward, right, up), where `right` is the
@@ -59,11 +60,14 @@ const FACES: [(Vec3, Vec3, Vec3); 6] = [
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct ReflectionProbeParams {
-    /// xyz: world-space probe center; w: 1 once captured (0 = use the irradiance fallback).
-    pub center: [f32; 4],
+    /// Per prefiltered cube: xyz: world-space center it was captured from; w: 1 once captured
+    /// (neither = use the irradiance fallback).
+    pub centers: [[f32; 4]; 2],
     /// Prefiltered mip for roughness 1.
     pub max_lod: f32,
-    pub _pad: [f32; 3],
+    /// Share of cube 1 in the result: the newer cube fades in over one capture cycle.
+    pub blend: f32,
+    pub _pad: [f32; 2],
 }
 
 /// Mirrors `ProbeCapture` in `lighting.wgsl`; one per face at `STRIDE`.
@@ -90,9 +94,11 @@ struct FilterParams {
 /// The probe's GPU textures, created on first use by whichever pass gets there first.
 pub struct ReflectionProbeTextures {
     capture: wgpu::Texture,
-    prefiltered: wgpu::Texture,
-    /// Cube view of every prefiltered mip, for shading.
-    pub(crate) view: wgpu::TextureView,
+    /// Two prefiltered cubes: each completed cycle overwrites the older, and shading crossfades
+    /// from it to the newer.
+    prefiltered: [wgpu::Texture; 2],
+    /// Cube views of every prefiltered mip, for shading.
+    pub(crate) views: [wgpu::TextureView; 2],
     /// Clamped trilinear.
     pub(crate) sampler: wgpu::Sampler,
 }
@@ -112,10 +118,12 @@ impl ReflectionProbeTextures {
             })
         };
         let capture = cube("reflection_probe_capture", CAPTURE_SIZE, CAPTURE_MIPS);
-        let prefiltered = cube("reflection_probe_prefiltered", PREFILTER_SIZE, PREFILTER_MIPS);
-        let view = prefiltered.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::Cube),
-            ..Default::default()
+        let prefiltered = [0, 1].map(|_| cube("reflection_probe_prefiltered", PREFILTER_SIZE, PREFILTER_MIPS));
+        let views = [0, 1].map(|i| {
+            prefiltered[i].create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::Cube),
+                ..Default::default()
+            })
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("reflection_probe_sampler"),
@@ -124,7 +132,7 @@ impl ReflectionProbeTextures {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
-        Self { capture, prefiltered, view, sampler }
+        Self { capture, prefiltered, views, sampler }
     }
 }
 
@@ -147,7 +155,8 @@ struct Filter {
     downsample_bgs: Vec<wgpu::BindGroup>,
     prefilter_bg: wgpu::BindGroup,
     capture_targets: Vec<Vec<wgpu::TextureView>>,
-    prefilter_targets: Vec<Vec<wgpu::TextureView>>,
+    /// [cube][face][level].
+    prefilter_targets: [Vec<Vec<wgpu::TextureView>>; 2],
     _params: wgpu::Buffer,
 }
 
@@ -303,7 +312,7 @@ impl Filter {
             downsample_bgs,
             prefilter_bg,
             capture_targets: targets(&textures.capture, CAPTURE_MIPS),
-            prefilter_targets: targets(&textures.prefiltered, PREFILTER_MIPS),
+            prefilter_targets: [0, 1].map(|i| targets(&textures.prefiltered[i], PREFILTER_MIPS)),
             _params: params_buffer,
         }
     }
@@ -338,12 +347,12 @@ impl Filter {
         }
     }
 
-    /// GGX-prefilters every face and level of the cube `lighting` samples.
-    fn prefilter(&self, encoder: &mut wgpu::CommandEncoder) {
+    /// GGX-prefilters every face and level of prefiltered cube `cube`.
+    fn prefilter(&self, encoder: &mut wgpu::CommandEncoder, cube: usize) {
         for face in 0..6 {
             for level in 0..PREFILTER_MIPS {
                 let offset = Self::params_offset(face, CAPTURE_MIPS + level);
-                Self::draw(encoder, &self.prefilter_targets[face][level as usize], &self.prefilter, &self.prefilter_bg, offset);
+                Self::draw(encoder, &self.prefilter_targets[cube][face][level as usize], &self.prefilter, &self.prefilter_bg, offset);
             }
         }
     }
@@ -393,8 +402,12 @@ pub struct ReflectionProbePass {
     /// Center of the six-face cycle in progress. One face is captured per frame, continuously, so
     /// moved geometry, changed lights and converging GI show up within two cycles, at a constant cost.
     cycle_center: Option<Vec3>,
-    /// Center of the last completed cycle: what the prefiltered cube shows.
-    published: Option<Vec3>,
+    /// Center each prefiltered cube was captured from.
+    published: [Option<Vec3>; 2],
+    /// The cube the last completed cycle wrote, which is fading in.
+    newest: usize,
+    /// Frames since `newest` was written.
+    fade_frames: u32,
     next_face: usize,
 }
 
@@ -433,7 +446,9 @@ impl ReflectionProbePass {
             views_id,
             debug_flags_id,
             cycle_center: None,
-            published: None,
+            published: [None; 2],
+            newest: 0,
+            fade_frames: 0,
             next_face: 0,
         };
         (pass, outputs)
@@ -652,7 +667,7 @@ impl Pass for ReflectionProbePass {
         let camera = world.get_entities::<Camera>().first().map(|c| c.eye);
         let (true, Some(eye)) = (enabled, camera) else {
             self.cycle_center = None;
-            self.published = None;
+            self.published = [None; 2];
             self.next_face = 0;
             params_buf.write(queue, bytemuck::bytes_of(&ReflectionProbeParams::zeroed()));
             return;
@@ -788,23 +803,28 @@ impl Pass for ReflectionProbePass {
         pass.draw(0..3, 0..1);
         drop(pass);
 
-        // The prefiltered cube only changes when a cycle completes, so `lighting` always samples six
-        // faces from one center. GGX lobes cross faces, so prefiltering reads all six.
+        // A prefiltered cube only changes when a cycle completes, so `lighting` always samples six
+        // faces from one center per cube. GGX lobes cross faces, so prefiltering reads all six. The
+        // completed cycle overwrites the older cube, which has fully faded out by then, and fades in
+        // over the next cycle: swapping cubes at once made reflections jump as the camera moved.
         capture.filter.downsample(encoder, &[face]);
         self.next_face = (face + 1) % 6;
+        self.fade_frames += 1;
         if self.next_face == 0 {
-            capture.filter.prefilter(encoder);
-            self.published = Some(center);
+            let cube = 1 - self.newest;
+            capture.filter.prefilter(encoder, cube);
+            self.published[cube] = Some(center);
+            self.newest = cube;
+            self.fade_frames = 1;
         }
 
-        let Some(published) = self.published else {
-            params_buf.write(queue, bytemuck::bytes_of(&ReflectionProbeParams::zeroed()));
-            return;
-        };
+        let fade = if self.published[1 - self.newest].is_some() { (self.fade_frames as f32 / 6.0).min(1.0) } else { 1.0 };
+        let centers = self.published.map(|c| c.map_or([0.0; 4], |c| [c.x, c.y, c.z, 1.0]));
         let params = ReflectionProbeParams {
-            center: [published.x, published.y, published.z, 1.0],
+            centers,
             max_lod: (PREFILTER_MIPS - 1) as f32,
-            _pad: [0.0; 3],
+            blend: if self.newest == 1 { fade } else { 1.0 - fade },
+            _pad: [0.0; 2],
         };
         params_buf.write(queue, bytemuck::bytes_of(&params));
     }

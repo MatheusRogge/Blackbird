@@ -247,6 +247,7 @@ impl LightingBindings {
                     uniform_entry(4, fragment | wgpu::ShaderStages::VERTEX),
                     texture_entry(5, wgpu::TextureViewDimension::Cube, FILTERABLE),
                     uniform_entry(6, fragment),
+                    texture_entry(8, wgpu::TextureViewDimension::Cube, FILTERABLE),
                     wgpu::BindGroupLayoutEntry {
                         binding: 7,
                         visibility: fragment,
@@ -360,7 +361,8 @@ impl LightingBindings {
                         resource: wgpu::BindingResource::Sampler(&layouts.probe_sampler),
                     },
                     wgpu::BindGroupEntry { binding: 4, resource: camera.binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&reflection.view) },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&reflection.views[0]) },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&reflection.views[1]) },
                     wgpu::BindGroupEntry { binding: 6, resource: reflection_params.binding() },
                     wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&reflection.sampler) },
                 ],
