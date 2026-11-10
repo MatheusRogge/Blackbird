@@ -151,6 +151,8 @@ fn gi_flags(gi: &project::GiSettings) -> RenderDebugFlags {
         ddgi_view_bias: gi.view_bias,
         ddgi_probe_spacing: gi.probe_spacing,
         ddgi_grid_anchor: gi.grid_anchor,
+        ddgi_indirect_intensity: gi.indirect_intensity,
+        ddgi_bounce: gi.bounce,
         ..RenderDebugFlags::default()
     }
 }

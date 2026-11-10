@@ -477,6 +477,8 @@ impl RenderGraph {
             }
         }
 
+        debug_assert_eq!(order.len(), needed.len(), "render graph has a cycle: its passes would be dropped");
+
         CompiledGraph {
             output,
             order,
@@ -615,12 +617,13 @@ impl RenderGraph {
         for (pass_idx, &node_id) in order.iter().enumerate() {
             let reads = self.ctx.passes[&node_id].reads();
             let writes = self.ctx.passes[&node_id].writes();
+            let history = self.ctx.passes[&node_id].history_reads();
 
             let mut views: HashMap<ResourceId, &wgpu::TextureView> = HashMap::new();
             let mut textures: HashMap<ResourceId, &wgpu::Texture> = HashMap::new();
             let mut buffers: HashMap<ResourceId, BufferRange> = HashMap::new();
 
-            for id in reads.iter().chain(writes.iter()) {
+            for id in reads.iter().chain(writes.iter()).chain(history.iter()) {
                 if *id == output {
                     views.insert(*id, surface_view);
                     continue;

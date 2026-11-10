@@ -10,7 +10,9 @@
 //!   --exposure E         linear exposure override
 //!   --no-specular --no-reflections --no-ssr --no-reflection-probe --no-emissive-lights --no-indirect --no-direct --no-shadows --no-particles
 //!   --no-ao --no-contact-shadows --no-shadow-mask --no-traced-reflections
-//!   --view lit|albedo|normal|material|emissive|shadows|shadow-detail
+//!   --view lit|albedo|normal|material|emissive|ao|indirect|ssr|reflections|reflection-sources|shadows|shadow-detail
+//!   --gi-intensity X     indirect diffuse multiplier (default 1)
+//!   --gi-bounce X        share of the probes' irradiance reflected again by their hits, 0–1 (default 1)
 //!   --point x,y,z,I[,r]  add a white point light of I candela (range 10), source radius r (default 0)
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
 //!   --burst N            every particle emitter bursts N particles on the second frame
@@ -144,6 +146,8 @@ fn parse_args() -> Result<Options> {
             "--no-ao" => flags.ambient_occlusion = false,
             "--no-contact-shadows" => flags.contact_shadows = false,
             "--no-shadow-mask" => flags.shadow_mask = false,
+            "--gi-intensity" => flags.ddgi_indirect_intensity = value()?.parse()?,
+            "--gi-bounce" => flags.ddgi_bounce = value()?.parse()?,
             "--view" => {
                 flags.view = match value()?.as_str() {
                     "lit" => GBufferView::Lit,
@@ -153,6 +157,11 @@ fn parse_args() -> Result<Options> {
                     "emissive" => GBufferView::Emissive,
                     "shadows" => GBufferView::LocalShadows,
                     "shadow-detail" => GBufferView::ShadowDetail,
+                    "ao" => GBufferView::AmbientOcclusion,
+                    "indirect" => GBufferView::IndirectDiffuse,
+                    "ssr" => GBufferView::Ssr,
+                    "reflections" => GBufferView::Reflections,
+                    "reflection-sources" => GBufferView::ReflectionSources,
                     other => bail!("unknown view {other}"),
                 }
             }

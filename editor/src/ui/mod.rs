@@ -146,6 +146,8 @@ fn draw_gi_window(ctx: &egui::Context, state: &mut crate::state::EditorState, de
                 flags.ddgi_view_bias = defaults.ddgi_view_bias;
                 flags.ddgi_probe_spacing = defaults.ddgi_probe_spacing;
                 flags.ddgi_grid_anchor = defaults.ddgi_grid_anchor;
+                flags.ddgi_indirect_intensity = defaults.ddgi_indirect_intensity;
+                flags.ddgi_bounce = defaults.ddgi_bounce;
             }
             ui.label(egui::RichText::new("Saved with the project; builds use them too.").small().weak());
         });

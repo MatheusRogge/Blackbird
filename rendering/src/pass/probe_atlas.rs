@@ -58,11 +58,11 @@ pub struct ProbeGridParams {
     pub hysteresis: f32,                 // offset 48
     pub normal_bias: f32,                // offset 52
     pub view_bias: f32,                  // offset 56
-    pub _pad: f32,                       // offset 60
+    pub indirect_intensity: f32,         // offset 60
     /// `grid_origin` in probe cells from the anchor. Probes are stored in the atlas by world cell
     /// modulo `grid_dim`, so a probe keeps its slot while the grid slides past it.
     pub cell_origin: [i32; 3],           // offset 64
-    pub _pad1: u32,                      // offset 76
+    pub bounce: f32,                     // offset 76
 }
 
 pub struct ProbeAtlasOutputs {
@@ -173,17 +173,16 @@ impl Pass for ProbeAtlasPass {
         let cfg = &self.config;
         let probe_count = cfg.grid_dim[0] * cfg.grid_dim[1] * cfg.grid_dim[2];
 
-        let (hysteresis, normal_bias, view_bias, probe_spacing, anchor) = self
-            .debug_flags
-            .read()
-            .map(|f| (
-                f.ddgi_hysteresis,
-                f.ddgi_normal_bias,
-                f.ddgi_view_bias,
-                f.ddgi_probe_spacing,
-                f.ddgi_grid_anchor,
-            ))
-            .unwrap_or((0.97, 0.2, 0.1, 5.0, [0.0; 3]));
+        let flags = self.debug_flags.read().expect("debug_flags poisoned");
+        let (hysteresis, normal_bias, view_bias, probe_spacing, anchor) = (
+            flags.ddgi_hysteresis,
+            flags.ddgi_normal_bias,
+            flags.ddgi_view_bias,
+            flags.ddgi_probe_spacing,
+            flags.ddgi_grid_anchor,
+        );
+        let (indirect_intensity, bounce) = (flags.ddgi_indirect_intensity, flags.ddgi_bounce);
+        drop(flags);
 
         let max_ray_distance = {
             let dim = self.config.grid_dim;
@@ -238,9 +237,9 @@ impl Pass for ProbeAtlasPass {
             hysteresis,
             normal_bias,
             view_bias,
-            _pad: 0.0,
+            indirect_intensity,
             cell_origin,
-            _pad1: 0,
+            bounce,
         };
 
         params_buf.write(queue, bytemuck::bytes_of(&params));

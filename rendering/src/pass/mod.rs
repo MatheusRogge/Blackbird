@@ -54,6 +54,13 @@ pub trait PassDesc {
     fn reads(&self) -> Vec<ResourceId>;
     fn writes(&self) -> Vec<ResourceId>;
 
+    /// Resources read as an earlier frame left them, e.g. the output of a pass this one feeds.
+    /// They reach `PassContext` but add no ordering edge (which would be a cycle) and don't extend
+    /// lifetimes, so they must not be screen textures, which are aliased within the frame.
+    fn history_reads(&self) -> Vec<ResourceId> {
+        vec![]
+    }
+
     fn layout_entries(&self) -> Vec<wgpu::BindGroupLayoutEntry> {
         vec![]
     }

@@ -29,6 +29,8 @@ pub fn sync(state: &mut EditorState, flags: &mut RenderDebugFlags) {
         view_bias: flags.ddgi_view_bias,
         probe_spacing: flags.ddgi_probe_spacing,
         grid_anchor: flags.ddgi_grid_anchor,
+        indirect_intensity: flags.ddgi_indirect_intensity,
+        bounce: flags.ddgi_bounce,
     };
 }
 
@@ -46,4 +48,6 @@ fn apply(view: &ViewSettings, gi: &GiSettings, flags: &mut RenderDebugFlags) {
     flags.ddgi_view_bias = gi.view_bias;
     flags.ddgi_probe_spacing = gi.probe_spacing;
     flags.ddgi_grid_anchor = gi.grid_anchor;
+    flags.ddgi_indirect_intensity = gi.indirect_intensity;
+    flags.ddgi_bounce = gi.bounce;
 }

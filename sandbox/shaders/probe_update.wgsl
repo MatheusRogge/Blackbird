@@ -12,9 +12,9 @@ struct ProbeGridParams {
     hysteresis:             f32,
     normal_bias:            f32,
     view_bias:              f32,
-    _pad:                   f32,
+    indirect_intensity:     f32,
     cell_origin:            vec3<i32>,
-    _pad1:                  u32,
+    bounce:                 f32,
 }
 
 @group(0) @binding(0) var<storage, read> ray_radiance:   array<vec4<f32>>;

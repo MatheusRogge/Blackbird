@@ -5,11 +5,36 @@
 @group(0) @binding(1) var t_specular_weight:   texture_2d<f32>;
 // Probe-based reflection, already weighted and exposed. Written by lighting.wgsl.
 @group(0) @binding(2) var t_specular_fallback: texture_2d<f32>;
-// Premultiplied SSR color, a: confidence. Written by ssr.wgsl.
+// Premultiplied SSR color, a: confidence: `ssr_temporal`'s output, with `reflection_trace`'s
+// traces filled in.
 @group(0) @binding(3) var t_ssr:               texture_2d<f32>;
 // G-buffer depth, reversed-Z.
 @group(0) @binding(4) var t_depth:             texture_depth_2d;
-@group(0) @binding(5) var s_linear:            sampler;
+// The `ssr` pass's own output (screen-space hits only), for the debug views.
+@group(0) @binding(5) var t_ssr_raw:           texture_2d<f32>;
+
+// Mirrors rendering::debug_flags::DebugFlagsGpu; only `view` is read here.
+struct DebugFlags {
+    disable_albedo:   u32,
+    disable_indirect: u32,
+    disable_direct:   u32,
+    disable_shadows:  u32,
+    view:             u32,
+    disable_specular: u32,
+    disable_reflections: u32,
+    disable_ssr:      u32,
+    disable_contact_shadows: u32,
+    disable_shadow_mask: u32,
+    disable_traced_reflections: u32,
+}
+
+@group(0) @binding(6) var<uniform> debug: DebugFlags;
+@group(0) @binding(7) var s_linear:            sampler;
+
+// rendering::debug_flags::GBufferView.
+const VIEW_SSR:                u32 = 9u;
+const VIEW_REFLECTIONS:        u32 = 10u;
+const VIEW_REFLECTION_SOURCES: u32 = 11u;
 
 // Blur radius at roughness 1; SSR stops at 0.4, so the widest blur is 40% of this.
 const BLUR_RADIUS_PX: f32 = 32.0;
@@ -51,8 +76,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let px = vec2<i32>(in.pos.xy);
     let lit = textureLoad(t_lit, px, 0);
     let weight = textureLoad(t_specular_weight, px, 0);
+    let reflection_view = debug.view >= VIEW_SSR && debug.view <= VIEW_REFLECTION_SOURCES;
     if all(weight.rgb == vec3f(0.0)) {
-        return lit;
+        // Nothing reflects here: the reflection views show it as a dim grey of the scene.
+        return select(lit, vec4f(vec3f(dot(lit.rgb, vec3f(0.2126, 0.7152, 0.0722)) * 0.15), lit.a), reflection_view);
+    }
+    if debug.view == VIEW_SSR {
+        return vec4f(textureLoad(t_ssr_raw, px, 0).rgb, lit.a);
+    }
+    if debug.view == VIEW_REFLECTION_SOURCES {
+        let screen = saturate(textureLoad(t_ssr_raw, px, 0).a);
+        let resolved = saturate(textureLoad(t_ssr, px, 0).a);
+        let traced = max(resolved - screen, 0.0);
+        return vec4f(1.0 - max(resolved, screen), screen, traced, lit.a);
     }
 
     // Vogel disc, rotated per pixel. Reversed-Z depth is affine in screen space across a plane, so
@@ -80,5 +116,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let confidence = ssr.a;
     let reflection = ssr.rgb / max(confidence, 1e-4) * weight.rgb;
     let fallback = textureLoad(t_specular_fallback, px, 0).rgb;
-    return vec4f(lit.rgb + mix(fallback, reflection, confidence), lit.a);
+    let reflected = mix(fallback, reflection, confidence);
+    if debug.view == VIEW_REFLECTIONS {
+        return vec4f(reflected, lit.a);
+    }
+    return vec4f(lit.rgb + reflected, lit.a);
 }

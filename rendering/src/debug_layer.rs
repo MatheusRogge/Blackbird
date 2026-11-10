@@ -209,6 +209,7 @@ pub fn layer_toggles(ui: &mut egui::Ui, flags: &mut RenderDebugFlags) {
     ui.add_enabled_ui(flags.reflections, |ui| {
         ui.indent("reflections_indent", |ui| {
             ui.checkbox(&mut flags.ssr, "Screen-space");
+            ui.checkbox(&mut flags.traced_reflections, "Ray-traced");
             ui.checkbox(&mut flags.reflection_probe, "Reflection probe");
         });
     });
@@ -230,6 +231,12 @@ pub fn layer_toggles(ui: &mut egui::Ui, flags: &mut RenderDebugFlags) {
 /// DDGI probe settings and the probe visualisation.
 pub fn gi_controls(ui: &mut egui::Ui, flags: &mut RenderDebugFlags) {
     egui::Grid::new("gi_controls").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Indirect intensity").on_hover_text("Multiplier on indirect diffuse light. 1 is physically based.");
+        ui.add(egui::Slider::new(&mut flags.ddgi_indirect_intensity, 0.0..=4.0));
+        ui.end_row();
+        ui.label("Bounce").on_hover_text("How much of the probes' own light their rays' hits reflect again. 0 = a single bounce; 1 = every bounce (physically based), so light reaches areas no light sees directly.");
+        ui.add(egui::Slider::new(&mut flags.ddgi_bounce, 0.0..=1.0));
+        ui.end_row();
         ui.label("Hysteresis").on_hover_text("Share of the previous probe value kept per update: higher is smoother but reacts more slowly to changes.");
         ui.add(egui::Slider::new(&mut flags.ddgi_hysteresis, 0.0..=0.995));
         ui.end_row();

@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use bytemuck::{Pod, Zeroable};
 use engine_core::world::World;
 use ultraviolet::Mat4;
@@ -44,8 +47,13 @@ pub struct ProbeTracePass {
     counts_buffer_id: ResourceId,
     ray_radiance_id: ResourceId,
     ray_direction_id: ResourceId,
-    pipeline: Option<wgpu::ComputePipeline>,
-    bind_group: Option<wgpu::BindGroup>,
+    irradiance_atlas_ids: [ResourceId; 2],
+    visibility_atlas_ids: [ResourceId; 2],
+    current_atlas: Arc<AtomicUsize>,
+    pipeline: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::Sampler)>,
+    /// `bind_groups[i]` reads probe atlas `i`, for the bounces after the first. The atlases are
+    /// `history_reads`: `probe_update` writes them from this pass's rays.
+    bind_groups: [Option<wgpu::BindGroup>; 2],
     frame_uniform_id: ResourceId,
     frame_index: u32,
     shader: ShaderAsset,
@@ -89,8 +97,11 @@ impl ProbeTracePass {
                 counts_buffer_id: light_buffers.counts_buffer_id,
                 ray_radiance_id,
                 ray_direction_id,
+                irradiance_atlas_ids: probe_atlas.irradiance_atlas_ids,
+                visibility_atlas_ids: probe_atlas.visibility_atlas_ids,
+                current_atlas: Arc::clone(&probe_atlas.current_atlas),
                 pipeline: None,
-                bind_group: None,
+                bind_groups: [None, None],
                 frame_uniform_id,
                 frame_index: 0,
                 shader,
@@ -131,6 +142,19 @@ fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
 fn mat4_to_cols(m: Mat4) -> [[f32; 4]; 4] {
     let c = m.cols;
     [c[0].into(), c[1].into(), c[2].into(), c[3].into()]
@@ -153,6 +177,10 @@ impl PassDesc for ProbeTracePass {
             self.area_buffer_id,
             self.counts_buffer_id,
         ]
+    }
+
+    fn history_reads(&self) -> Vec<ResourceId> {
+        [self.irradiance_atlas_ids, self.visibility_atlas_ids].concat()
     }
 
     fn writes(&self) -> Vec<ResourceId> {
@@ -191,6 +219,9 @@ impl Pass for ProbeTracePass {
         let Some(&radiance_buf) = ctx.buffers.get(&self.ray_radiance_id) else { return };
         let Some(&direction_buf) = ctx.buffers.get(&self.ray_direction_id) else { return };
         let Some(&frame_buf) = ctx.buffers.get(&self.frame_uniform_id) else { return };
+        let atlas = self.current_atlas.load(Ordering::Relaxed);
+        let Some(&irradiance_view) = ctx.views.get(&self.irradiance_atlas_ids[atlas]) else { return };
+        let Some(&visibility_view) = ctx.views.get(&self.visibility_atlas_ids[atlas]) else { return };
 
         let cameras = world.get_entities::<Camera>();
         let inv_view = cameras
@@ -318,6 +349,15 @@ impl Pass for ProbeTracePass {
                     storage_entry(9),
                     storage_entry(10),
                     storage_entry(11),
+                    // 12-14: the current probe atlases and their sampler
+                    texture_entry(12),
+                    texture_entry(13),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 14,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
                 ],
             });
 
@@ -328,20 +368,28 @@ impl Pass for ProbeTracePass {
                     immediate_size: 0,
                 });
 
-            self.pipeline = Some(device.create_compute_pipeline(
-                &wgpu::ComputePipelineDescriptor {
-                    label: Some("probe_trace_pipeline"),
-                    layout: Some(&pipeline_layout),
-                    module: &module,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                },
-            ));
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("probe_trace_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("probe_trace_atlas"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
+            self.pipeline = Some((pipeline, bgl, sampler));
+        }
+        let (pipeline, bgl, sampler) = self.pipeline.as_ref().unwrap();
 
-            self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        if self.bind_groups[atlas].is_none() {
+            self.bind_groups[atlas] = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("probe_trace_bg"),
-                layout: &bgl,
+                layout: bgl,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: bvh_nodes_buf.binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: bvh_tris_buf.binding() },
@@ -355,12 +403,13 @@ impl Pass for ProbeTracePass {
                     wgpu::BindGroupEntry { binding: 9, resource: point_buf.binding() },
                     wgpu::BindGroupEntry { binding: 10, resource: spot_buf.binding() },
                     wgpu::BindGroupEntry { binding: 11, resource: area_buf.binding() },
+                    wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(irradiance_view) },
+                    wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(visibility_view) },
+                    wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::Sampler(sampler) },
                 ],
             }));
         }
-
-        let pipeline = self.pipeline.as_ref().unwrap();
-        let bg = self.bind_group.as_ref().unwrap();
+        let bg = self.bind_groups[atlas].as_ref().unwrap();
 
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("probe_trace"),

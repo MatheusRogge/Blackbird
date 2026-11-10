@@ -111,11 +111,23 @@ pub struct GiSettings {
     pub probe_spacing: f32,
     /// A world point probes are aligned to.
     pub grid_anchor: [f32; 3],
+    /// Multiplier on indirect diffuse light.
+    pub indirect_intensity: f32,
+    /// Share of the probes' irradiance their rays' hits reflect again: 0 = a single bounce.
+    pub bounce: f32,
 }
 
 impl Default for GiSettings {
     fn default() -> Self {
-        Self { hysteresis: 0.97, normal_bias: 0.2, view_bias: 0.1, probe_spacing: 5.0, grid_anchor: [0.0; 3] }
+        Self {
+            hysteresis: 0.97,
+            normal_bias: 0.2,
+            view_bias: 0.1,
+            probe_spacing: 5.0,
+            grid_anchor: [0.0; 3],
+            indirect_intensity: 1.0,
+            bounce: 1.0,
+        }
     }
 }
 

@@ -38,7 +38,9 @@ struct ProbeGridParams {
     hysteresis:            f32,
     normal_bias:           f32,
     view_bias:             f32,
-    _pad:                  f32,
+    indirect_intensity:    f32,
+    cell_origin:           vec3<i32>,
+    bounce:                f32,
 }
 
 struct GpuSkyLight {
@@ -121,6 +123,10 @@ struct TraceResult {
 @group(0) @binding(9)  var<storage, read> point_lights: array<GpuPointLight>;
 @group(0) @binding(10) var<storage, read> spot_lights:  array<GpuSpotLight>;
 @group(0) @binding(11) var<storage, read> area_lights:  array<GpuAreaLight>;
+// The atlases `probe_update` wrote last, for the bounces after the first.
+@group(0) @binding(12) var irradiance_atlas: texture_2d<f32>;
+@group(0) @binding(13) var visibility_atlas: texture_2d<f32>;
+@group(0) @binding(14) var probe_sampler: sampler;
 
 // Shadow rays start this far off the surface, as a fraction of the probe spacing.
 const SHADOW_BIAS: f32 = 0.002;
@@ -281,6 +287,74 @@ fn env_brdf_approx(f0: vec3<f32>, roughness: f32, n_dot_v: f32) -> vec3<f32> {
     return f0 * ab.x + ab.y;
 }
 
+// ── Probe lookup (mirrors lighting.wgsl's `sample_probe_irradiance`) ───────────
+
+const PROBES_PER_ROW: u32 = 30u;
+const PROBES_PER_COL: u32 = 29u;
+
+fn octahedral_encode(n: vec3<f32>) -> vec2<f32> {
+    let l1 = abs(n.x) + abs(n.y) + abs(n.z);
+    var p = n.xy / l1;
+    if n.z < 0.0 {
+        let sp = 1.0 - abs(p.yx);
+        p = vec2f(
+            select(-sp.x, sp.x, p.x >= 0.0),
+            select(-sp.y, sp.y, p.y >= 0.0),
+        );
+    }
+    return p * 0.5 + 0.5;
+}
+
+fn atlas_uv(probe_index: u32, oct_uv: vec2<f32>, texel_size: u32) -> vec2<f32> {
+    let ts   = f32(texel_size);
+    let tile = ts + 2.0;
+    let col  = f32(probe_index % PROBES_PER_ROW);
+    let row  = f32(probe_index / PROBES_PER_ROW);
+    let px   = oct_uv * ts + 1.0;
+    return vec2f((col * tile + px.x) / (f32(PROBES_PER_ROW) * tile), (row * tile + px.y) / (f32(PROBES_PER_COL) * tile));
+}
+
+fn chebyshev_weight(mean_d: f32, mean_d2: f32, dist: f32) -> f32 {
+    if dist <= mean_d { return 1.0; }
+    let variance = max(mean_d2 - mean_d * mean_d, 1e-6);
+    let d = dist - mean_d;
+    return variance / (variance + d * d);
+}
+
+fn probe_slot(ci: vec3<i32>) -> u32 {
+    let dim = vec3<i32>(probe_params.grid_dim);
+    let s = ((probe_params.cell_origin + ci) % dim + dim) % dim;
+    return u32(s.x + dim.x * (s.y + dim.y * s.z));
+}
+
+// Irradiance (/ π, as the atlas stores it) the probes saw last update around the hit, biased
+// toward the probe that traced it as lighting.wgsl biases toward the camera.
+fn probe_irradiance(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>) -> vec3<f32> {
+    let biased_pos = pos + normal * probe_params.normal_bias + to_probe * probe_params.view_bias;
+    let grid_pos = (biased_pos - probe_params.grid_origin) / probe_params.probe_spacing;
+    let base_f   = floor(grid_pos);
+    let base_i   = vec3<i32>(base_f);
+    let frac     = grid_pos - base_f;
+    let dim      = vec3<i32>(probe_params.grid_dim);
+    let oct_uv   = octahedral_encode(normal);
+
+    var irradiance   = vec3f(0.0);
+    var weight_total = 0.0;
+    for (var i = 0; i < 8; i++) {
+        let offset = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        let ci = base_i + offset;
+        if any(ci < vec3<i32>(0)) || any(ci >= dim) { continue; }
+        let slot = probe_slot(ci);
+        let w3 = select(1.0 - frac, frac, offset == vec3<i32>(1));
+        let probe_ws = probe_params.grid_origin + vec3f(ci) * probe_params.probe_spacing;
+        let vis = textureSampleLevel(visibility_atlas, probe_sampler, atlas_uv(slot, oct_uv, probe_params.visibility_texel_size), 0.0).rg;
+        let w = max(w3.x * w3.y * w3.z * chebyshev_weight(vis.r, vis.g, length(biased_pos - probe_ws)), 1e-4);
+        irradiance += textureSampleLevel(irradiance_atlas, probe_sampler, atlas_uv(slot, oct_uv, probe_params.irradiance_texel_size), 0.0).rgb * w;
+        weight_total += w;
+    }
+    return irradiance / max(weight_total, 1e-5);
+}
+
 // Radiance leaving the hit toward the probe. The specular part uses the reflectance seen from
 // the probe but is spread like diffuse: tracing the real lobe would make glossy floors flicker
 // through the probes, and the probes only store irradiance anyway.
@@ -356,6 +430,12 @@ fn shade_hit(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>, tri: BvhTri
         let c      = dot(-L, cross(r_dir, u_dir));
         let facing = select(max(c, 0.0), abs(c), light.two_sided > 0.5);
         radiance += brdf * light.color * (light.intensity * n_dot_l * facing * area / (dist * dist + area));
+    }
+
+    // Further bounces: the hit reflects what the probes gathered around it last update, so light
+    // keeps spreading into areas no light reaches directly, one bounce per update.
+    if probe_params.bounce > 0.0 {
+        radiance += albedo * probe_params.bounce * probe_irradiance(pos, normal, to_probe);
     }
     return radiance;
 }

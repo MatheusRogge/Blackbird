@@ -10,7 +10,7 @@ Project::relative_path(project_dir, path) / list_scenes(project_dir)
 CameraSettings { move_speed, fast_multiplier, exposure_stops }   // exposure() = 2^stops
 BuildSettings { include: Vec<String> }
 ViewSettings { grid, gizmos, animation, reflections, ssr, traced_reflections, reflection_probe, ambient_occlusion, contact_shadows, particles }   // editor View menu
-GiSettings { hysteresis, normal_bias, view_bias, probe_spacing, grid_anchor }   // DDGI, editor and player
+GiSettings { hysteresis, normal_bias, view_bias, probe_spacing, grid_anchor, indirect_intensity, bounce }   // DDGI, editor and player
 ```
 
 - Every project path is relative to the project dir with `/` separators. That matches the logical paths used by `assets` manifests and packs, so a project path can be loaded unchanged from loose files or a `.bbpak`.

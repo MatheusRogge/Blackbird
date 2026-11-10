@@ -34,9 +34,9 @@ struct ProbeGridParams {
     hysteresis:             f32,
     normal_bias:            f32,
     view_bias:              f32,
-    _pad:                   f32,
+    indirect_intensity:     f32,
     cell_origin:            vec3<i32>,
-    _pad1:                  u32,
+    bounce:                 f32,
 }
 
 struct CameraUniform {
@@ -75,7 +75,8 @@ struct DebugFlags {
     disable_indirect: u32,
     disable_direct:   u32,
     disable_shadows:  u32,
-    // 0 lit, 1 albedo, 2 normal, 3 material, 4 emissive, 5 local shadows (rendering::debug_flags::GBufferView).
+    // 0 lit, 1 albedo, 2 normal, 3 material, 4 emissive, 5 local shadows, 6 shadow detail, 7 AO,
+    // 8 indirect diffuse; 9–11 are drawn by composite.wgsl (rendering::debug_flags::GBufferView).
     view:             u32,
     disable_specular: u32,
     disable_reflections: u32,
@@ -456,7 +457,7 @@ fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>, dir: vec3<f32>, v
         }
     }
 
-    return irradiance / max(weight_total, 1e-5);
+    return irradiance / max(weight_total, 1e-5) * probe_params.indirect_intensity;
 }
 
 // Cluster + light data
@@ -1183,6 +1184,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
             return unreflective(vec3f(material.rg, material.b * textureLoad(t_ao, frag_xy, 0).r));
         }
         case 4u: { return unreflective(textureSample(t_emissive, s_linear, in.uv).rgb * cp.exposure); }
+        case 7u: { return unreflective(vec3f(textureSample(t_material, s_linear, in.uv).b * textureLoad(t_ao, frag_xy, 0).r)); }
         default: {}
     }
 
@@ -1273,6 +1275,9 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
             out.specular_weight = vec4f(weight, roughness);
             out.specular_fallback = vec4f(env * weight * cp.exposure, 1.0);
         }
+    }
+    if debug.view == 8u {
+        return unreflective(color * cp.exposure);
     }
 
     if debug.disable_direct == 0u {

@@ -258,8 +258,9 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
                 FullscreenInput::Color(lighting_outputs.specular_fallback_id),
                 FullscreenInput::Color(ssr_resolved_id),
                 FullscreenInput::Depth(gbuffer_outputs.depth_id),
+                FullscreenInput::Color(ssr_id),
             ],
-            vec![],
+            vec![lighting_outputs.debug_flags_id],
             wgpu::TextureFormat::Rgba16Float,
             self.composite_shader,
         );

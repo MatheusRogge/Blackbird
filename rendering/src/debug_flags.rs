@@ -33,11 +33,35 @@ pub enum GBufferView {
     /// Virtual shadow map mip each pixel's local shadow resolved to, for the most important
     /// shadowed light reaching it: red = mip 0 (finest) through violet = the coarsest page.
     ShadowDetail,
+    /// Screen-space AO × the material's AO, as it scales indirect light.
+    AmbientOcclusion,
+    /// Indirect diffuse light alone (DDGI probes × albedo × AO, plus diffuse transmission), exposed.
+    IndirectDiffuse,
+    /// The `ssr` pass's screen-space hits (premultiplied by their confidence), before the traced
+    /// fill-in, temporal accumulation and blur. Drawn by `composite`.
+    Ssr,
+    /// The reflections `composite` adds to `lit`, alone.
+    Reflections,
+    /// Where each reflecting pixel's reflection comes from: green = SSR, blue = ray-traced
+    /// (`reflection_trace`), red = the probe fallback. Drawn by `composite`.
+    ReflectionSources,
 }
 
 impl GBufferView {
-    pub const ALL: [Self; 7] =
-        [Self::Lit, Self::Albedo, Self::Normal, Self::Material, Self::Emissive, Self::LocalShadows, Self::ShadowDetail];
+    pub const ALL: [Self; 12] = [
+        Self::Lit,
+        Self::Albedo,
+        Self::Normal,
+        Self::Material,
+        Self::Emissive,
+        Self::AmbientOcclusion,
+        Self::IndirectDiffuse,
+        Self::Ssr,
+        Self::Reflections,
+        Self::ReflectionSources,
+        Self::LocalShadows,
+        Self::ShadowDetail,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -48,6 +72,11 @@ impl GBufferView {
             Self::Emissive => "Emissive",
             Self::LocalShadows => "Local light shadows",
             Self::ShadowDetail => "Local shadow detail",
+            Self::AmbientOcclusion => "Ambient occlusion",
+            Self::IndirectDiffuse => "Indirect diffuse (GI)",
+            Self::Ssr => "Screen-space reflections",
+            Self::Reflections => "Reflections",
+            Self::ReflectionSources => "Reflection sources",
         }
     }
 }
@@ -92,6 +121,11 @@ pub struct RenderDebugFlags {
     pub ddgi_view_bias:     f32,
     pub ddgi_probe_spacing: f32,
     pub ddgi_grid_anchor:   [f32; 3],
+    /// Multiplier on indirect diffuse light wherever the probes are sampled.
+    pub ddgi_indirect_intensity: f32,
+    /// Share of the probes' own irradiance their rays' hits reflect (`probe_trace`): 0 = a single
+    /// bounce, 1 = every bounce.
+    pub ddgi_bounce: f32,
 }
 
 impl Default for RenderDebugFlags {
@@ -124,6 +158,8 @@ impl Default for RenderDebugFlags {
             ddgi_view_bias:     0.1,
             ddgi_probe_spacing: 5.0,
             ddgi_grid_anchor:      [0.0, 0.0, 0.0],
+            ddgi_indirect_intensity: 1.0,
+            ddgi_bounce: 1.0,
         }
     }
 }
