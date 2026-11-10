@@ -87,6 +87,26 @@ fn vs_main(in: VertexInput, @builtin(instance_index) instance: u32) -> VertexOut
     return out;
 }
 
+// Geometric specular antialiasing (Tokuyoshi & Kaplanyan 2019): where the shading normal changes
+// within a pixel (tile seams, normal-map detail in the distance), a highlight or a mirror
+// reflection would land on a few pixels and sparkle as the camera moves; the pixel's roughness is
+// widened by the normal's screen-space variance instead, so specular, SSR and traced reflections
+// all see the filtered lobe.
+const SPECULAR_AA_VARIANCE: f32 = 0.25;
+const SPECULAR_AA_MAX_KERNEL: f32 = 0.18;
+
+fn specular_aa_variance(n: vec3<f32>) -> f32 {
+    let dx = dpdx(n);
+    let dy = dpdy(n);
+    return min(2.0 * SPECULAR_AA_VARIANCE * (dot(dx, dx) + dot(dy, dy)), SPECULAR_AA_MAX_KERNEL);
+}
+
+// Perceptual roughness with GGX alpha² widened by `kernel`.
+fn specular_aa_roughness(roughness: f32, kernel: f32) -> f32 {
+    let a2 = roughness * roughness * roughness * roughness;
+    return sqrt(sqrt(saturate(a2 + kernel)));
+}
+
 @fragment
 fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> GBufferOutput {
     var out: GBufferOutput;
@@ -96,9 +116,6 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> GBuff
     let normal_sample = textureSample(normal_tex, tex_sampler, in.uv).rgb;
     let metallic_roughness = textureSample(metallic_roughness_tex, tex_sampler, in.uv);
     let emissive = textureSample(emissive_tex, tex_sampler, in.uv).rgb * in.emissive;
-    if albedo.a < in.material.x {
-        discard;
-    }
 
     var N = normalize(in.world_normal);
     if !front_facing && in.material.y > 0.5 {
@@ -109,10 +126,15 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> GBuff
 
     let tangent_normal = normalize(normal_sample * 2.0 - 1.0);
     let world_normal = normalize(T * tangent_normal.x + B * tangent_normal.y + N * tangent_normal.z);
+    // Derivatives also need uniform control flow, so before the discard.
+    let normal_variance = specular_aa_variance(world_normal);
+    if albedo.a < in.material.x {
+        discard;
+    }
 
     out.albedo = albedo;
     out.normal = vec4<f32>(world_normal * 0.5 + 0.5, 1.0);
-    let roughness = metallic_roughness.g * in.material.w;
+    let roughness = specular_aa_roughness(metallic_roughness.g * in.material.w, normal_variance);
     let metallic = metallic_roughness.b * in.material.z;
     out.material = vec4<f32>(roughness, metallic, 1.0, 0.0);
     out.emissive = vec4<f32>(emissive, 1.0);
