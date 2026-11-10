@@ -1,8 +1,8 @@
 // Screen-space reflections. Traces the reflection ray through a Hi-Z depth pyramid (built by the
 // `ssr` pass, rendering/src/pass/hiz.wgsl) and writes the color it hits, premultiplied by a
 // confidence the composite pass blends with. `ssr_temporal` accumulates it over frames. The color
-// comes from last frame's composite output where the hit was on screen then, so reflected surfaces
-// show their own reflections (each frame adds a bounce); otherwise from this frame's `lit`.
+// comes from this frame's `lit`, plus, for rough hit surfaces, their own reflections from last
+// frame's composite output where the hit was on screen then (each frame adds a bounce).
 // Glass (the `ao` pass's glass depth, folded into the Hi-Z) is hit too, and takes its color from
 // last frame's `transparent` output.
 
@@ -52,6 +52,10 @@ const MAX_DISTANCE:   f32 = 50.0;
 const MAX_ITERATIONS: u32 = 64u;
 // A ray counts as hitting a surface when it is behind it by less than this fraction of its depth.
 const THICKNESS:      f32 = 0.03;
+// Hit surfaces' own reflections are carried into the hit colour from this roughness, fully at
+// the second (see `hit_color`).
+const BOUNCE_MIN_ROUGHNESS:  f32 = 0.3;
+const BOUNCE_FULL_ROUGHNESS: f32 = 0.6;
 
 struct VertexOutput {
     @builtin(position) pos: vec4<f32>,
@@ -142,7 +146,13 @@ fn hit_color(hit_px: vec2<f32>, hit_uv: vec2<f32>, hit_depth: f32, glass: bool) 
             if glass {
                 return textureSampleLevel(t_prev_glass, s_linear, prev_uv, 0.0).rgb;
             }
-            return textureSampleLevel(t_prev, s_linear, prev_uv, 0.0).rgb;
+            // Last frame's reflections on the hit surface are as seen from the camera, not from
+            // the ray: a glossy floor's reflection of a light would show up wherever a wall's ray
+            // lands on it. Only rough reflections, which barely depend on the view, are kept.
+            let hit_roughness = textureLoad(t_specular_weight, vec2<i32>(hit_px), 0).a;
+            let lit = textureSampleLevel(t_lit, s_linear, hit_uv, 0.0).rgb;
+            let prev_color = textureSampleLevel(t_prev, s_linear, prev_uv, 0.0).rgb;
+            return mix(lit, prev_color, smoothstep(BOUNCE_MIN_ROUGHNESS, BOUNCE_FULL_ROUGHNESS, hit_roughness));
         }
     }
     return textureSampleLevel(t_lit, s_linear, hit_uv, 0.0).rgb;
