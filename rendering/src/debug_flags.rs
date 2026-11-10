@@ -13,7 +13,8 @@ pub struct DebugFlagsGpu {
     pub disable_ssr:      u32,
     pub disable_contact_shadows: u32,
     pub disable_shadow_mask: u32,
-    pub _pad: [u32; 2],
+    pub disable_traced_reflections: u32,
+    pub _pad: u32,
 }
 
 /// What the `lighting` pass outputs: the lit image, or one G-buffer target as-is.
@@ -63,6 +64,9 @@ pub struct RenderDebugFlags {
     pub reflections: bool,
     /// Screen-space reflections only: with this off, reflections come from the probe fallback alone.
     pub ssr: bool,
+    /// Reflection rays traced through the GI's BVH where SSR found nothing (`reflection_trace`).
+    /// Off: those pixels take the probe (or DDGI) fallback.
+    pub traced_reflections: bool,
     /// The camera-following reflection probe (`reflection_probe` pass): with this off, reflections
     /// SSR misses fall back to DDGI irradiance around the reflection vector.
     pub reflection_probe: bool,
@@ -101,6 +105,7 @@ impl Default for RenderDebugFlags {
             emissive_lights: true,
             reflections: true,
             ssr: true,
+            traced_reflections: true,
             reflection_probe: true,
             particles: true,
             ambient_occlusion: true,
@@ -136,7 +141,8 @@ impl RenderDebugFlags {
             disable_ssr:      !self.ssr as u32,
             disable_contact_shadows: !self.contact_shadows as u32,
             disable_shadow_mask: !self.shadow_mask as u32,
-            _pad: [0; 2],
+            disable_traced_reflections: !self.traced_reflections as u32,
+            _pad: 0,
         }
     }
 }

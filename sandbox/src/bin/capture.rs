@@ -9,7 +9,7 @@
 //!   --target x,y,z       point the camera looks at
 //!   --exposure E         linear exposure override
 //!   --no-specular --no-reflections --no-ssr --no-reflection-probe --no-emissive-lights --no-indirect --no-direct --no-shadows --no-particles
-//!   --no-ao --no-contact-shadows --no-shadow-mask
+//!   --no-ao --no-contact-shadows --no-shadow-mask --no-traced-reflections
 //!   --view lit|albedo|normal|material|emissive|shadows|shadow-detail
 //!   --point x,y,z,I[,r]  add a white point light of I candela (range 10), source radius r (default 0)
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
@@ -134,6 +134,7 @@ fn parse_args() -> Result<Options> {
             "--no-specular" => flags.specular = false,
             "--no-reflections" => flags.reflections = false,
             "--no-ssr" => flags.ssr = false,
+            "--no-traced-reflections" => flags.traced_reflections = false,
             "--no-reflection-probe" => flags.reflection_probe = false,
             "--no-emissive-lights" => flags.emissive_lights = false,
             "--no-indirect" => flags.indirect = false,

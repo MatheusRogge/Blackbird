@@ -16,6 +16,7 @@ pub mod probe_atlas;
 pub mod probe_trace;
 pub mod probe_update;
 pub mod reflection_probe;
+pub mod reflection_trace;
 pub mod prev_frame;
 pub mod ssr;
 pub mod ssr_temporal;

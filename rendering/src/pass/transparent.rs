@@ -11,6 +11,7 @@ use crate::{
     graph::{NodeId, RenderGraph},
     mesh::{Mesh, Vertex},
     pass::ao::AoOutputs,
+    pass::bvh_upload::BvhOutputs,
     pass::cluster_assignment::ClusterOutputs,
     pass::gbuffer::GBufferOutputs,
     pass::light_upload::LightBuffers,
@@ -168,8 +169,9 @@ pub struct TransparentPass {
     node_id: Option<NodeId>,
     shader: ShaderAsset,
     pipelines: Option<Pipelines>,
-    /// Keyed by the scene, depth, normal and glass view addresses and the geometry generation.
-    scene_bg: Option<(([usize; 5], u64), wgpu::BindGroup)>,
+    /// Keyed by the scene, depth, normal, glass, lit and specular weight view addresses, the BVH
+    /// buffer ranges and the geometry generation.
+    scene_bg: Option<(([usize; 13], u64), wgpu::BindGroup)>,
     behind: Option<Behind>,
     bindings: LightingBindings,
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
@@ -179,6 +181,11 @@ pub struct TransparentPass {
     normal_id: ResourceId,
     glass_depth_id: ResourceId,
     glass_transmittance_id: ResourceId,
+    lit_id: ResourceId,
+    specular_weight_id: ResourceId,
+    bvh_nodes_id: ResourceId,
+    bvh_tris_id: ResourceId,
+    bvh_info_id: ResourceId,
     debug_flags_id: ResourceId,
     output_id: ResourceId,
 }
@@ -191,6 +198,7 @@ impl TransparentPass {
         gbuffer: &GBufferOutputs,
         ao: &AoOutputs,
         lighting: &LightingOutputs,
+        bvh: &BvhOutputs,
         cluster: &ClusterOutputs,
         light_buffers: &LightBuffers,
         shadow: &ShadowOutputs,
@@ -227,6 +235,11 @@ impl TransparentPass {
             normal_id: gbuffer.normal_id,
             glass_depth_id: ao.glass_depth_id,
             glass_transmittance_id: ao.glass_transmittance_id,
+            lit_id: lighting.lit_id,
+            specular_weight_id: lighting.specular_weight_id,
+            bvh_nodes_id: bvh.nodes_id,
+            bvh_tris_id: bvh.tris_id,
+            bvh_info_id: bvh.info_id,
             debug_flags_id: lighting.debug_flags_id,
             output_id,
         };
@@ -250,6 +263,11 @@ impl TransparentPass {
                 color_entry(8),
                 depth_entry(17),
                 color_entry(18),
+                color_entry(20),
+                color_entry(21),
+                buffer_entry(22, wgpu::BufferBindingType::Storage { read_only: true }),
+                buffer_entry(23, wgpu::BufferBindingType::Storage { read_only: true }),
+                buffer_entry(24, wgpu::BufferBindingType::Uniform),
             ],
         });
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -396,6 +414,15 @@ fn color_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+fn buffer_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+        count: None,
+    }
+}
+
 fn depth_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -521,6 +548,11 @@ impl PassDesc for TransparentPass {
             self.normal_id,
             self.glass_depth_id,
             self.glass_transmittance_id,
+            self.lit_id,
+            self.specular_weight_id,
+            self.bvh_nodes_id,
+            self.bvh_tris_id,
+            self.bvh_info_id,
             self.debug_flags_id,
         ];
         reads.extend(self.bindings.reads());
@@ -557,6 +589,8 @@ impl Pass for TransparentPass {
             Some(&normal_view),
             Some(&glass_depth_view),
             Some(&glass_transmittance_view),
+            Some(&lit_view),
+            Some(&specular_weight_view),
         ) = (
             ctx.views.get(&self.output_id),
             ctx.views.get(&self.scene_id),
@@ -564,7 +598,15 @@ impl Pass for TransparentPass {
             ctx.views.get(&self.normal_id),
             ctx.views.get(&self.glass_depth_id),
             ctx.views.get(&self.glass_transmittance_id),
+            ctx.views.get(&self.lit_id),
+            ctx.views.get(&self.specular_weight_id),
         ) else {
+            return;
+        };
+        let buffer = |id| ctx.buffers.get(id).copied();
+        let (Some(bvh_nodes), Some(bvh_tris), Some(bvh_info)) =
+            (buffer(&self.bvh_nodes_id), buffer(&self.bvh_tris_id), buffer(&self.bvh_info_id))
+        else {
             return;
         };
 
@@ -572,7 +614,7 @@ impl Pass for TransparentPass {
             self.pipelines = Some(self.create_pipelines(device, queue));
         }
 
-        let (lit_view, screen_reflections) = {
+        let (lit_debug_view, screen_reflections) = {
             let flags = self.debug_flags.read().expect("debug_flags poisoned");
             (
                 flags.view == GBufferView::Lit,
@@ -584,7 +626,7 @@ impl Pass for TransparentPass {
         let mut meshes: Vec<_> = world
             .get_entity_handles::<Mesh>()
             .into_iter()
-            .filter(|h| lit_view && h.entity.is_blended())
+            .filter(|h| lit_debug_view && h.entity.is_blended())
             .filter_map(|h| {
                 let draw = ctx.geometry.get(h.id)?;
                 let (eye, view_proj) = camera?;
@@ -615,11 +657,21 @@ impl Pass for TransparentPass {
             build_behind_chain(device, encoder, pipelines, behind, scene_view, None);
         }
 
-        let key = (
-            [scene_view, depth_view, normal_view, glass_depth_view, glass_transmittance_view]
-                .map(|v| std::ptr::from_ref(v) as usize),
-            ctx.geometry.generation(),
-        );
+        let views = [
+            scene_view,
+            depth_view,
+            normal_view,
+            glass_depth_view,
+            glass_transmittance_view,
+            lit_view,
+            specular_weight_view,
+        ]
+        .map(|v| std::ptr::from_ref(v) as usize);
+        let buffers = [bvh_nodes, bvh_tris, bvh_info].map(|b| [std::ptr::from_ref(b.buffer) as usize, b.offset as usize]);
+        let mut addresses = [0; 13];
+        addresses[..7].copy_from_slice(&views);
+        addresses[7..].copy_from_slice(buffers.as_flattened());
+        let key = (addresses, ctx.geometry.generation());
         if self.scene_bg.as_ref().is_none_or(|(k, _)| *k != key) {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("transparent_scene_bg"),
@@ -636,6 +688,14 @@ impl Pass for TransparentPass {
                         binding: 18,
                         resource: wgpu::BindingResource::TextureView(glass_transmittance_view),
                     },
+                    wgpu::BindGroupEntry { binding: 20, resource: wgpu::BindingResource::TextureView(lit_view) },
+                    wgpu::BindGroupEntry {
+                        binding: 21,
+                        resource: wgpu::BindingResource::TextureView(specular_weight_view),
+                    },
+                    wgpu::BindGroupEntry { binding: 22, resource: bvh_nodes.binding() },
+                    wgpu::BindGroupEntry { binding: 23, resource: bvh_tris.binding() },
+                    wgpu::BindGroupEntry { binding: 24, resource: bvh_info.binding() },
                 ],
             });
             self.scene_bg = Some((key, bind_group));

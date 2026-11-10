@@ -18,6 +18,7 @@ pub fn sync(state: &mut EditorState, flags: &mut RenderDebugFlags) {
     view.animation = state.timeline.show;
     view.reflections = flags.reflections;
     view.ssr = flags.ssr;
+    view.traced_reflections = flags.traced_reflections;
     view.reflection_probe = flags.reflection_probe;
     view.ambient_occlusion = flags.ambient_occlusion;
     view.contact_shadows = flags.contact_shadows;
@@ -35,6 +36,7 @@ fn apply(view: &ViewSettings, gi: &GiSettings, flags: &mut RenderDebugFlags) {
     flags.show_grid = view.grid;
     flags.reflections = view.reflections;
     flags.ssr = view.ssr;
+    flags.traced_reflections = view.traced_reflections;
     flags.reflection_probe = view.reflection_probe;
     flags.ambient_occlusion = view.ambient_occlusion;
     flags.contact_shadows = view.contact_shadows;

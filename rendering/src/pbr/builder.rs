@@ -22,6 +22,7 @@ use crate::{
         probe_trace::ProbeTracePass,
         probe_update::ProbeUpdatePass,
         reflection_probe::ReflectionProbePass,
+        reflection_trace::{ReflectionTraceInputs, ReflectionTracePass},
         prev_frame::{FrameHistory, PrevFramePass},
         ssr::{SsrInputs, SsrPass},
         ssr_temporal::SsrTemporalPass,
@@ -218,10 +219,29 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         );
         graph.add_pass(device, ssr_pass);
 
+        let (reflection_trace_pass, reflection_id, reflection_ray_length_id) = ReflectionTracePass::new(
+            &mut graph,
+            ReflectionTraceInputs {
+                gbuffer: &gbuffer_outputs,
+                lighting: &lighting_outputs,
+                bvh: &bvh_outputs,
+                ssr_id,
+                ssr_ray_length_id,
+                cluster: &cluster_outputs,
+                light_buffers: &light_buffers,
+                shadow: &shadow_outputs,
+                probe_atlas: &probe_atlas_outputs,
+                camera_buffer_id,
+                reflection: &reflection_outputs,
+            },
+            self.lighting_shader.clone(),
+        );
+        graph.add_pass(device, reflection_trace_pass);
+
         let (ssr_temporal_pass, ssr_resolved_id) = SsrTemporalPass::new(
             &mut graph,
-            ssr_id,
-            ssr_ray_length_id,
+            reflection_id,
+            reflection_ray_length_id,
             gbuffer_outputs.depth_id,
             lighting_outputs.specular_weight_id,
             camera_buffer_id,
@@ -252,6 +272,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             &gbuffer_outputs,
             &ao_outputs,
             &lighting_outputs,
+            &bvh_outputs,
             &cluster_outputs,
             &light_buffers,
             &shadow_outputs,

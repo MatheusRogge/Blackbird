@@ -162,6 +162,10 @@ fn draw_view_menu(ui: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<Ren
     if ui.add_enabled(flags.reflections, ssr).clicked() {
         flags.ssr = !flags.ssr;
     }
+    let traced = egui::Button::selectable(flags.traced_reflections, "Ray-traced reflections");
+    if ui.add_enabled(flags.reflections, traced).clicked() {
+        flags.traced_reflections = !flags.traced_reflections;
+    }
     let probe = egui::Button::selectable(flags.reflection_probe, "Reflection probe");
     if ui.add_enabled(flags.reflections, probe).clicked() {
         flags.reflection_probe = !flags.reflection_probe;

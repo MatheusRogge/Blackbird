@@ -82,6 +82,7 @@ struct DebugFlags {
     disable_ssr:      u32,
     disable_contact_shadows: u32,
     disable_shadow_mask: u32,
+    disable_traced_reflections: u32,
 }
 
 @group(4) @binding(0) var<uniform> debug: DebugFlags;
@@ -570,12 +571,17 @@ fn env_brdf_approx(f0: vec3<f32>, roughness: f32, n_dot_v: f32) -> vec3<f32> {
     return f0 * ab.x + ab.y;
 }
 
-// KHR_lights_punctual recommended falloff: inverse-square, smoothly windowed to zero at `range`.
-// Radiance (unexposed) arriving along `R` at `pos_ws`, for reflections SSR can't resolve: the
-// reflection probe once captured, else DDGI irradiance around `R`. The probe was captured from its
+// Mirror ssr.wgsl's MAX_ROUGHNESS / FADE_ROUGHNESS; `glass_ssr` and `fs_reflection_trace` use them.
+const SSR_MAX_ROUGHNESS:  f32 = 0.4;
+const SSR_FADE_ROUGHNESS: f32 = 0.25;
+
+// Radiance (unexposed) reflected toward `view_dir` at `pos_ws`, for reflections SSR can't resolve:
+// the reflection probe once captured, else DDGI irradiance around the reflection vector. The probe was captured from its
 // center, not from `pos_ws`, so the lookup direction is parallax-corrected with the captured
 // distance: a few fixed-point steps find where the ray from `pos_ws` meets the captured surface.
-fn reflected_radiance(pos_ws: vec3<f32>, N: vec3<f32>, R: vec3<f32>, view_dir: vec3<f32>, roughness: f32) -> vec3<f32> {
+fn reflected_radiance(pos_ws: vec3<f32>, N: vec3<f32>, view_dir: vec3<f32>, roughness: f32) -> vec3<f32> {
+    // Around the dominant direction, leaning toward N as roughness grows (Filament).
+    let R = normalize(mix(reflect(-view_dir, N), N, roughness * roughness));
     if reflection.centers[0].w + reflection.centers[1].w < 0.5 {
         return sample_probe_irradiance(pos_ws, N, R, view_dir);
     }
@@ -604,6 +610,7 @@ fn parallax_probe(cube: texture_cube<f32>, c: vec3<f32>, pos_ws: vec3<f32>, R: v
     return textureSampleLevel(cube, s_reflection, dir, lod).rgb;
 }
 
+// KHR_lights_punctual recommended falloff: inverse-square, smoothly windowed to zero at `range`.
 fn range_attenuation(dist: f32, range: f32) -> f32 {
     let r = dist / range;
     let window = clamp(1.0 - r * r * r * r, 0.0, 1.0);
@@ -1258,14 +1265,11 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
             color += transmission * sample_probe_irradiance(pos_ws, -N, -N, view_dir);
         }
 
-        // Reflections are added by the composite pass: SSR where it hits, else probe irradiance
-        // around the reflection vector, leaning toward N as roughness grows (Filament's dominant
-        // direction).
+        // Reflections are added by the composite pass: SSR where it hits, else the probe.
         if debug.disable_specular == 0u && debug.disable_reflections == 0u {
             let n_dot_v = max(dot(N, view_dir), 1e-4);
-            let R = normalize(mix(reflect(-view_dir, N), N, alpha));
             let weight = env_brdf_approx(f0, roughness, n_dot_v) * specular_occlusion(n_dot_v, ao, roughness);
-            let env = reflected_radiance(pos_ws, N, R, view_dir, roughness);
+            let env = reflected_radiance(pos_ws, N, view_dir, roughness);
             out.specular_weight = vec4f(weight, roughness);
             out.specular_fallback = vec4f(env * weight * cp.exposure, 1.0);
         }
@@ -1409,6 +1413,9 @@ struct Model {
 @group(0) @binding(8) var t_behind: texture_2d<f32>;
 // Source level of the `t_behind` mip chain build.
 @group(0) @binding(10) var t_blit: texture_2d<f32>;
+// The deferred `lit` and `specular_weight` targets, for `glass_ssr` hits.
+@group(0) @binding(20) var t_scene_lit: texture_2d<f32>;
+@group(0) @binding(21) var t_scene_specular_weight: texture_2d<f32>;
 
 @group(5) @binding(0) var m_albedo: texture_2d<f32>;
 @group(5) @binding(1) var m_normal: texture_2d<f32>;
@@ -1472,13 +1479,14 @@ fn refracted_uv(m: Model, frag: vec4<f32>, pos_ws: vec3<f32>, N: vec3<f32>, view
 
 // Screen-space reflections for blended surfaces, ported from ssr.wgsl with fewer steps: blended
 // surfaces aren't in the G-buffer, so the opaque `ssr` pass can't cover them.
-const GLASS_SSR_MAX_ROUGHNESS:  f32 = 0.4;
-const GLASS_SSR_FADE_ROUGHNESS: f32 = 0.25;
 const GLASS_SSR_MAX_DISTANCE:   f32 = 50.0;
 const GLASS_SSR_MAX_STEPS:      u32 = 32u;
 const GLASS_SSR_STEP_PIXELS:    f32 = 3.0;
 const GLASS_SSR_REFINE_STEPS:   u32 = 5u;
 const GLASS_SSR_THICKNESS:      f32 = 0.03;
+// Mirrors ssr.wgsl's BOUNCE_*_ROUGHNESS.
+const GLASS_SSR_BOUNCE_MIN_ROUGHNESS:  f32 = 0.3;
+const GLASS_SSR_BOUNCE_FULL_ROUGHNESS: f32 = 0.6;
 
 fn linear_depth(d: f32) -> f32 {
     let n = camera.depth_params.x;
@@ -1492,7 +1500,7 @@ fn clip_to_pixel(h: vec4<f32>, dims: vec2<f32>) -> vec2<f32> {
 }
 
 // Marches the reflection ray `R` from `pos_ws` against the G-buffer depth. Returns the opaque
-// scene where it lands (exposed, from `t_behind` blurred by roughness) and the confidence in a.
+// scene where it lands (exposed) and the confidence in a.
 fn glass_ssr(pos_ws: vec3<f32>, R: vec3<f32>, frag: vec2<f32>, roughness: f32) -> vec4<f32> {
     let dims = vec2f(textureDimensions(t_depth));
     let cam_pos = camera.inv_view[3].xyz;
@@ -1561,11 +1569,16 @@ fn glass_ssr(pos_ws: vec3<f32>, R: vec3<f32>, frag: vec2<f32>, roughness: f32) -
     let hit_uv = hit_px / dims;
     // The mip whose texel matches composite.wgsl's opaque SSR blur radius (roughness × 32 px).
     let lod = log2(max(roughness * 32.0, 1.0));
-    let color = textureSampleLevel(t_behind, s_linear, hit_uv, lod).rgb;
+    // `t_behind` has the hit surface's reflections as the camera sees them, not as the ray does
+    // (see ssr.wgsl's `hit_color`): glossy hits take `lit`, which has none but isn't blurred.
+    let hit_roughness = textureLoad(t_scene_specular_weight, vec2<i32>(hit_px), 0).a;
+    let color = mix(textureSampleLevel(t_scene_lit, s_linear, hit_uv, 0.0).rgb,
+        textureSampleLevel(t_behind, s_linear, hit_uv, lod).rgb,
+        smoothstep(GLASS_SSR_BOUNCE_MIN_ROUGHNESS, GLASS_SSR_BOUNCE_FULL_ROUGHNESS, hit_roughness));
 
     let edge = min(hit_uv, 1.0 - hit_uv);
     let confidence = smoothstep(0.0, 0.08, min(edge.x, edge.y))
-        * (1.0 - smoothstep(GLASS_SSR_FADE_ROUGHNESS, GLASS_SSR_MAX_ROUGHNESS, roughness))
+        * (1.0 - smoothstep(SSR_FADE_ROUGHNESS, SSR_MAX_ROUGHNESS, roughness))
         * (1.0 - smoothstep(0.1, 0.5, R_vs.z))
         * (1.0 - smoothstep(0.7, 1.0, hi));
     return vec4f(color, confidence);
@@ -1657,7 +1670,7 @@ fn fs_forward(in: ForwardVertex, @builtin(front_facing) front_facing: bool) -> @
     if debug.disable_direct == 0u {
         color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, -pos_vs.z, false, Ng, false);
     }
-    // Exposed, unlike `color`: screen-space hits come from the exposed `t_behind`.
+    // Exposed, unlike `color`: screen-space hits are exposed.
     var reflected = vec3f(0.0);
     if debug.disable_indirect == 0u {
         color += diffuse_color * sample_probe_irradiance(pos_ws, N, N, view_dir);
@@ -1665,12 +1678,21 @@ fn fs_forward(in: ForwardVertex, @builtin(front_facing) front_facing: bool) -> @
             color += back_lit * sample_probe_irradiance(pos_ws, -N, -N, view_dir);
         }
         if debug.disable_reflections == 0u && any(reflectance > vec3f(0.0)) {
-            let R = normalize(mix(reflect(-view_dir, N), N, alpha));
-            reflected = reflected_radiance(pos_ws, N, R, view_dir, roughness) * cp.exposure;
-            if debug.disable_ssr == 0u && roughness < GLASS_SSR_MAX_ROUGHNESS {
-                let hit = glass_ssr(pos_ws, reflect(-view_dir, N), in.pos.xy, roughness);
-                reflected = mix(reflected, hit.rgb, hit.a);
+            reflected = reflected_radiance(pos_ws, N, view_dir, roughness) * cp.exposure;
+            let R = reflect(-view_dir, N);
+            var hit = vec4f(0.0);
+            if debug.disable_ssr == 0u && roughness < SSR_MAX_ROUGHNESS {
+                hit = glass_ssr(pos_ws, R, in.pos.xy, roughness);
             }
+            // Where SSR misses, the BVH is traced at any roughness: glass is often far from the
+            // camera-centred probe, whose parallax correction then lands on whatever it saw that
+            // way (the lamp-lit corridor in a pane high up in the atrium). The traced hit tells
+            // whether the probe saw the reflected surface at all.
+            if hit.a < TRACE_SKIP_CONFIDENCE {
+                let traced = trace_mirror(pos_ws, traced_direction(view_dir, N, roughness), Ng, -pos_vs.z, roughness);
+                reflected = select(reflected, traced.rgb, traced.a > 0.0);
+            }
+            reflected = mix(reflected, hit.rgb, hit.a);
         }
     }
 
@@ -2078,4 +2100,384 @@ fn fs_particle(in: ParticleVertex) -> @location(0) vec4<f32> {
         radiance *= light;
     }
     return vec4f(radiance * (cp.exposure * in.weight * shape * soft), 0.0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ray-traced reflections (rendering::pass::reflection_trace), between `ssr` and `ssr_temporal`.
+// `fs_reflection_trace` traces the reflection ray of one glossy pixel per 2×2 block that SSR
+// didn't hit, `fs_reflection_trace_rough` one rough pixel per 4×4, through the GI's BVH (software
+// traversal, as `probe_trace.wgsl`), so a reflection doesn't depend on what is on screen or on
+// what the camera-centred probe saw. The hit is shaded from the best source that saw it: this
+// frame's `lit` if it is on screen there, else the reflection probe if the probe's capture
+// reached it, else the BVH triangle's averaged material (`trace_shade_triangle`). Group 0:
+// G-buffer normal (1), depth (3), `lit` (20), `specular_weight` (21), the BVH (22–24) and `ssr`'s
+// colour (25). `fs_reflection_resolve` upsamples the traces to full resolution and fills in what
+// SSR missed, writing SSR's own outputs (premultiplied colour + confidence, ray length) for
+// `ssr_temporal` to accumulate and `composite` to blur like any SSR hit; its group 0 is the normal
+// (1), depth (3), `specular_weight` (21), `ssr`'s colour (25), the glossy and rough traces (27,
+// 29) and `ssr`'s ray length (28).
+
+// Mirrors rendering::bvh::BvhNode / GpuTriangle / BvhInfo (and probe_trace.wgsl).
+struct BvhNode {
+    aabb_min:            vec3<f32>,
+    left_or_first_prim:  u32,
+    aabb_max:            vec3<f32>,
+    right_or_prim_count: u32,
+}
+
+struct BvhTriangle {
+    v0: vec3<f32>, albedo_metallic: u32,
+    v1: vec3<f32>, roughness_coverage: u32,
+    v2: vec3<f32>, emissive: u32,
+}
+
+struct BvhInfo {
+    node_count: u32,
+    tri_count:  u32,
+    enabled:    u32,
+    _pad:       u32,
+}
+
+@group(0) @binding(22) var<storage, read> bvh_nodes: array<BvhNode>;
+@group(0) @binding(23) var<storage, read> bvh_tris:  array<BvhTriangle>;
+@group(0) @binding(24) var<uniform>       bvh_info:  BvhInfo;
+@group(0) @binding(25) var t_ssr:            texture_2d<f32>;
+@group(0) @binding(27) var t_traced:         texture_2d<f32>;
+@group(0) @binding(28) var t_ssr_ray_length: texture_2d<f32>;
+@group(0) @binding(29) var t_traced_rough:   texture_2d<f32>;
+
+const TRACE_MAX_DISTANCE: f32 = 100.0;
+// SSR already resolved pixels above this confidence.
+const TRACE_SKIP_CONFIDENCE: f32 = 0.99;
+// A probe texel stands for the hit when its captured distance is within this much of the hit's
+// (plus a fraction of the distance), i.e. the probe saw the same surface.
+const TRACE_PROBE_TOLERANCE: f32 = 0.05;
+const TRACE_PROBE_TOLERANCE_FRACTION: f32 = 0.1;
+// A screen pixel stands for the hit when its depth is within this fraction of the hit's.
+const TRACE_SCREEN_TOLERANCE: f32 = 0.02;
+
+struct BvhHit {
+    dist: f32,
+    tri:  u32,
+}
+
+// Entry distance of the ray into `node`'s box, or a negative value if it misses it within t_max.
+fn trace_box(node: BvhNode, ro: vec3<f32>, inv_rd: vec3<f32>, t_max: f32) -> f32 {
+    let t1 = (node.aabb_min - ro) * inv_rd;
+    let t2 = (node.aabb_max - ro) * inv_rd;
+    let t_near = max(max(min(t1.x, t2.x), min(t1.y, t2.y)), min(t1.z, t2.z));
+    let t_far = min(min(max(t1.x, t2.x), max(t1.y, t2.y)), max(t1.z, t2.z));
+    return select(-1.0, max(t_near, 0.0), t_near <= t_far && t_far >= 0.0 && t_near <= t_max);
+}
+
+// Closest hit along `rd` from `ro` within `max_dist` (dist < 0: none). Children are visited near
+// first, and boxes entered past the closest hit so far are skipped. Cut-out triangles count as
+// solid when at least half their area is: a random pass-through would be noise without the
+// probes' temporal blend.
+fn trace_bvh(ro: vec3<f32>, rd: vec3<f32>, max_dist: f32) -> BvhHit {
+    var best = BvhHit(-1.0, 0u);
+    var t_max = max_dist;
+    let inv_rd = 1.0 / rd;
+    // Node index and the entry distance it was pushed with.
+    var stack: array<vec2<u32>, 32>;
+    var sp = 0;
+    var node_index = 0u;
+    if trace_box(bvh_nodes[0], ro, inv_rd, t_max) < 0.0 {
+        return best;
+    }
+    loop {
+        let node = bvh_nodes[node_index];
+        if (node.right_or_prim_count & 0x80000000u) == 0u {
+            let left = node.left_or_first_prim;
+            let right = node.right_or_prim_count;
+            let t_left = trace_box(bvh_nodes[left], ro, inv_rd, t_max);
+            let t_right = trace_box(bvh_nodes[right], ro, inv_rd, t_max);
+            if t_left >= 0.0 && t_right >= 0.0 {
+                let left_first = t_left <= t_right;
+                node_index = select(right, left, left_first);
+                if sp < 32 {
+                    stack[sp] = vec2<u32>(select(left, right, left_first), bitcast<u32>(max(t_left, t_right)));
+                    sp += 1;
+                }
+                continue;
+            }
+            if t_left >= 0.0 || t_right >= 0.0 {
+                node_index = select(right, left, t_left >= 0.0);
+                continue;
+            }
+        } else {
+            let first = node.left_or_first_prim;
+            let count = node.right_or_prim_count & 0x7FFFFFFFu;
+            for (var i = 0u; i < count; i++) {
+                let tri = bvh_tris[first + i];
+                if unpack4x8unorm(tri.roughness_coverage).y < 0.5 {
+                    continue;
+                }
+                // Möller–Trumbore.
+                let e1 = tri.v1 - tri.v0;
+                let e2 = tri.v2 - tri.v0;
+                let h = cross(rd, e2);
+                let a = dot(e1, h);
+                if abs(a) < 1e-7 {
+                    continue;
+                }
+                let f = 1.0 / a;
+                let s = ro - tri.v0;
+                let u = f * dot(s, h);
+                let q = cross(s, e1);
+                let v = f * dot(rd, q);
+                let t = f * dot(e2, q);
+                if u >= 0.0 && v >= 0.0 && u + v <= 1.0 && t > 1e-4 && t < t_max {
+                    t_max = t;
+                    best = BvhHit(t, first + i);
+                }
+            }
+        }
+        // Next pushed node the ray still reaches before the closest hit.
+        var found = false;
+        while sp > 0 {
+            sp -= 1;
+            if bitcast<f32>(stack[sp].y) <= t_max {
+                node_index = stack[sp].x;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            break;
+        }
+    }
+    return best;
+}
+
+// rendering::bvh::pack_emissive (the area-light flag doesn't matter here: reflections show the emitter).
+fn unpack_bvh_emissive(e: u32) -> vec3<f32> {
+    return vec3f(f32(e & 0xffu), f32((e >> 8u) & 0xffu), f32((e >> 16u) & 0xffu)) / 255.0
+        * exp2(f32((e >> 24u) & 0x7fu) - 64.0);
+}
+
+// Unexposed radiance this frame's `lit` shows at `pos_ws`, or a negative value if it isn't on
+// screen there (off screen, hidden, or a surface facing away from the ray).
+fn trace_screen_radiance(pos_ws: vec3<f32>, R: vec3<f32>) -> vec3<f32> {
+    let clip = camera.view_proj * vec4f(pos_ws, 1.0);
+    if clip.w <= 0.0 {
+        return vec3f(-1.0);
+    }
+    let dims = vec2f(cp.screen_w, cp.screen_h);
+    let px = vec2<i32>(clip_to_pixel(clip, dims));
+    if any(px < vec2<i32>(0)) || any(px >= vec2<i32>(dims)) {
+        return vec3f(-1.0);
+    }
+    let d = textureLoad(t_depth, px, 0);
+    if d == 0.0 || abs(linear_depth(d) - clip.w) > TRACE_SCREEN_TOLERANCE * clip.w {
+        return vec3f(-1.0);
+    }
+    let n = textureLoad(t_normal, px, 0).rgb * 2.0 - 1.0;
+    if dot(n, R) > 0.0 {
+        return vec3f(-1.0);
+    }
+    return textureLoad(t_scene_lit, px, 0).rgb / cp.exposure;
+}
+
+// The probe's radiance toward its center from `pos_ws` (rgb, prefiltered at `lod`), with a = 1
+// if its capture reached that point rather than something in front of or behind it.
+fn trace_probe_radiance(cube: texture_cube<f32>, center: vec3<f32>, pos_ws: vec3<f32>, lod: f32) -> vec4<f32> {
+    let v = pos_ws - center;
+    let d = length(v);
+    let dir = v / max(d, 1e-4);
+    let reached = abs(textureSampleLevel(cube, s_reflection, dir, 0.0).a - d)
+        < TRACE_PROBE_TOLERANCE + TRACE_PROBE_TOLERANCE_FRACTION * d;
+    return vec4f(textureSampleLevel(cube, s_reflection, dir, lod).rgb, f32(reached));
+}
+
+// Unexposed radiance leaving the BVH triangle `tri` at `pos_ws` along -R, from its averaged
+// material: emission plus DDGI irradiance. No direct light: shadowed light lookups at every such
+// hit cost several times the trace, and these are surfaces neither the camera nor the probe sees.
+fn trace_shade_triangle(tri: BvhTriangle, pos_ws: vec3<f32>, R: vec3<f32>) -> vec3<f32> {
+    var N = normalize(cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
+    N = select(N, -N, dot(N, R) > 0.0);
+    let material = unpack4x8unorm(tri.albedo_metallic);
+    let albedo = select(material.rgb, vec3f(1.0), debug.disable_albedo != 0u);
+    let metallic = material.a;
+    let roughness = max(unpack4x8unorm(tri.roughness_coverage).x, MIN_ROUGHNESS);
+    let f0 = mix(vec3f(0.04), albedo, metallic);
+    let diffuse_color = albedo * (1.0 - metallic);
+    let view_dir = -R;
+    var color = unpack_bvh_emissive(tri.emissive);
+    if debug.disable_indirect == 0u {
+        let n_dot_v = max(dot(N, view_dir), 1e-4);
+        color += diffuse_color * sample_probe_irradiance(pos_ws, N, N, view_dir)
+            + env_brdf_approx(f0, roughness, n_dot_v) * sample_probe_irradiance(pos_ws, N, reflect(R, N), view_dir);
+    }
+    return color;
+}
+
+// Unexposed radiance arriving along R from the BVH hit `hit` at `pos_ws`, for a reflecting
+// surface of `roughness`: the screen only within SSR's roughness range (a single sharp pixel
+// would be noise on a rougher one), the probe prefiltered for it.
+fn trace_hit_radiance(hit: BvhHit, pos_ws: vec3<f32>, R: vec3<f32>, roughness: f32) -> vec3<f32> {
+    if roughness < SSR_MAX_ROUGHNESS {
+        let screen = trace_screen_radiance(pos_ws, R);
+        if screen.x >= 0.0 {
+            return screen;
+        }
+    }
+    let lod = roughness * reflection.max_lod * smoothstep(SSR_FADE_ROUGHNESS, SSR_MAX_ROUGHNESS, roughness);
+    // Each cube's share, from the probe where its capture reached the hit, else shaded here.
+    var radiance = vec3f(0.0);
+    var shaded_share = 1.0;
+    if reflection.centers[0].w + reflection.centers[1].w >= 0.5 {
+        shaded_share = 0.0;
+        if reflection.blend < 1.0 {
+            let probe = trace_probe_radiance(t_reflection, reflection.centers[0].xyz, pos_ws, lod);
+            radiance += probe.rgb * (probe.a * (1.0 - reflection.blend));
+            shaded_share += (1.0 - probe.a) * (1.0 - reflection.blend);
+        }
+        if reflection.blend > 0.0 {
+            let probe = trace_probe_radiance(t_reflection_b, reflection.centers[1].xyz, pos_ws, lod);
+            radiance += probe.rgb * (probe.a * reflection.blend);
+            shaded_share += (1.0 - probe.a) * reflection.blend;
+        }
+    }
+    if shaded_share > 0.0 {
+        radiance += trace_shade_triangle(bvh_tris[hit.tri], pos_ws, R) * shaded_share;
+    }
+    return radiance;
+}
+
+// The direction traced for a surface of `roughness`: the mirror ray over SSR's roughness range,
+// leaning toward N past it (Filament's dominant direction, as `reflected_radiance`).
+fn traced_direction(view_dir: vec3<f32>, N: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let lean = roughness * roughness * smoothstep(SSR_FADE_ROUGHNESS, SSR_MAX_ROUGHNESS, roughness);
+    return normalize(mix(reflect(-view_dir, N), N, lean));
+}
+
+// Surfaces rougher than SSR reaches are traced at a quarter of the resolution (`fs_reflection_trace_rough`,
+// texel r = pixel 4r): their reflections are blurry, and tracing them at half resolution cost
+// 2.5× as much. Tracing a rotating quarter of the half-resolution tiles instead kept stale traces
+// in the others, which swam and hitched as the camera turned.
+
+// The pixel half-resolution traced texel `q` stands for. Always the same one: cycling through the 2×2 block let
+// `ssr_temporal`'s neighbourhood clip move with the cycle, and reflections of small bright
+// lights flickered with the camera still.
+fn traced_pixel(q: vec2<i32>) -> vec2<i32> {
+    let size = vec2<i32>(i32(cp.screen_w), i32(cp.screen_h));
+    return min(q * 2, size - 1);
+}
+
+// rgb: radiance arriving along the traced ray of `traced_pixel`, exposed; a: the ray's length
+// (TRACE_MAX_DISTANCE for the sky), 0 where nothing was traced. Glossy pixels only.
+@fragment
+fn fs_reflection_trace(in: VertexOutput) -> @location(0) vec4<f32> {
+    return trace_pixel(traced_pixel(vec2<i32>(in.pos.xy)), false);
+}
+
+// As `fs_reflection_trace`, for pixel 4r of rough surfaces.
+@fragment
+fn fs_reflection_trace_rough(in: VertexOutput) -> @location(0) vec4<f32> {
+    let size = vec2<i32>(i32(cp.screen_w), i32(cp.screen_h));
+    return trace_pixel(min(vec2<i32>(in.pos.xy) * 4, size - 1), true);
+}
+
+fn trace_pixel(px: vec2<i32>, rough: bool) -> vec4<f32> {
+    let weight = textureLoad(t_scene_specular_weight, px, 0);
+    if all(weight.rgb == vec3f(0.0)) || (weight.a >= SSR_MAX_ROUGHNESS) != rough
+        || textureLoad(t_ssr, px, 0).a > TRACE_SKIP_CONFIDENCE {
+        return vec4f(0.0);
+    }
+    let at = gbuffer_pos_ws(px);
+    let pos_ws = at.xyz;
+    let view_dir = normalize(camera.inv_view[3].xyz - pos_ws);
+    let N = normalize(textureLoad(t_normal, px, 0).rgb * 2.0 - 1.0);
+    return trace_mirror(pos_ws, traced_direction(view_dir, N, weight.a), geometric_normal(px, pos_ws, view_dir),
+        linear_depth(at.w), weight.a);
+}
+
+// Exposed radiance arriving at `pos_ws` along `R` through the BVH (rgb) and the ray's length (a;
+// TRACE_MAX_DISTANCE for the sky, 0 if not traced), for a surface of `roughness` (see
+// `trace_hit_radiance`). The ray starts off the geometric surface `geo_N` (not the normal-mapped
+// one; rays into it aren't traced), by an offset growing with the view depth `depth_vs`.
+fn trace_mirror(pos_ws: vec3<f32>, R: vec3<f32>, geo_N: vec3<f32>, depth_vs: f32, roughness: f32) -> vec4<f32> {
+    if debug.disable_traced_reflections != 0u || bvh_info.enabled == 0u || dot(R, geo_N) <= 0.0 {
+        return vec4f(0.0);
+    }
+    let offset = 0.005 + 0.002 * depth_vs;
+    let origin = pos_ws + geo_N * offset;
+    let hit = trace_bvh(origin, R, TRACE_MAX_DISTANCE);
+    if hit.dist < 0.0 {
+        return vec4f(min(sky_color(R), vec3f(PROBE_MAX_RADIANCE)) * cp.exposure, TRACE_MAX_DISTANCE);
+    }
+    let radiance = trace_hit_radiance(hit, origin + R * hit.dist, R, roughness);
+    return vec4f(min(radiance, vec3f(PROBE_MAX_RADIANCE)) * cp.exposure, hit.dist + offset);
+}
+
+struct ReflectionResolveOutput {
+    // Premultiplied colour, a: confidence (as ssr.wgsl's).
+    @location(0) color: vec4<f32>,
+    @location(1) ray_length: f32,
+}
+
+// SSR's outputs with the traces filling in what it missed (all of it past SSR's roughness range,
+// replacing the camera-centred probe, whose parallax correction lands on the wrong surface for
+// rays it didn't see: door frames near the emergency lamp turned orange as the camera walked up).
+// The traces are upsampled like the shadow mask (`upsample_shadow_mask`): the traced texels
+// around the pixel, weighted by distance and by how close each one's surface is to this pixel's
+// tangent plane and normal.
+@fragment
+fn fs_reflection_resolve(in: VertexOutput) -> ReflectionResolveOutput {
+    let px = vec2<i32>(in.pos.xy);
+    let ssr = textureLoad(t_ssr, px, 0);
+    let ssr_ray = textureLoad(t_ssr_ray_length, px, 0).r;
+    var out = ReflectionResolveOutput(ssr, ssr_ray);
+    let weight = textureLoad(t_scene_specular_weight, px, 0);
+    let share = 1.0 - ssr.a;
+    if debug.disable_traced_reflections != 0u || share <= 0.0 || all(weight.rgb == vec3f(0.0)) {
+        return out;
+    }
+    let at = gbuffer_pos_ws(px);
+    let N = normalize(textureLoad(t_normal, px, 0).rgb * 2.0 - 1.0);
+    let depth_vs = linear_depth(at.w);
+    let rough = weight.a >= SSR_MAX_ROUGHNESS;
+    let scale = select(2, 4, rough);
+    let radius = select(2.5, 5.0, rough);
+    let size = select(vec2<i32>(textureDimensions(t_traced)), vec2<i32>(textureDimensions(t_traced_rough)), rough);
+    let full = vec2<i32>(i32(cp.screen_w), i32(cp.screen_h));
+    let center = vec2<i32>(in.pos.xy) / scale;
+    var traced = vec4f(0.0);
+    var total = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let q = clamp(center + vec2<i32>(x, y), vec2<i32>(0), size - 1);
+            var sample: vec4<f32>;
+            if rough {
+                sample = textureLoad(t_traced_rough, q, 0);
+            } else {
+                sample = textureLoad(t_traced, q, 0);
+            }
+            if sample.a == 0.0 {
+                continue;
+            }
+            let p = min(q * scale, full - 1);
+            let d = vec2f(p - px);
+            let spatial = saturate(1.0 - length(d) / radius);
+            if spatial == 0.0 {
+                continue;
+            }
+            let other = gbuffer_pos_ws(p);
+            let plane_dist = abs(dot(other.xyz - at.xyz, N));
+            let n = normalize(textureLoad(t_normal, p, 0).rgb * 2.0 - 1.0);
+            let w = spatial * saturate(1.0 - plane_dist / (MASK_PLANE_TOLERANCE * depth_vs))
+                * pow(saturate(dot(n, N)), 4.0);
+            traced += w * sample;
+            total += w;
+        }
+    }
+    if total < 1e-3 {
+        return out;
+    }
+    traced /= total;
+    out.color = vec4f(ssr.rgb + traced.rgb * share, ssr.a + share);
+    out.ray_length = (select(0.0, ssr_ray * ssr.a, ssr_ray > 0.0) + traced.a * share)
+        / (select(0.0, ssr.a, ssr_ray > 0.0) + share);
+    return out;
 }
