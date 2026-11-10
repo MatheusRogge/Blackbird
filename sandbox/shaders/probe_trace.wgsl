@@ -14,7 +14,7 @@ struct BvhNode {
 struct BvhTriangle {
     v0: vec3<f32>, albedo_metallic: u32,  // linear albedo rgb + metallic, unorm8
     v1: vec3<f32>, roughness_coverage: u32, // unorm8 x: roughness, y: alpha coverage
-    v2: vec3<f32>, emissive: u32,          // unorm8 rgb × 2^(a·255 − 128), 0 = none
+    v2: vec3<f32>, emissive: u32,          // see `unpack_emissive`
 }
 
 struct BvhInfo {
@@ -251,6 +251,15 @@ fn probe_world_position(probe_index: u32) -> vec3<f32> {
 
 // ── Shading helpers ───────────────────────────────────────────────────────────
 
+// Mirrors rendering::bvh::EMISSIVE_AREA_LIGHT.
+const EMISSIVE_AREA_LIGHT: u32 = 0x80000000u;
+
+// rendering::bvh::pack_emissive: unorm8 rgb × 2^(bits 24–30 − 64).
+fn unpack_emissive(e: u32) -> vec3<f32> {
+    return vec3f(f32(e & 0xffu), f32((e >> 8u) & 0xffu), f32((e >> 16u) & 0xffu)) / 255.0
+        * exp2(f32((e >> 24u) & 0x7fu) - 64.0);
+}
+
 fn view_to_world(p: vec3<f32>) -> vec3<f32> {
     return (frame.inv_view * vec4<f32>(p, 1.0)).xyz;
 }
@@ -288,8 +297,9 @@ fn shade_hit(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>, tri: BvhTri
     let bias      = SHADOW_BIAS * probe_params.probe_spacing;
     let origin    = pos + normal * bias;
 
-    let packed_emissive = unpack4x8unorm(tri.emissive);
-    var radiance = packed_emissive.rgb * exp2(packed_emissive.a * 255.0 - 128.0);
+    // Meshes lit as area lights (EMISSIVE_AREA_LIGHT) already reach the hit as lights; rays that
+    // happen to see the small, bright emitter made the probes flicker.
+    var radiance = select(unpack_emissive(tri.emissive), vec3f(0.0), (tri.emissive & EMISSIVE_AREA_LIGHT) != 0u);
     for (var i = 0u; i < light_counts.num_sky; i++) {
         let L = -(frame.inv_view * vec4<f32>(sky_lights[i].direction_vs, 0.0)).xyz;
         if L.y < 0.0 { continue; }

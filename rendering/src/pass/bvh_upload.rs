@@ -12,6 +12,7 @@ use crate::{
     arena::BufferRange,
     bvh::{self, BvhInfo, BvhNode, GpuTriangle, MAX_BVH_NODES, MAX_BVH_TRIS, pack_emissive},
     graph::{NodeId, RenderGraph},
+    light::emissive::SharedEmissiveLights,
     mesh::Mesh,
     pass::{Pass, PassContext, PassDesc},
     resource::{ResourceDescriptor, ResourceId},
@@ -53,6 +54,7 @@ pub struct BvhUploadPass {
     /// `TextureAsset::mean` per (`TextureAsset::id`, sRGB), pruned to live textures on each rebuild.
     texture_means: HashMap<(u64, bool), [f32; 4]>,
     built_meshes: Vec<BuiltMesh>,
+    emissive_lights: SharedEmissiveLights,
 }
 
 fn pack_unorm4x8(v: [f32; 4]) -> u32 {
@@ -63,7 +65,7 @@ fn pack_unorm4x8(v: [f32; 4]) -> u32 {
 }
 
 impl BvhUploadPass {
-    pub fn new(graph: &mut RenderGraph) -> (Self, BvhOutputs) {
+    pub fn new(graph: &mut RenderGraph, emissive_lights: SharedEmissiveLights) -> (Self, BvhOutputs) {
         let nodes_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: MAX_BVH_NODES * std::mem::size_of::<BvhNode>() as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -93,6 +95,7 @@ impl BvhUploadPass {
                 node_count,
                 texture_means: HashMap::new(),
                 built_meshes: Vec::new(),
+                emissive_lights,
             },
             outputs,
         )
@@ -151,8 +154,9 @@ impl Pass for BvhUploadPass {
             }
         }
 
+        let emitters = self.emissive_lights.read().expect("emissive lights poisoned").clone();
         if !self.dirty {
-            self.refresh_emissive(queue, tris_buf, world);
+            self.refresh_emissive(queue, tris_buf, world, &emitters);
             return;
         }
         self.dirty = false;
@@ -185,7 +189,7 @@ impl Pass for BvhUploadPass {
             let albedo: [f32; 3] = std::array::from_fn(|c| factors.base_color[c] * albedo_mean[c]);
             let metallic = factors.metallic * mr_mean[2];
             let roughness = factors.roughness * mr_mean[1];
-            let emissive = emissive_of(mesh, &mut self.texture_means);
+            let emissive = emissive_of(handle.id, mesh, &emitters, &mut self.texture_means);
             let mesh_index = self.built_meshes.len() as u32;
             self.built_meshes.push(BuiltMesh { key: handle.id, emissive, triangles: Vec::new() });
 
@@ -263,11 +267,11 @@ impl Pass for BvhUploadPass {
 
 impl BvhUploadPass {
     /// Rewrites the emissive word of the triangles of each mesh whose emissive changed since the build.
-    fn refresh_emissive(&mut self, queue: &wgpu::Queue, tris: BufferRange<'_>, world: &World) {
+    fn refresh_emissive(&mut self, queue: &wgpu::Queue, tris: BufferRange<'_>, world: &World, emitters: &HashSet<EntityKey>) {
         const EMISSIVE_OFFSET: u64 = std::mem::offset_of!(GpuTriangle, emissive) as u64;
         for built in &mut self.built_meshes {
             let Some(mesh) = world.get_entity::<Mesh>(built.key) else { continue };
-            let emissive = emissive_of(mesh, &mut self.texture_means);
+            let emissive = emissive_of(built.key, mesh, emitters, &mut self.texture_means);
             if emissive == built.emissive {
                 continue;
             }
@@ -280,12 +284,21 @@ impl BvhUploadPass {
     }
 }
 
-/// The mesh's packed emitted radiance: factor × strength × its emissive texture's mean.
-fn emissive_of(mesh: &Mesh, texture_means: &mut HashMap<(u64, bool), [f32; 4]>) -> u32 {
+/// The mesh's packed emitted radiance: factor × strength × its emissive texture's mean, flagged
+/// `EMISSIVE_AREA_LIGHT` if it is one of the `emitters` lit as area lights.
+fn emissive_of(
+    key: EntityKey,
+    mesh: &Mesh,
+    emitters: &HashSet<EntityKey>,
+    texture_means: &mut HashMap<(u64, bool), [f32; 4]>,
+) -> u32 {
     let mean = mesh
         .emissive_texture
         .as_ref()
         .map_or([1.0; 4], |t| *texture_means.entry((t.id(), true)).or_insert_with(|| t.mean(true)));
     let factors = &mesh.material;
-    pack_emissive(std::array::from_fn(|c| factors.emissive[c] * factors.emissive_strength * mean[c]))
+    pack_emissive(
+        std::array::from_fn(|c| factors.emissive[c] * factors.emissive_strength * mean[c]),
+        emitters.contains(&key),
+    )
 }

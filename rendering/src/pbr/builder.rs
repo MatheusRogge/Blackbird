@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use crate::{
     debug_flags::RenderDebugFlags,
     graph::RenderGraph,
-    light::{SharedShadowCasters, virtual_shadow::SharedPageRequests},
+    light::{SharedShadowCasters, emissive::SharedEmissiveLights, virtual_shadow::SharedPageRequests},
     pass::{
         ao::AoPass,
         shadow_pages::ShadowPagesPass,
@@ -110,12 +110,13 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
         let debug_flags = graph.debug_flags_arc();
 
         let shadow_casters: SharedShadowCasters = Arc::default();
+        let emissive_lights: SharedEmissiveLights = Arc::default();
         let page_requests: SharedPageRequests = Arc::default();
         let (light_upload_pass, light_buffers) =
-            LightUploadPass::new(&mut graph, Arc::clone(&debug_flags), Arc::clone(&shadow_casters));
+            LightUploadPass::new(&mut graph, Arc::clone(&debug_flags), Arc::clone(&shadow_casters), Arc::clone(&emissive_lights));
         graph.add_pass(device, light_upload_pass);
 
-        let (bvh_pass, bvh_outputs) = BvhUploadPass::new(&mut graph);
+        let (bvh_pass, bvh_outputs) = BvhUploadPass::new(&mut graph, emissive_lights);
         graph.add_pass(device, bvh_pass);
 
         let (probe_atlas_pass, probe_atlas_outputs) =

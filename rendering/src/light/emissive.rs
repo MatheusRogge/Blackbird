@@ -1,6 +1,16 @@
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
+
+use engine_core::entity::EntityKey;
 use ultraviolet::{Mat4, Vec3};
 
 use crate::mesh::Mesh;
+
+/// The meshes `light_upload` made area lights of this frame. `bvh_upload` flags their triangles'
+/// emissive (`bvh::EMISSIVE_AREA_LIGHT`) so GI rays skip it: their light already reaches the
+/// probes' hits as a light, and rays that happen to see the small, bright emitter made the probes
+/// flicker. Reflection rays still see it.
+pub type SharedEmissiveLights = Arc<RwLock<HashSet<EntityKey>>>;
 
 /// Below this area-weighted normal coherence (|Σ n·A| / ΣA) a mesh is not flat enough to stand in
 /// for a rectangle light.

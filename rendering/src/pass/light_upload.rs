@@ -10,7 +10,7 @@ use crate::{
     debug_flags::RenderDebugFlags,
     graph::{NodeId, RenderGraph},
     light::{
-        emissive::{self, EmissiveRect},
+        emissive::{self, EmissiveRect, SharedEmissiveLights},
         AreaLight, GpuAreaLight, GpuPointLight, GpuSkyLight, GpuSpotLight, LightCounts,
         MAX_AREA_LIGHTS, MAX_POINT_LIGHTS, MAX_SKY_LIGHTS, MAX_SPOT_LIGHTS, PointLight, SkyLight,
         SpotLight, SHADOW_KIND_AREA, SHADOW_KIND_POINT, SHADOW_KIND_SPOT, SHADOW_SLOT_NONE, ShadowedLights,
@@ -52,6 +52,7 @@ pub struct LightUploadPass {
     emissive_rects: HashMap<EntityKey, Option<EmissiveRect>>,
     /// Emissive texture means per `TextureAsset::id`.
     emissive_means: HashMap<u64, [f32; 3]>,
+    emissive_lights: SharedEmissiveLights,
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
     /// The slots picked this frame, for `ShadowPass` to render.
     shadow_casters: SharedShadowCasters,
@@ -63,6 +64,7 @@ impl LightUploadPass {
         graph: &mut RenderGraph,
         debug_flags: Arc<RwLock<RenderDebugFlags>>,
         shadow_casters: SharedShadowCasters,
+        emissive_lights: SharedEmissiveLights,
     ) -> (Self, LightBuffers) {
         let point_buffer_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: (MAX_POINT_LIGHTS * size_of::<GpuPointLight>()) as u64,
@@ -107,6 +109,7 @@ impl LightUploadPass {
             node_id: None,
             emissive_rects: HashMap::new(),
             emissive_means: HashMap::new(),
+            emissive_lights,
             debug_flags,
             shadow_casters,
             shadow_slots: ShadowSlots::default(),
@@ -148,12 +151,12 @@ impl PassDesc for LightUploadPass {
 impl LightUploadPass {
     /// One one-sided area light per flat emissive mesh, brightest first. Luminance is the mesh's
     /// emissive factor × strength × its emissive texture's mean, the same nits `gbuffer` writes.
-    fn emissive_lights(&mut self, world: &World) -> Vec<AreaLight> {
+    fn emissive_lights(&mut self, world: &World) -> Vec<(EntityKey, AreaLight)> {
         let meshes = world.get_entity_handles::<Mesh>();
         let live: HashSet<EntityKey> = meshes.iter().map(|h| h.id).collect();
         self.emissive_rects.retain(|key, _| live.contains(key));
 
-        let mut lights: Vec<(f32, AreaLight)> = Vec::new();
+        let mut lights: Vec<(f32, EntityKey, AreaLight)> = Vec::new();
         for handle in &meshes {
             let mesh = handle.entity;
             let factors = &mesh.material;
@@ -178,6 +181,7 @@ impl LightUploadPass {
             }
             lights.push((
                 flux,
+                handle.id,
                 AreaLight {
                     position: rect.center,
                     right: rect.right,
@@ -189,7 +193,7 @@ impl LightUploadPass {
             ));
         }
         lights.sort_by(|a, b| b.0.total_cmp(&a.0));
-        lights.into_iter().map(|(_, light)| light).collect()
+        lights.into_iter().map(|(_, key, light)| (key, light)).collect()
     }
 }
 
@@ -234,10 +238,15 @@ impl Pass for LightUploadPass {
             let flags = self.debug_flags.read().expect("debug_flags poisoned");
             (flags.emissive_lights, flags.shadows)
         };
+        let mut emitters = HashSet::new();
         if emissive_lights {
             let free = MAX_AREA_LIGHTS - areas.len();
-            areas.extend(self.emissive_lights(world).into_iter().take(free));
+            for (key, light) in self.emissive_lights(world).into_iter().take(free) {
+                emitters.insert(key);
+                areas.push(light);
+            }
         }
+        *self.emissive_lights.write().expect("emissive lights poisoned") = emitters;
 
         let mut point_lights: Vec<GpuPointLight> = points
             .iter()
