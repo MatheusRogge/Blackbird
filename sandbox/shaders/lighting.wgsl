@@ -2375,11 +2375,58 @@ fn trace_hit_radiance(hit: BvhHit, pos_ws: vec3<f32>, R: vec3<f32>, roughness: f
     return radiance;
 }
 
-// The direction traced for a surface of `roughness`: the mirror ray over SSR's roughness range,
-// leaning toward N past it (Filament's dominant direction, as `reflected_radiance`).
+// The lobe's dominant direction for a surface of `roughness`: the mirror ray over SSR's roughness
+// range, leaning toward N past it (Filament's, as `reflected_radiance`). Traced as is for glass,
+// which has no temporal pass to average `sampled_direction`'s draws.
 fn traced_direction(view_dir: vec3<f32>, N: vec3<f32>, roughness: f32) -> vec3<f32> {
     let lean = roughness * roughness * smoothstep(SSR_FADE_ROUGHNESS, SSR_MAX_ROUGHNESS, roughness);
     return normalize(mix(reflect(-view_dir, N), N, lean));
+}
+
+fn interleaved_gradient_noise(p: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715))));
+}
+
+// Share of the GGX lobe's grazing tail cut off when sampling it: the rare rays out there are
+// most of the noise and barely change the average.
+const TRACE_LOBE_TRIM: f32 = 0.2;
+
+// A reflection direction drawn from the GGX lobe of `roughness` around N for this pixel and
+// frame (visible normals, Dupuy & Benyoub's spherical caps). A fixed ray per texel caught small
+// bright lights on normal-mapped surfaces in some texels and not their neighbours, which stayed
+// as a dotted pattern; drawn anew every frame, `ssr_temporal` averages them into the lobe.
+// Falls back to `traced_direction` for a draw below the surface.
+fn sampled_direction(px: vec2<i32>, view_dir: vec3<f32>, N: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let frame = camera.depth_params.z;
+    let xi = vec2f(
+        interleaved_gradient_noise(vec2f(px) + 5.588238 * frame),
+        interleaved_gradient_noise(vec2f(px.yx) + vec2f(47.0, 17.0) + 7.123987 * frame),
+    );
+    let alpha = roughness * roughness;
+    // Orthonormal basis around N (Duff et al. 2017).
+    let s = select(-1.0, 1.0, N.z >= 0.0);
+    let a = -1.0 / (s + N.z);
+    let b = N.x * N.y * a;
+    let T = vec3f(1.0 + s * N.x * N.x * a, s * b, -s * N.x);
+    let B = vec3f(b, s + N.y * N.y * a, -N.y);
+    let v = vec3f(dot(view_dir, T), dot(view_dir, B), dot(view_dir, N));
+    // Normal maps tilt N away from the viewer at grazing angles. Visible-normal sampling has no
+    // lobe there, and at roughness 0 its half vector came out zero and the ray NaN, which the
+    // temporal pass and SSR's last-frame lookups spread over the whole screen as black.
+    if v.z <= 1e-3 {
+        return traced_direction(view_dir, N, roughness);
+    }
+    let vh = normalize(vec3f(alpha * v.x, alpha * v.y, v.z));
+    let phi = 2.0 * PI * xi.x;
+    let z = (1.0 - xi.y * (1.0 - TRACE_LOBE_TRIM)) * (1.0 + vh.z) - vh.z;
+    let sin_theta = sqrt(saturate(1.0 - z * z));
+    let hh = vec3f(sin_theta * cos(phi), sin_theta * sin(phi), z) + vh;
+    let h = normalize(vec3f(alpha * hh.x, alpha * hh.y, max(hh.z, 0.0)));
+    let R = reflect(-view_dir, normalize(T * h.x + B * h.y + N * h.z));
+    if dot(R, N) <= 0.0 {
+        return traced_direction(view_dir, N, roughness);
+    }
+    return R;
 }
 
 // Surfaces rougher than SSR reaches are traced at a quarter of the resolution (`fs_reflection_trace_rough`,
@@ -2419,8 +2466,12 @@ fn trace_pixel(px: vec2<i32>, rough: bool) -> vec4<f32> {
     let pos_ws = at.xyz;
     let view_dir = normalize(camera.inv_view[3].xyz - pos_ws);
     let N = normalize(textureLoad(t_normal, px, 0).rgb * 2.0 - 1.0);
-    return trace_mirror(pos_ws, traced_direction(view_dir, N, weight.a), geometric_normal(px, pos_ws, view_dir),
-        linear_depth(at.w), weight.a);
+    let geo_N = geometric_normal(px, pos_ws, view_dir);
+    var R = sampled_direction(px, view_dir, N, weight.a);
+    if dot(R, geo_N) <= 0.0 {
+        R = traced_direction(view_dir, N, weight.a);
+    }
+    return trace_mirror(pos_ws, R, geo_N, linear_depth(at.w), weight.a);
 }
 
 // Exposed radiance arriving at `pos_ws` along `R` through the BVH (rgb) and the ray's length (a;
@@ -2496,8 +2547,12 @@ fn fs_reflection_resolve(in: VertexOutput) -> ReflectionResolveOutput {
             let other = gbuffer_pos_ws(p);
             let plane_dist = abs(dot(other.xyz - at.xyz, N));
             let n = normalize(textureLoad(t_normal, p, 0).rgb * 2.0 - 1.0);
+            // × 1 / (1 + luminance) (Karis): each texel is one fixed ray, so on normal-mapped
+            // surfaces a few rays catch a small bright light on screen (the emergency lamp) while
+            // their neighbours miss, and their exposed radiance spread into lasting fireflies.
+            let luminance = dot(sample.rgb, vec3f(0.2126, 0.7152, 0.0722));
             let w = spatial * saturate(1.0 - plane_dist / (MASK_PLANE_TOLERANCE * depth_vs))
-                * pow(saturate(dot(n, N)), 4.0);
+                * pow(saturate(dot(n, N)), 4.0) / (1.0 + luminance);
             traced += w * sample;
             total += w;
         }

@@ -30,6 +30,8 @@ struct CameraUniform {
 const CURRENT_WEIGHT: f32 = 0.1;
 // Width of the clip box in standard deviations of the 3×3 neighbourhood.
 const CLIP_SIGMA: f32 = 1.25;
+// Mirrors SSR_MAX_ROUGHNESS (lighting.wgsl): rougher pixels' traces are quarter resolution.
+const SSR_MAX_ROUGHNESS: f32 = 0.4;
 
 struct VertexOutput {
     @builtin(position) pos: vec4<f32>,
@@ -44,8 +46,9 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let px = vec2<i32>(in.pos.xy);
-    let current = textureLoad(t_ssr, px, 0);
-    if all(textureLoad(t_specular_weight, px, 0).rgb == vec3f(0.0)) {
+    let current = load_ssr(px);
+    let weight = textureLoad(t_specular_weight, px, 0);
+    if all(weight.rgb == vec3f(0.0)) {
         return vec4f(0.0);
     }
     let depth = textureLoad(t_depth, px, 0);
@@ -62,10 +65,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var ray_hits = 0.0;
     let dims = vec2<f32>(textureDimensions(t_ssr));
     let last = vec2<i32>(dims) - 1;
+    // The neighbourhood is spread at the spacing of the traces filling in SSR (half resolution,
+    // quarter past SSR's roughness range): adjacent pixels are upsampled from the same few traced
+    // rays, which are drawn anew every frame, so a 3×3 block moved with them, the clip box
+    // followed the noise and neither clamp caught a ray that hit a bright light.
+    let stride = select(2, 4, weight.a >= SSR_MAX_ROUGHNESS);
     for (var y = -1; y <= 1; y++) {
         for (var x = -1; x <= 1; x++) {
-            let p = clamp(px + vec2<i32>(x, y), vec2<i32>(0), last);
-            let s = textureLoad(t_ssr, p, 0);
+            let p = clamp(px + vec2<i32>(x, y) * stride, vec2<i32>(0), last);
+            let s = load_ssr(p);
             m1 += s;
             m2 += s * s;
             if x != 0 || y != 0 {
@@ -103,9 +111,30 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let mean = m1 / 9.0;
     let sigma = sqrt(max(m2 / 9.0 - mean * mean, vec4f(0.0)));
     let history = clamp(
-        textureSampleLevel(t_history, s_linear, prev_uv, 0.0),
+        finite_or_zero(textureSampleLevel(t_history, s_linear, prev_uv, 0.0)),
         mean - CLIP_SIGMA * sigma,
         mean + CLIP_SIGMA * sigma,
     );
-    return mix(history, current_clamped, CURRENT_WEIGHT);
+    // Weighted by 1 / (1 + luminance) (Karis): the traced reflections draw a new ray every frame,
+    // and one that catches a bright light now and then shimmered; the neighbour clamp above can't
+    // catch it, since the trace upsample spreads it over its neighbours too.
+    let w_current = CURRENT_WEIGHT / (1.0 + luminance(current_clamped.rgb));
+    let w_history = (1.0 - CURRENT_WEIGHT) / (1.0 + luminance(history.rgb));
+    return (current_clamped * w_current + history * w_history) / (w_current + w_history);
+}
+
+// The history feeds itself, and through `composite` and `prev_frame` SSR's hit colours: one NaN
+// or inf from any input would spread over the whole screen within frames, so none gets in.
+// (Checked on the bits: `x != x` may be folded away by the compiler.)
+fn finite_or_zero(v: vec4<f32>) -> vec4<f32> {
+    let exponent = bitcast<vec4<u32>>(v) & vec4<u32>(0x7f800000u);
+    return select(vec4f(0.0), v, all(exponent != vec4<u32>(0x7f800000u)));
+}
+
+fn load_ssr(p: vec2<i32>) -> vec4<f32> {
+    return finite_or_zero(textureLoad(t_ssr, p, 0));
+}
+
+fn luminance(c: vec3<f32>) -> f32 {
+    return dot(c, vec3f(0.2126, 0.7152, 0.0722));
 }

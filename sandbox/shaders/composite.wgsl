@@ -42,6 +42,8 @@ const GOLDEN_ANGLE:   f32 = 2.39996323;
 const BLUR_TAPS:      u32 = 8u;
 // A tap off the centre pixel's plane by more than this fraction of its depth gets no weight.
 const PLANE_TOLERANCE: f32 = 0.02;
+// A tap whose roughness differs from the centre's by more than this fades out, gone at twice it.
+const ROUGHNESS_TOLERANCE: f32 = 0.1;
 
 struct VertexOutput {
     @builtin(position) pos: vec4<f32>,
@@ -105,9 +107,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let r = radius * sqrt((f32(i) + 0.5) / f32(BLUR_TAPS));
         let angle = f32(i) * GOLDEN_ANGLE + rotation;
         let offset = vec2f(cos(angle), sin(angle)) * r;
-        let tap_depth = load_depth(vec2<i32>(in.pos.xy + offset));
+        let tap_px = vec2<i32>(in.pos.xy + offset);
+        let tap_depth = load_depth(tap_px);
         let error = abs(tap_depth - (depth + dot(gradient, offset))) / depth;
-        let w = 1.0 - smoothstep(0.5 * PLANE_TOLERANCE, PLANE_TOLERANCE, error);
+        // Coplanar but a different material (a door's smooth window panel beside its rough
+        // wood): the rough side's wide disc caught the panel's sharp, bright reflections in a few
+        // taps and showed them as a spray of dots.
+        let tap_roughness = textureLoad(t_specular_weight, clamp(tap_px, vec2<i32>(0), vec2<i32>(dims) - 1), 0).a;
+        let material = 1.0 - smoothstep(ROUGHNESS_TOLERANCE, 2.0 * ROUGHNESS_TOLERANCE, abs(tap_roughness - weight.a));
+        let w = (1.0 - smoothstep(0.5 * PLANE_TOLERANCE, PLANE_TOLERANCE, error)) * material;
         ssr += w * textureSampleLevel(t_ssr, s_linear, (in.pos.xy + offset) / dims, 0.0);
         total += w;
     }
