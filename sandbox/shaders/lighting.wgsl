@@ -108,13 +108,19 @@ const SHADOW_SLOT_NONE: u32 = 0xffffffffu;
 // get sparse beyond this.
 const MAX_PENUMBRA_TEXELS: f32 = 16.0;
 
-// 12-tap Poisson disc on the unit disc, for local light shadow PCF.
+// 12-tap Poisson disc on the unit disc, for local light shadow PCF. The first EARLY_OUT_TAPS
+// spread around the whole disc (56°, 147°, 251°, 315°), since the search and the filter decide
+// from them whether to stop.
 const POISSON: array<vec2<f32>, 12> = array<vec2<f32>, 12>(
-    vec2f(-0.326, -0.406), vec2f(-0.840, -0.074), vec2f(-0.696,  0.457),
-    vec2f(-0.203,  0.621), vec2f( 0.962, -0.195), vec2f( 0.473, -0.480),
-    vec2f( 0.519,  0.767), vec2f( 0.185, -0.893), vec2f( 0.507,  0.064),
-    vec2f( 0.896,  0.412), vec2f(-0.322, -0.933), vec2f(-0.792, -0.598),
+    vec2f( 0.519,  0.767), vec2f(-0.696,  0.457), vec2f(-0.322, -0.933),
+    vec2f( 0.473, -0.480), vec2f(-0.326, -0.406), vec2f(-0.840, -0.074),
+    vec2f(-0.203,  0.621), vec2f( 0.962, -0.195), vec2f( 0.185, -0.893),
+    vec2f( 0.507,  0.064), vec2f( 0.896,  0.412), vec2f(-0.792, -0.598),
 );
+// Taps after which the blocker search stops if none found a blocker (lit), and the filter stops
+// if all agree (fully lit or fully shadowed): most texels are one or the other, and the search
+// was the costliest part of the shadow mask.
+const EARLY_OUT_TAPS: u32 = 4u;
 
 // Local light shadows are virtual shadow maps (rendering::light::virtual_shadow): each face is a
 // VSM_SIZE² map with VSM_MIPS mips in VSM_PAGE² pages, of which the ones visible pixels asked for
@@ -311,6 +317,9 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> ve
         var blocker_depth = 0.0;
         let search_page = vsm_page(face_index, uv, mip);
         for (var i = 0u; i < 12u; i++) {
+            if i == EARLY_OUT_TAPS && blockers == 0.0 {
+                break;
+            }
             let offset = rot * POISSON[i] * (search_texels / size);
             let at = vsm_tap(face_index, search_page, uv + offset);
             if at.w == 0.0 {
@@ -348,7 +357,12 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> ve
     var lit = vec3f(0.0);
     var taps = 0.0;
     let filter_page = vsm_page(face_index, uv, filter_mip);
+    var opaque_min = 1.0;
+    var opaque_max = 0.0;
     for (var i = 0u; i < 12u; i++) {
+        if i == EARLY_OUT_TAPS && taps == f32(EARLY_OUT_TAPS) && (opaque_max == 0.0 || opaque_min == 1.0) {
+            break;
+        }
         let offset = rot * POISSON[i] * radius;
         let at = vsm_tap(face_index, filter_page, uv + offset);
         if at.w == 0.0 {
@@ -357,6 +371,8 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> ve
         taps += 1.0;
         let depth = ndc.z + clamp(dot(slope, offset), -max_dz, max_dz) - coarse_bias;
         let opaque = textureSampleCompareLevel(t_local_shadow, s_shadow, at.xy, depth);
+        opaque_min = min(opaque_min, opaque);
+        opaque_max = max(opaque_max, opaque);
         if opaque > 0.0 {
             lit += opaque * local_glass_tint(at.xy, glass_reference);
         }
