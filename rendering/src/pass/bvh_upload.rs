@@ -198,10 +198,14 @@ impl Pass for BvhUploadPass {
             };
             // Cut-out texels pass `alpha × base color alpha >= cutoff`.
             let cutout = mesh.alpha_cutoff().map(|cutoff| (cutoff, mesh.material.base_color[3]));
+            // Probe relocation tells front faces from back faces by winding, which mirroring flips.
+            let mirrored = mesh.transform.determinant() < 0.0;
+            let double_sided = if mesh.double_sided { 1.0 } else { 0.0 };
             let verts = &mesh.vertices;
             for chunk in mesh.indices.chunks(3) {
                 if chunk.len() < 3 { continue; }
                 let (i0, i1, i2) = (chunk[0] as usize, chunk[1] as usize, chunk[2] as usize);
+                let (i1, i2) = if mirrored { (i2, i1) } else { (i1, i2) };
                 if i0 >= verts.len() || i1 >= verts.len() || i2 >= verts.len() { continue; }
                 let (v0, v1, v2) = (world_pos(i0), world_pos(i1), world_pos(i2));
                 let color = |c: usize| (verts[i0].color[c] + verts[i1].color[c] + verts[i2].color[c]) / 3.0;
@@ -215,7 +219,7 @@ impl Pass for BvhUploadPass {
                 };
                 if coverage <= 0.0 { continue; }
                 let albedo_metallic = pack_unorm4x8([albedo[0] * color(0), albedo[1] * color(1), albedo[2] * color(2), metallic]);
-                let roughness_coverage = pack_unorm4x8([roughness, coverage, 0.0, 0.0]);
+                let roughness_coverage = pack_unorm4x8([roughness, coverage, double_sided, 0.0]);
                 gpu_tris.push(GpuTriangle { v0, albedo_metallic, v1, roughness_coverage, v2, emissive });
                 tri_mesh.push(mesh_index);
             }

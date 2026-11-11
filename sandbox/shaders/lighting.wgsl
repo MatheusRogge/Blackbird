@@ -401,6 +401,31 @@ fn chebyshev_weight(mean_d: f32, mean_d2: f32, dist: f32) -> f32 {
     return variance / (variance + d * d);
 }
 
+// How far `probe_update` relocated the probe in `slot` off its grid point, kept in the alpha of
+// its first three visibility texels.
+fn probe_offset(slot: u32) -> vec3<f32> {
+    let tile = probe_params.visibility_texel_size + 2u;
+    let o = vec2<i32>(i32((slot % PROBES_PER_ROW) * tile + 1u), i32((slot / PROBES_PER_ROW) * tile + 1u));
+    return vec3f(
+        textureLoad(visibility_atlas, o, 0).a,
+        textureLoad(visibility_atlas, o + vec2<i32>(1, 0), 0).a,
+        textureLoad(visibility_atlas, o + vec2<i32>(2, 0), 0).a,
+    );
+}
+
+// A probe's weight before trilinear, as in RTXGI. `vis` is the probe's distance moments toward
+// the biased point, `probe_dist` the distance to it. Mirrors probe_trace.wgsl.
+fn probe_weight(pos_ws: vec3<f32>, N_ws: vec3<f32>, probe_ws: vec3<f32>, vis: vec2<f32>, probe_dist: f32) -> f32 {
+    let to_probe = probe_ws - pos_ws;
+    // Wrap shading: probes behind the surface fade out without a hard cut-off.
+    let wrap = (dot(to_probe / max(length(to_probe), 1e-4), N_ws) + 1.0) * 0.5;
+    var w = (wrap * wrap + 0.2) * max(chebyshev_weight(vis.r, vis.g, probe_dist), 0.05);
+    w = max(w, 1e-6);
+    // Crush small weights, so light leaking from probes behind walls fades out.
+    if w < 0.2 { w *= w * w / 0.04; }
+    return w;
+}
+
 // Atlas slot of the probe at grid cell `ci`: its world cell modulo the grid, so a probe keeps its
 // slot (and its history) while the grid slides with the camera. Mirrors probe_update.wgsl.
 fn probe_slot(ci: vec3<i32>) -> u32 {
@@ -420,7 +445,6 @@ fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>, dir: vec3<f32>, v
     let base_i   = vec3<i32>(base_f);
     let frac     = grid_pos - base_f;
     let dim      = vec3<i32>(probe_params.grid_dim);
-    let oct_uv   = octahedral_encode(N_ws);
     let dir_uv   = octahedral_encode(dir);
 
     var irradiance   = vec3f(0.0);
@@ -440,17 +464,18 @@ fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>, dir: vec3<f32>, v
                 let w_tri = wx * wy * wz;
 
                 let probe_ws = probe_params.grid_origin
-                    + vec3f(f32(ci.x), f32(ci.y), f32(ci.z)) * probe_params.probe_spacing;
-                let probe_dist = length(biased_pos - probe_ws);
+                    + vec3f(f32(ci.x), f32(ci.y), f32(ci.z)) * probe_params.probe_spacing
+                    + probe_offset(probe_index);
+                let from_probe = biased_pos - probe_ws;
+                let probe_dist = length(from_probe);
 
-                let vis_uv = visibility_atlas_uv(probe_index, oct_uv);
+                let vis_uv = visibility_atlas_uv(probe_index, octahedral_encode(from_probe / max(probe_dist, 1e-4)));
                 let vis    = textureSample(visibility_atlas, probe_sampler, vis_uv).rg;
-                let w_vis  = chebyshev_weight(vis.r, vis.g, probe_dist);
 
                 let irr_uv = irradiance_atlas_uv(probe_index, dir_uv);
                 let irr    = textureSample(irradiance_atlas, probe_sampler, irr_uv).rgb;
 
-                let w = max(w_tri * w_vis, 0.0001);
+                let w = probe_weight(pos_ws, N_ws, probe_ws, vis, probe_dist) * w_tri;
                 irradiance   += irr * w;
                 weight_total += w;
             }

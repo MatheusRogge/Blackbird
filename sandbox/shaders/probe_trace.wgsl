@@ -107,6 +107,8 @@ struct TraceResult {
     normal: vec3<f32>,
     dist:   f32,
     tri:    u32,
+    // Hit the back of a single-sided triangle.
+    backface: bool,
 }
 
 // ── Bindings ──────────────────────────────────────────────────────────────────
@@ -218,9 +220,11 @@ fn bvh_trace(ro: vec3<f32>, rd: vec3<f32>, max_dist: f32, any_hit: bool) -> Trac
                     let e1 = tri.v1 - tri.v0;
                     let e2 = tri.v2 - tri.v0;
                     var n = normalize(cross(e1, e2));
-                    if dot(n, rd) > 0.0 { n = -n; }
+                    let behind = dot(n, rd) > 0.0;
+                    if behind { n = -n; }
                     result.normal = n;
                     result.tri    = first + i;
+                    result.backface = behind && unpack4x8unorm(tri.roughness_coverage).z < 0.5;
                 }
             }
         } else {
@@ -249,10 +253,8 @@ fn spherical_fibonacci(idx: u32, total: u32) -> vec3<f32> {
 
 fn probe_world_position(probe_index: u32) -> vec3<f32> {
     let dim = probe_params.grid_dim;
-    let gx  = probe_index % dim.x;
-    let gy  = (probe_index / dim.x) % dim.y;
-    let gz  = probe_index / (dim.x * dim.y);
-    return probe_params.grid_origin + vec3<f32>(f32(gx), f32(gy), f32(gz)) * probe_params.probe_spacing;
+    let ci  = vec3<i32>(vec3<u32>(probe_index % dim.x, (probe_index / dim.x) % dim.y, probe_index / (dim.x * dim.y)));
+    return probe_params.grid_origin + vec3<f32>(ci) * probe_params.probe_spacing + probe_offset(probe_slot(ci));
 }
 
 // ── Shading helpers ───────────────────────────────────────────────────────────
@@ -321,10 +323,32 @@ fn chebyshev_weight(mean_d: f32, mean_d2: f32, dist: f32) -> f32 {
     return variance / (variance + d * d);
 }
 
+// Mirrors lighting.wgsl's `probe_weight`.
+fn probe_weight(pos: vec3<f32>, normal: vec3<f32>, probe_ws: vec3<f32>, vis: vec2<f32>, probe_dist: f32) -> f32 {
+    let to_probe = probe_ws - pos;
+    let wrap = (dot(to_probe / max(length(to_probe), 1e-4), normal) + 1.0) * 0.5;
+    var w = (wrap * wrap + 0.2) * max(chebyshev_weight(vis.r, vis.g, probe_dist), 0.05);
+    w = max(w, 1e-6);
+    if w < 0.2 { w *= w * w / 0.04; }
+    return w;
+}
+
 fn probe_slot(ci: vec3<i32>) -> u32 {
     let dim = vec3<i32>(probe_params.grid_dim);
     let s = ((probe_params.cell_origin + ci) % dim + dim) % dim;
     return u32(s.x + dim.x * (s.y + dim.y * s.z));
+}
+
+// How far `probe_update` moved the probe in `slot` off its grid point, kept in the alpha of its
+// first three visibility texels. Mirrors lighting.wgsl.
+fn probe_offset(slot: u32) -> vec3<f32> {
+    let tile = probe_params.visibility_texel_size + 2u;
+    let o = vec2<i32>(i32((slot % PROBES_PER_ROW) * tile + 1u), i32((slot / PROBES_PER_ROW) * tile + 1u));
+    return vec3f(
+        textureLoad(visibility_atlas, o, 0).a,
+        textureLoad(visibility_atlas, o + vec2<i32>(1, 0), 0).a,
+        textureLoad(visibility_atlas, o + vec2<i32>(2, 0), 0).a,
+    );
 }
 
 // Irradiance (/ π, as the atlas stores it) the probes saw last update around the hit, biased
@@ -346,9 +370,12 @@ fn probe_irradiance(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>) -> v
         if any(ci < vec3<i32>(0)) || any(ci >= dim) { continue; }
         let slot = probe_slot(ci);
         let w3 = select(1.0 - frac, frac, offset == vec3<i32>(1));
-        let probe_ws = probe_params.grid_origin + vec3f(ci) * probe_params.probe_spacing;
-        let vis = textureSampleLevel(visibility_atlas, probe_sampler, atlas_uv(slot, oct_uv, probe_params.visibility_texel_size), 0.0).rg;
-        let w = max(w3.x * w3.y * w3.z * chebyshev_weight(vis.r, vis.g, length(biased_pos - probe_ws)), 1e-4);
+        let probe_ws = probe_params.grid_origin + vec3f(ci) * probe_params.probe_spacing + probe_offset(slot);
+        let from_probe = biased_pos - probe_ws;
+        let probe_dist = length(from_probe);
+        let vis_uv = octahedral_encode(from_probe / max(probe_dist, 1e-4));
+        let vis = textureSampleLevel(visibility_atlas, probe_sampler, atlas_uv(slot, vis_uv, probe_params.visibility_texel_size), 0.0).rg;
+        let w = probe_weight(pos, normal, probe_ws, vis, probe_dist) * w3.x * w3.y * w3.z;
         irradiance += textureSampleLevel(irradiance_atlas, probe_sampler, atlas_uv(slot, oct_uv, probe_params.irradiance_texel_size), 0.0).rgb * w;
         weight_total += w;
     }
@@ -474,13 +501,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let probe_pos = probe_world_position(probe_index);
     let ray_dir   = spherical_fibonacci(ray_index, probe_params.rays_per_probe);
-    let result    = bvh_trace(probe_pos, ray_dir, probe_params.max_ray_distance, false);
+    // Starts a millimetre behind the probe, so a probe lying exactly in a wall still hits it and
+    // `probe_update` moves it out.
+    let result    = bvh_trace(probe_pos - ray_dir * 1e-3, ray_dir, probe_params.max_ray_distance, false);
 
     var radiance: vec3<f32>;
     var hit_dist: f32;
 
     if result.hit {
-        hit_dist = result.dist;
+        // Negative marks a back face, for probe relocation.
+        hit_dist = select(result.dist, -result.dist, result.backface);
         radiance = shade_hit(result.pos, result.normal, -ray_dir, bvh_tris[result.tri]);
     } else {
         hit_dist = probe_params.max_ray_distance;
