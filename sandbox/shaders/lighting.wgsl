@@ -862,7 +862,7 @@ fn cluster_index(pixel: vec2<f32>, depth_vs: f32) -> u32 {
 // occludes by how far behind the depth buffer it is, so edges come out soft and stable without
 // temporal accumulation.
 const CONTACT_LENGTH: f32 = 0.15;
-const CONTACT_MAX_STEPS: u32 = 24u;
+const CONTACT_MAX_STEPS: u32 = 16u;
 // A sample starts to be occluded once the depth buffer is in front of it by this fraction of its
 // depth (self-shadowing margin), fully by twice that, and stops past CONTACT_THICKNESS (so it
 // doesn't hide behind everything in front of it).
