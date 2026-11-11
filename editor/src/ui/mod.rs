@@ -34,7 +34,7 @@ impl UiLayer for EditorUiLayer {
         let Ok(mut state) = self.state.try_lock() else { return };
         view_settings::sync(&mut state, &mut self.debug_flags.write().expect("debug_flags poisoned"));
         let (viewport, add) = ctx.root_ui(|root| {
-            toolbar::draw(root, &mut state, &self.debug_flags);
+            toolbar::draw(root, &mut state, world, &self.debug_flags);
             let add = hierarchy::draw(root, &mut state);
             inspector::draw(root, &mut state);
             self.assets.draw(root, &mut state);

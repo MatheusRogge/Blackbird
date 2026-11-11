@@ -1,7 +1,9 @@
 use std::sync::RwLock;
 
 use egui::Ui;
+use engine::rendering::camera::Camera;
 use engine::rendering::debug_flags::{GBufferView, RenderDebugFlags};
+use engine_core::world::World;
 
 use crate::state::{CameraSettings, EditorState};
 
@@ -13,7 +15,7 @@ const REDO_ALT_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT), egui::Key::Z);
 const DELETE_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Delete);
 
-pub fn draw(root: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<RenderDebugFlags>) {
+pub fn draw(root: &mut Ui, state: &mut EditorState, world: &World, debug_flags: &RwLock<RenderDebugFlags>) {
     let can_save = state.document.is_some();
     if can_save && root.ctx().input_mut(|i| i.consume_shortcut(&SAVE_SHORTCUT)) {
         state.save_requested = true;
@@ -107,7 +109,24 @@ pub fn draw(root: &mut Ui, state: &mut EditorState, debug_flags: &RwLock<RenderD
                 ui.menu_button("Build", |ui| super::build::draw_menu(ui, state));
             });
             ui.menu_button("View", |ui| draw_view_menu(ui, state, debug_flags));
-            ui.menu_button("Camera", |ui| draw_camera_settings(ui, &mut state.camera_settings));
+            ui.menu_button("Camera", |ui| {
+                draw_camera_settings(ui, &mut state.camera_settings);
+                ui.separator();
+                let camera = state.editor_camera_key.and_then(|key| world.get_entity::<Camera>(key));
+                let copy = ui.add_enabled(camera.is_some(), egui::Button::new("Copy View as Capture Args"))
+                    .on_hover_text("--eye / --target / --exposure for sandbox's capture tool, to render this view headless");
+                if let Some(camera) = camera
+                    && copy.clicked()
+                {
+                    let (e, t) = (camera.eye, camera.target);
+                    ui.ctx().copy_text(format!(
+                        "--eye {:.3},{:.3},{:.3} --target {:.3},{:.3},{:.3} --exposure {}",
+                        e.x, e.y, e.z, t.x, t.y, t.z, camera.exposure
+                    ));
+                    state.status = "Copied the view's capture arguments".into();
+                    ui.close();
+                }
+            });
         });
     });
 

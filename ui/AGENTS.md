@@ -23,7 +23,8 @@ pub const SCENE_VIEWPORT_ID: &str;              // egui temp data key (an egui::
 1. The render thread receives the frame's `Vec<InputEvent>` from the game thread → `on_events`.
 2. `Renderer::render` runs the graph, then calls the overlay with a **non-sRGB view** of the swapchain texture (egui outputs gamma-space colors) and submits it in a separate command buffer.
 3. `execute` runs every layer in order, tessellates, and renders with `LoadOp::Load` on top of the frame.
-4. After the pass it stores `egui_wants_pointer_input()` / `egui_wants_keyboard_input()` into the shared atomics. The game thread reads them through `Engine::ui_wants_pointer()` / `ui_wants_keyboard()`, one frame late.
+4. There is no `egui-winit`, so nothing else applies egui's `PlatformOutput`: `execute` handles `OutputCommand::CopyText` itself through `arboard` (opened on the first copy, from the render thread). Paste, cursor icons and URL opening are not wired.
+5. After the pass it stores `egui_wants_pointer_input()` / `egui_wants_keyboard_input()` into the shared atomics. The game thread reads them through `Engine::ui_wants_pointer()` / `ui_wants_keyboard()`, one frame late.
 
 Layers get `&World` under the render thread's **read** lock. Don't mutate game state from a layer. Share an `Arc<Mutex<_>>` with a plugin instead (that is how `editor` does it), and use `try_lock` so the render thread never blocks on the game thread.
 

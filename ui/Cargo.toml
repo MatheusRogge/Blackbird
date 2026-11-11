@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 egui     = { version = "0.37", features = ["default_fonts", "monochrome_emoji_fonts"] }
 egui-wgpu = "0.37"
+arboard  = { version = "3.4.1", default-features = false }
 wgpu     = { version = "30", features = ["wgsl"] }
 
 engine_core = { path = "../core/" }

@@ -17,6 +17,8 @@ pub struct EguiRenderer {
     cursor_pos: Option<Pos2>,
     ui_wants_pointer: Arc<AtomicBool>,
     ui_wants_keyboard: Arc<AtomicBool>,
+    // Opened on the first copy; None until then, or if the platform has no clipboard.
+    clipboard: Option<arboard::Clipboard>,
 }
 
 impl EguiRenderer {
@@ -43,6 +45,17 @@ impl EguiRenderer {
             cursor_pos: None,
             ui_wants_pointer,
             ui_wants_keyboard,
+            clipboard: None,
+        }
+    }
+
+    // There is no egui-winit here to apply egui's platform output, so copies are done directly.
+    fn copy_text(&mut self, text: String) {
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        if let Some(clipboard) = &mut self.clipboard {
+            let _ = clipboard.set_text(text);
         }
     }
 
@@ -180,6 +193,11 @@ impl EguiRenderer {
             layer.ui(&self.ctx, world);
         }
         let mut full_output = self.ctx.end_pass();
+        for command in std::mem::take(&mut full_output.platform_output.commands) {
+            if let egui::OutputCommand::CopyText(text) = command {
+                self.copy_text(text);
+            }
+        }
 
         self.ui_wants_pointer
             .store(self.ctx.egui_wants_pointer_input(), Ordering::Relaxed);
