@@ -131,13 +131,44 @@ const VSM_POOL_SIDE: u32 = 32u;
 // debug view.
 var<private> vsm_resolved_mip: f32 = -1.0;
 
+// Pages of the mips before `mip`: Σ (64 >> m)² = 4096 · (1 − 4^−mip) / (3/4), exact in integers.
 fn vsm_mip_offset(mip: u32) -> u32 {
-    var offset = 0u;
-    for (var m = 0u; m < mip; m++) {
-        let n = VSM_PAGES0 >> m;
-        offset += n * n;
+    return (16384u - (16384u >> (2u * mip))) / 3u;
+}
+
+// One resident page of a face at a given mip, for kernels whose taps mostly fall inside it.
+struct VsmPage {
+    // Physical page origin in the atlas, in pages.
+    origin: vec2<f32>,
+    // The page's coordinates at its mip, and the mip's pages per side.
+    page: vec2<f32>,
+    n: f32,
+    mip: u32,
+    resident: bool,
+}
+
+// The page under face UV `uv` at exactly `mip` (not resident: `resident` is false).
+fn vsm_page(face_index: u32, uv: vec2<f32>, mip: u32) -> VsmPage {
+    let n = VSM_PAGES0 >> mip;
+    let page = min(vec2<u32>(clamp(uv, vec2f(0.0), vec2f(1.0)) * f32(n)), vec2<u32>(n - 1u));
+    let entry = local_pages[face_index * VSM_PAGES_PER_FACE + vsm_mip_offset(mip) + page.y * n + page.x];
+    let physical = max(entry, 1u) - 1u;
+    return VsmPage(vec2f(f32(physical % VSM_POOL_SIDE), f32(physical / VSM_POOL_SIDE)), vec2f(page), f32(n), mip, entry != 0u);
+}
+
+// `vsm_lookup` for a kernel tap: taps inside the kernel centre's page `centre` (resident at the
+// tap's mip) are addressed directly, the rest looked up. Every PCSS tap used to walk the page table
+// and mip chain itself, though a kernel of ≤ MAX_PENUMBRA_TEXELS rarely leaves its 128² page.
+fn vsm_tap(face_index: u32, centre: VsmPage, uv: vec2<f32>) -> vec4<f32> {
+    if centre.resident {
+        let p = clamp(uv, vec2f(0.0), vec2f(1.0)) * centre.n;
+        if all(min(floor(p), vec2f(centre.n - 1.0)) == centre.page) {
+            let inside = clamp(p - centre.page, vec2f(0.5 / VSM_PAGE), vec2f(1.0 - 0.5 / VSM_PAGE));
+            let atlas = f32(textureDimensions(t_local_shadow).x);
+            return vec4f((centre.origin + inside) * VSM_PAGE / atlas, f32(centre.mip), 1.0);
+        }
     }
-    return offset;
+    return vsm_lookup(face_index, uv, centre.mip);
 }
 
 // Where face UV `uv` of face `face_index` is in the atlas (xy, atlas UV) at `mip`, or at the
@@ -278,9 +309,10 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> ve
         let max_dz = max_dz_per_texel * search_texels;
         var blockers = 0.0;
         var blocker_depth = 0.0;
+        let search_page = vsm_page(face_index, uv, mip);
         for (var i = 0u; i < 12u; i++) {
             let offset = rot * POISSON[i] * (search_texels / size);
-            let at = vsm_lookup(face_index, uv + offset, mip);
+            let at = vsm_tap(face_index, search_page, uv + offset);
             if at.w == 0.0 {
                 continue;
             }
@@ -315,9 +347,10 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> ve
     let coarse_bias = max_dz_per_texel * (filter_scale - 1.0);
     var lit = vec3f(0.0);
     var taps = 0.0;
+    let filter_page = vsm_page(face_index, uv, filter_mip);
     for (var i = 0u; i < 12u; i++) {
         let offset = rot * POISSON[i] * radius;
-        let at = vsm_lookup(face_index, uv + offset, filter_mip);
+        let at = vsm_tap(face_index, filter_page, uv + offset);
         if at.w == 0.0 {
             continue;
         }
