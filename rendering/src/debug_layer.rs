@@ -240,6 +240,9 @@ pub fn gi_controls(ui: &mut egui::Ui, flags: &mut RenderDebugFlags) {
         ui.label("Hysteresis").on_hover_text("Share of the previous probe value kept per update: higher is smoother but reacts more slowly to changes.");
         ui.add(egui::Slider::new(&mut flags.ddgi_hysteresis, 0.0..=0.995));
         ui.end_row();
+        ui.label("Update interval").on_hover_text("Frames between probe updates. Each update adds a bounce and blends in new rays, so fewer frames converge faster but run the probe passes (~5 ms on a GTX 970) on more frames. Shimmer stays the same; for less, raise the hysteresis.");
+        ui.add(egui::Slider::new(&mut flags.ddgi_update_interval, 1..=8).suffix(" frames"));
+        ui.end_row();
         ui.label("Normal bias").on_hover_text("How far shading points move along their normal before sampling the probes, against leaks through walls.");
         ui.add(egui::Slider::new(&mut flags.ddgi_normal_bias, 0.0..=1.0).suffix(" m"));
         ui.end_row();

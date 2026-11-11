@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use engine_core::world::World;
 
@@ -23,13 +23,13 @@ pub struct ProbeUpdatePass {
     irradiance_atlas_ids: [ResourceId; 2],
     visibility_atlas_ids: [ResourceId; 2],
     current_atlas:        Arc<AtomicUsize>,
+    update_due:           Arc<AtomicBool>,
 
     irradiance_pipelines: [Option<wgpu::ComputePipeline>; 2],
     visibility_pipelines:  [Option<wgpu::ComputePipeline>; 2],
     // bind_groups[i] reads atlas[i] and writes atlas[1-i]
     bind_groups: [Option<wgpu::BindGroup>; 2],
 
-    frame_index: u32,
     shader: ShaderAsset,
 }
 
@@ -48,12 +48,12 @@ impl ProbeUpdatePass {
             irradiance_atlas_ids: probe_atlas.irradiance_atlas_ids,
             visibility_atlas_ids: probe_atlas.visibility_atlas_ids,
             current_atlas:        Arc::clone(&probe_atlas.current_atlas),
+            update_due:           Arc::clone(&probe_atlas.update_due),
 
             irradiance_pipelines: [None, None],
             visibility_pipelines:  [None, None],
             bind_groups:          [None, None],
 
-            frame_index: 0,
             shader,
         }
     }
@@ -221,9 +221,7 @@ impl Pass for ProbeUpdatePass {
         ctx: &PassContext<'_>,
         _world: &World,
     ) {
-        let current = self.frame_index;
-        self.frame_index = self.frame_index.wrapping_add(1);
-        if !current.is_multiple_of(4) {
+        if !self.update_due.load(Ordering::Relaxed) {
             return;
         }
 

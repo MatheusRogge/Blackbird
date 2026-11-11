@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytemuck::{Pod, Zeroable};
 use engine_core::world::World;
@@ -50,6 +50,7 @@ pub struct ProbeTracePass {
     irradiance_atlas_ids: [ResourceId; 2],
     visibility_atlas_ids: [ResourceId; 2],
     current_atlas: Arc<AtomicUsize>,
+    update_due: Arc<AtomicBool>,
     pipeline: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::Sampler)>,
     /// `bind_groups[i]` reads probe atlas `i`, for the bounces after the first. The atlases are
     /// `history_reads`: `probe_update` writes them from this pass's rays.
@@ -100,6 +101,7 @@ impl ProbeTracePass {
                 irradiance_atlas_ids: probe_atlas.irradiance_atlas_ids,
                 visibility_atlas_ids: probe_atlas.visibility_atlas_ids,
                 current_atlas: Arc::clone(&probe_atlas.current_atlas),
+                update_due: Arc::clone(&probe_atlas.update_due),
                 pipeline: None,
                 bind_groups: [None, None],
                 frame_uniform_id,
@@ -201,9 +203,8 @@ impl Pass for ProbeTracePass {
         ctx: &PassContext<'_>,
         world: &World,
     ) {
-        let current = self.frame_index;
         self.frame_index = self.frame_index.wrapping_add(1);
-        if !current.is_multiple_of(4) {
+        if !self.update_due.load(Ordering::Relaxed) {
             return;
         }
 

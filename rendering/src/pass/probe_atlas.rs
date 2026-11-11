@@ -1,5 +1,5 @@
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytemuck::{Pod, Zeroable};
 use engine_core::world::World;
@@ -72,6 +72,8 @@ pub struct ProbeAtlasOutputs {
     pub probe_params_id: ResourceId,
     /// Which slot (0 or 1) was written most recently — read by LightingPass.
     pub current_atlas: Arc<AtomicUsize>,
+    /// Whether the probes update this frame (`RenderDebugFlags::ddgi_update_interval`).
+    pub update_due: Arc<AtomicBool>,
 }
 
 pub struct ProbeAtlasPass {
@@ -79,6 +81,8 @@ pub struct ProbeAtlasPass {
     config: ProbeGridConfig,
     probe_params_id: ResourceId,
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
+    frame: u32,
+    update_due: Arc<AtomicBool>,
 }
 
 impl ProbeAtlasPass {
@@ -118,11 +122,13 @@ impl ProbeAtlasPass {
         });
 
         let current_atlas = Arc::new(AtomicUsize::new(0));
+        let update_due = Arc::new(AtomicBool::new(false));
         let outputs = ProbeAtlasOutputs {
             irradiance_atlas_ids,
             visibility_atlas_ids,
             probe_params_id,
             current_atlas,
+            update_due: Arc::clone(&update_due),
         };
 
         (
@@ -131,6 +137,8 @@ impl ProbeAtlasPass {
                 config,
                 probe_params_id,
                 debug_flags,
+                frame: 0,
+                update_due,
             },
             outputs,
         )
@@ -182,7 +190,10 @@ impl Pass for ProbeAtlasPass {
             flags.ddgi_grid_anchor,
         );
         let (indirect_intensity, bounce) = (flags.ddgi_indirect_intensity, flags.ddgi_bounce);
+        let interval = flags.ddgi_update_interval.max(1);
         drop(flags);
+        self.update_due.store(self.frame == 0, Ordering::Relaxed);
+        self.frame = (self.frame + 1) % interval;
 
         let max_ray_distance = {
             let dim = self.config.grid_dim;

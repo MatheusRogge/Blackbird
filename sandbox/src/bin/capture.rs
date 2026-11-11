@@ -14,6 +14,8 @@
 //!   --gi-intensity X     indirect diffuse multiplier (default 1)
 //!   --gi-bounce X        share of the probes' irradiance reflected again by their hits, 0–1 (default 1)
 //!   --gi-spacing X       DDGI probe spacing in metres (default 5)
+//!   --gi-hysteresis X    share of a probe's history kept per update (default 0.97)
+//!   --gi-interval N      frames between probe updates (default 2)
 //!   --point x,y,z,I[,r]  add a white point light of I candela (range 10), source radius r (default 0)
 //!   --reloads N          unload and reload the scene N times first, like an editor hot reload
 //!   --burst N            every particle emitter bursts N particles on the second frame
@@ -150,6 +152,8 @@ fn parse_args() -> Result<Options> {
             "--gi-intensity" => flags.ddgi_indirect_intensity = value()?.parse()?,
             "--gi-bounce" => flags.ddgi_bounce = value()?.parse()?,
             "--gi-spacing" => flags.ddgi_probe_spacing = value()?.parse()?,
+            "--gi-hysteresis" => flags.ddgi_hysteresis = value()?.parse()?,
+            "--gi-interval" => flags.ddgi_update_interval = value()?.parse()?,
             "--view" => {
                 flags.view = match value()?.as_str() {
                     "lit" => GBufferView::Lit,

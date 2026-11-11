@@ -115,6 +115,8 @@ pub struct GiSettings {
     pub indirect_intensity: f32,
     /// Share of the probes' irradiance their rays' hits reflect again: 0 = a single bounce.
     pub bounce: f32,
+    /// Frames between probe updates: fewer converge faster and cost more per frame.
+    pub update_interval: u32,
 }
 
 impl Default for GiSettings {
@@ -127,6 +129,7 @@ impl Default for GiSettings {
             grid_anchor: [0.0; 3],
             indirect_intensity: 1.0,
             bounce: 1.0,
+            update_interval: 2,
         }
     }
 }

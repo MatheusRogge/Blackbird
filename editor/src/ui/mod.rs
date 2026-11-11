@@ -148,6 +148,7 @@ fn draw_gi_window(ctx: &egui::Context, state: &mut crate::state::EditorState, de
                 flags.ddgi_grid_anchor = defaults.ddgi_grid_anchor;
                 flags.ddgi_indirect_intensity = defaults.ddgi_indirect_intensity;
                 flags.ddgi_bounce = defaults.ddgi_bounce;
+                flags.ddgi_update_interval = defaults.ddgi_update_interval;
             }
             ui.label(egui::RichText::new("Saved with the project; builds use them too.").small().weak());
         });

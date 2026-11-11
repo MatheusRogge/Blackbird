@@ -153,6 +153,7 @@ fn gi_flags(gi: &project::GiSettings) -> RenderDebugFlags {
         ddgi_grid_anchor: gi.grid_anchor,
         ddgi_indirect_intensity: gi.indirect_intensity,
         ddgi_bounce: gi.bounce,
+        ddgi_update_interval: gi.update_interval,
         ..RenderDebugFlags::default()
     }
 }

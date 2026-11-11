@@ -126,6 +126,10 @@ pub struct RenderDebugFlags {
     /// Share of the probes' own irradiance their rays' hits reflect (`probe_trace`): 0 = a single
     /// bounce, 1 = every bounce.
     pub ddgi_bounce: f32,
+    /// Frames between probe updates (`probe_trace` + `probe_update`). Multi-bounce light builds
+    /// up one bounce per update, so fewer frames between them converge faster, at their cost on
+    /// every update frame.
+    pub ddgi_update_interval: u32,
 }
 
 impl Default for RenderDebugFlags {
@@ -160,6 +164,7 @@ impl Default for RenderDebugFlags {
             ddgi_grid_anchor:      [0.0, 0.0, 0.0],
             ddgi_indirect_intensity: 1.0,
             ddgi_bounce: 1.0,
+            ddgi_update_interval: 2,
         }
     }
 }

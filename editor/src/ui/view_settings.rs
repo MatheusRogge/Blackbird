@@ -31,6 +31,7 @@ pub fn sync(state: &mut EditorState, flags: &mut RenderDebugFlags) {
         grid_anchor: flags.ddgi_grid_anchor,
         indirect_intensity: flags.ddgi_indirect_intensity,
         bounce: flags.ddgi_bounce,
+        update_interval: flags.ddgi_update_interval,
     };
 }
 
@@ -50,4 +51,5 @@ fn apply(view: &ViewSettings, gi: &GiSettings, flags: &mut RenderDebugFlags) {
     flags.ddgi_grid_anchor = gi.grid_anchor;
     flags.ddgi_indirect_intensity = gi.indirect_intensity;
     flags.ddgi_bounce = gi.bounce;
+    flags.ddgi_update_interval = gi.update_interval;
 }
