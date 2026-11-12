@@ -37,11 +37,11 @@ fn octahedral_decode(uv: vec2<f32>) -> vec3<f32> {
     return normalize(n);
 }
 
-// Probes are stored by world cell modulo the grid (mirrors `probe_slot` in lighting.wgsl), so
-// a probe keeps its history while the grid slides with the camera. The slot's visibility texels
-// carry a tag of the world cell they hold (blue channel); a slot whose tag doesn't match was
-// just handed to a probe entering the grid, and starts over instead of blending a probe ~60 m
-// away into it.
+// Probes are stored by world cell modulo the grid (mirrored by lighting.wgsl's
+// `sample_probe_irradiance`), so a probe keeps its history while the grid slides with the camera.
+// The slot's visibility texels carry a tag of the world cell they hold (blue channel); a slot
+// whose tag doesn't match was just handed to a probe entering the grid, and starts over instead
+// of blending a probe ~60 m away into it.
 fn probe_cell(probe_index: u32) -> vec3<i32> {
     let dim = probe_params.grid_dim;
     let local = vec3<u32>(probe_index % dim.x, (probe_index / dim.x) % dim.y, probe_index / (dim.x * dim.y));

@@ -361,6 +361,8 @@ fn probe_irradiance(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>) -> v
     let frac     = grid_pos - base_f;
     let dim      = vec3<i32>(probe_params.grid_dim);
     let oct_uv   = octahedral_encode(normal);
+    // `probe_slot` of the base corner, stepped per neighbour (as in lighting.wgsl).
+    let base_s   = ((probe_params.cell_origin + base_i) % dim + dim) % dim;
 
     var irradiance   = vec3f(0.0);
     var weight_total = 0.0;
@@ -368,7 +370,9 @@ fn probe_irradiance(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>) -> v
         let offset = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
         let ci = base_i + offset;
         if any(ci < vec3<i32>(0)) || any(ci >= dim) { continue; }
-        let slot = probe_slot(ci);
+        var s = base_s + offset;
+        s = select(s, vec3<i32>(0), s >= dim);
+        let slot = u32(s.x + dim.x * (s.y + dim.y * s.z));
         let w3 = select(1.0 - frac, frac, offset == vec3<i32>(1));
         let probe_ws = probe_params.grid_origin + vec3f(ci) * probe_params.probe_spacing + probe_offset(slot);
         let from_probe = biased_pos - probe_ws;

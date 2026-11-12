@@ -475,14 +475,6 @@ fn probe_weight(pos_ws: vec3<f32>, N_ws: vec3<f32>, probe_ws: vec3<f32>, vis: ve
     return w;
 }
 
-// Atlas slot of the probe at grid cell `ci`: its world cell modulo the grid, so a probe keeps its
-// slot (and its history) while the grid slides with the camera. Mirrors probe_update.wgsl.
-fn probe_slot(ci: vec3<i32>) -> u32 {
-    let dim = vec3<i32>(probe_params.grid_dim);
-    let s = ((probe_params.cell_origin + ci) % dim + dim) % dim;
-    return u32(s.x + dim.x * (s.y + dim.y * s.z));
-}
-
 // `dir` is the direction the irradiance is looked up in: the normal for diffuse, or near the
 // reflection vector as a stand-in for glossy reflections. Bias and visibility always follow `N_ws`.
 fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>, dir: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {
@@ -495,6 +487,10 @@ fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>, dir: vec3<f32>, v
     let frac     = grid_pos - base_f;
     let dim      = vec3<i32>(probe_params.grid_dim);
     let dir_uv   = octahedral_encode(dir);
+    // A probe's atlas slot is its world cell modulo the grid, so it keeps its history while the
+    // grid slides with the camera (mirrors probe_update.wgsl). The base corner's is wrapped once and
+    // stepped per neighbour: integer modulo by a uniform is slow, and eight probes did six each.
+    let base_s   = ((probe_params.cell_origin + base_i) % dim + dim) % dim;
 
     var irradiance   = vec3f(0.0);
     var weight_total = 0.0;
@@ -505,7 +501,9 @@ fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>, dir: vec3<f32>, v
                 let ci = base_i + vec3<i32>(dx, dy, dz);
                 if any(ci < vec3<i32>(0)) || any(ci >= dim) { continue; }
 
-                let probe_index = probe_slot(ci);
+                var s = base_s + vec3<i32>(dx, dy, dz);
+                s = select(s, vec3<i32>(0), s >= dim);
+                let probe_index = u32(s.x + dim.x * (s.y + dim.y * s.z));
 
                 let wx = select(1.0 - frac.x, frac.x, dx == 1);
                 let wy = select(1.0 - frac.y, frac.y, dy == 1);
