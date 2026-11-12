@@ -12,7 +12,7 @@ use crate::{
     pass::gbuffer::GBufferOutputs,
     pass::light_upload::LightBuffers,
     pass::lighting::{LightingBindings, LightingOutputs},
-    pass::particle_sim::ParticleOutputs,
+    pass::particle_sim::{MAX_PARTICLES, ParticleOutputs},
     pass::probe_atlas::ProbeAtlasOutputs,
     pass::reflection_probe::ReflectionProbeOutputs,
     pass::shadow::ShadowOutputs,
@@ -22,19 +22,25 @@ use crate::{
 };
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const LIGHT_WORKGROUP_SIZE: u32 = 64;
 
 /// Draws the particles `particle_sim` simulated over the finished HDR scene: copies `scene` into
-/// its own target, then draws every live particle (an indirect draw over `particle_sim`'s draw
-/// list, so expired slots cost nothing) as an additive camera-facing disc
-/// (`lighting.wgsl`'s `vs_particle` / `fs_particle`), lit with the same bindings as `lighting`.
+/// its own target, lights every live particle once at its centre (`cs_particle_light`, with the
+/// same bindings as `lighting`, into a radiance per draw-list entry), then draws them (an indirect
+/// draw over `particle_sim`'s draw list, so expired slots cost nothing) as additive camera-facing
+/// discs (`lighting.wgsl`'s `vs_particle` / `fs_particle`).
 /// No depth attachment: the fragment shader fades particles out against the G-buffer depth itself
 /// (soft particles). Particles draw over glass. Skipped in G-buffer debug views.
 pub struct ParticlesPass {
     node_id: Option<NodeId>,
     shader: ShaderAsset,
     pipeline: Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
+    light_pipeline: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    /// `cs_particle_light`'s radiance per draw-list entry.
+    light_buffer: Option<wgpu::Buffer>,
     /// Keyed by the depth view address.
     particle_bg: Option<(usize, wgpu::BindGroup)>,
+    light_bg: Option<wgpu::BindGroup>,
     bindings: LightingBindings,
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
     slots_in_use: Arc<AtomicU32>,
@@ -76,7 +82,10 @@ impl ParticlesPass {
             node_id: None,
             shader: lighting_shader,
             pipeline: None,
+            light_pipeline: None,
+            light_buffer: None,
             particle_bg: None,
+            light_bg: None,
             bindings: LightingBindings::new(
                 cluster,
                 light_buffers,
@@ -116,26 +125,9 @@ impl ParticlesPass {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 12,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 14,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                storage(12, wgpu::ShaderStages::VERTEX, true),
+                storage(14, wgpu::ShaderStages::VERTEX, true),
+                storage(32, wgpu::ShaderStages::VERTEX, true),
                 wgpu::BindGroupLayoutEntry {
                     binding: 13,
                     visibility: vertex_fragment,
@@ -192,6 +184,58 @@ impl ParticlesPass {
             cache: None,
         });
         (pipeline, particle_layout)
+    }
+
+    fn create_light_pipeline(&mut self, device: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+        let module = self.shader.compile(device).expect("lighting shader compile failed");
+        let compute = wgpu::ShaderStages::COMPUTE;
+        let light_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("particle_light_bgl"),
+            entries: &[
+                storage(12, compute, true),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: compute,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                storage(14, compute, true),
+                storage(30, compute, true),
+                storage(31, compute, false),
+            ],
+        });
+        let [cluster, shadow, probe, debug_flags] = self.bindings.layouts(device);
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("particle_light_pipeline_layout"),
+            bind_group_layouts: &[Some(&light_layout), Some(cluster), Some(shadow), Some(probe), Some(debug_flags)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("particle_light"),
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some("cs_particle_light"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        (pipeline, light_layout)
+    }
+}
+
+fn storage(binding: u32, visibility: wgpu::ShaderStages, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
     }
 }
 
@@ -268,7 +312,19 @@ impl Pass for ParticlesPass {
         if self.pipeline.is_none() {
             self.pipeline = Some(self.create_pipeline(device));
         }
+        if self.light_pipeline.is_none() {
+            self.light_pipeline = Some(self.create_light_pipeline(device));
+        }
+        let light_buffer = self.light_buffer.get_or_insert_with(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("particle_light"),
+                size: u64::from(MAX_PARTICLES) * 16,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            })
+        });
         let Some((pipeline, particle_layout)) = &self.pipeline else { return };
+        let Some((light_pipeline, light_layout)) = &self.light_pipeline else { return };
         let depth_key = depth_view as *const wgpu::TextureView as usize;
         if self.particle_bg.as_ref().is_none_or(|(key, _)| *key != depth_key) {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -279,12 +335,40 @@ impl Pass for ParticlesPass {
                     wgpu::BindGroupEntry { binding: 12, resource: particles.binding() },
                     wgpu::BindGroupEntry { binding: 13, resource: params.binding() },
                     wgpu::BindGroupEntry { binding: 14, resource: draw_list.binding() },
+                    wgpu::BindGroupEntry { binding: 32, resource: light_buffer.as_entire_binding() },
                 ],
             });
             self.particle_bg = Some((depth_key, bind_group));
         }
+        let light_bg = self.light_bg.get_or_insert_with(|| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("particle_light_bg"),
+                layout: light_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 12, resource: particles.binding() },
+                    wgpu::BindGroupEntry { binding: 13, resource: params.binding() },
+                    wgpu::BindGroupEntry { binding: 14, resource: draw_list.binding() },
+                    wgpu::BindGroupEntry { binding: 30, resource: state.binding() },
+                    wgpu::BindGroupEntry { binding: 31, resource: light_buffer.as_entire_binding() },
+                ],
+            })
+        });
         let Some((_, particle_bg)) = &self.particle_bg else { return };
         let Some(lighting_bgs) = self.bindings.bind_groups(device, ctx) else { return };
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("particle_light"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(light_pipeline);
+            pass.set_bind_group(0, &*light_bg, &[]);
+            for (i, bind_group) in lighting_bgs.iter().enumerate() {
+                pass.set_bind_group(i as u32 + 1, *bind_group, &[]);
+            }
+            let slots = self.slots_in_use.load(Ordering::Relaxed);
+            pass.dispatch_workgroups(slots.div_ceil(LIGHT_WORKGROUP_SIZE), 1, 1);
+        }
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("particles"),

@@ -87,10 +87,13 @@ fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGrou
     }
 }
 
+// Groups 1–4 are also bound by `particles`' compute pass.
+const LIGHTING_STAGES: wgpu::ShaderStages = wgpu::ShaderStages::FRAGMENT.union(wgpu::ShaderStages::COMPUTE);
+
 fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
+        visibility: LIGHTING_STAGES,
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Storage { read_only: true },
             has_dynamic_offset: false,
@@ -107,7 +110,7 @@ fn texture_entry(
 ) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
+        visibility: LIGHTING_STAGES,
         ty: wgpu::BindingType::Texture { multisampled: false, view_dimension, sample_type },
         count: None,
     }
@@ -240,7 +243,7 @@ impl LightingBindings {
     /// shaders too, for forward passes.
     pub(crate) fn layouts(&mut self, device: &wgpu::Device) -> [&wgpu::BindGroupLayout; 4] {
         let layouts = self.layouts.get_or_insert_with(|| {
-            let fragment = wgpu::ShaderStages::FRAGMENT;
+            let fragment = LIGHTING_STAGES;
             let cluster = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("lighting_cluster_bgl"),
                 entries: &[

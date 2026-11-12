@@ -518,10 +518,10 @@ fn sample_probe_irradiance(pos_ws: vec3<f32>, N_ws: vec3<f32>, dir: vec3<f32>, v
                 let probe_dist = length(from_probe);
 
                 let vis_uv = visibility_atlas_uv(probe_index, octahedral_encode(from_probe / max(probe_dist, 1e-4)));
-                let vis    = textureSample(visibility_atlas, probe_sampler, vis_uv).rg;
+                let vis    = textureSampleLevel(visibility_atlas, probe_sampler, vis_uv, 0.0).rg;
 
                 let irr_uv = irradiance_atlas_uv(probe_index, dir_uv);
-                let irr    = textureSample(irradiance_atlas, probe_sampler, irr_uv).rgb;
+                let irr    = textureSampleLevel(irradiance_atlas, probe_sampler, irr_uv, 0.0).rgb;
 
                 let w = probe_weight(pos_ws, N_ws, probe_ws, vis, probe_dist) * w_tri;
                 irradiance   += irr * w;
@@ -2002,19 +2002,39 @@ struct ParticleParams {
 @group(0) @binding(13) var<uniform> particle_params: ParticleParams;
 // Slots of the live particles, one per instance (particle_sim.wgsl's draw list).
 @group(0) @binding(14) var<storage, read> particle_draw_list: array<u32>;
+// particle_sim.wgsl's ParticleState as words: [1] is the live particle count.
+@group(0) @binding(30) var<storage, read> particle_state: array<u32>;
+// Unexposed radiance of each draw-list entry, written by `cs_particle_light` and read by
+// `vs_particle` (through a read-only binding).
+@group(0) @binding(31) var<storage, read_write> particle_light_out: array<vec4<f32>>;
+@group(0) @binding(32) var<storage, read> particle_light: array<vec4<f32>>;
 
 struct ParticleVertex {
     @builtin(position) pos: vec4<f32>,
     // Position on the unit disc.
     @location(0) corner: vec2<f32>,
-    @location(1) @interpolate(flat) center: vec3<f32>,
+    @location(1) @interpolate(flat) radiance: vec3<f32>,
     // Opacity × lifetime fade × the energy kept by the minimum size.
     @location(2) @interpolate(flat) weight: f32,
-    @location(3) @interpolate(flat) emitter: u32,
     // View-space distance along −Z.
     @location(4) @interpolate(flat) depth: f32,
     // Settled on a surface: no soft fade, which would hide it.
     @location(5) @interpolate(flat) resting: u32,
+}
+
+fn particle_emitter(slot: u32) -> u32 {
+    for (var k = 0u; k < particle_params.counts.x; k++) {
+        let s = particle_params.emitters[k].slots;
+        if slot >= s.x && slot < s.x + s.y { return k; }
+    }
+    return 0u;
+}
+
+// Drawn radius in pixels, at least MIN_PARTICLE_RADIUS_PX.
+fn particle_radius_px(p: Particle, clip_w: f32) -> vec2<f32> {
+    let screen = particle_params.screen;
+    let radius_px = 0.5 * p.size * screen.z * 0.5 * screen.y / clip_w;
+    return vec2f(radius_px, max(radius_px, MIN_PARTICLE_RADIUS_PX));
 }
 
 // Henyey–Greenstein, normalized so an isotropic scatterer gives 1.
@@ -2045,9 +2065,45 @@ fn particle_sky_shadow(pos_vs: vec3<f32>, depth_vs: f32) -> vec3<f32> {
     return lit / 9.0 * glass_tint(t_glass_tint, uv, cascade, ref_depth);
 }
 
+// `light_shadow` for a particle: one bilinear comparison (plus glass tint) at the mip a screen
+// pixel spans there, offset toward the light (`L`, world). Particles are too small and blurred
+// for penumbrae, and the full filter at every light cost Osaka's rain ~20 ms.
+fn particle_light_shadow(slot: u32, pos: vec3<f32>, L: vec3<f32>) -> vec3<f32> {
+    if debug.disable_shadows != 0u || slot == SHADOW_SLOT_NONE { return vec3f(1.0); }
+    let shape = local_shadow.faces[slot * 6u].shape;
+    let d = pos - local_shadow.faces[slot * 6u].light.xyz;
+    var face = 0u;
+    if shape.x > 1.5 {
+        let a = abs(d);
+        if a.x >= a.y && a.x >= a.z {
+            face = select(1u, 0u, d.x > 0.0);
+        } else if a.y >= a.z {
+            face = select(3u, 2u, d.y > 0.0);
+        } else {
+            face = select(5u, 4u, d.z > 0.0);
+        }
+    }
+    let face_index = slot * 6u + face;
+    let f = local_shadow.faces[face_index];
+    if shape.x == 0.0 || f.info.x == 0u { return vec3f(1.0); }
+    let eye = camera.inv_view[3].xyz;
+    let footprint = max(dot(pos - eye, -camera.inv_view[2].xyz), 0.0) * local_shadow.lod.x;
+    let texel0 = 2.0 * length(d) * shape.y / VSM_SIZE;
+    let mip = u32(clamp(floor(log2(max(footprint / texel0, 1.0))), 0.0, f32(VSM_MIPS - 1u)));
+    let clip = f.view_proj * vec4f(pos + L * (1.5 * texel0 * f32(1u << mip)), 1.0);
+    let ndc = clip.xyz / clip.w;
+    let at = vsm_lookup(face_index, ndc.xy * vec2f(0.5, -0.5) + 0.5, mip);
+    if at.w == 0.0 || (shape.x < 1.5 && (clip.w <= 0.0 || any(abs(ndc.xy) > vec2f(1.0)))) {
+        return vec3f(1.0);
+    }
+    let opaque = textureSampleCompareLevel(t_local_shadow, s_shadow, at.xy, ndc.z);
+    if opaque <= 0.0 { return vec3f(0.0); }
+    return opaque * local_glass_tint(at.xy, clip.w - texel0 * f32(1u << u32(at.z)));
+}
+
 // Illuminance from every light at a particle, each weighted by the phase function toward the
-// camera (`view_dir`, world). Same lights, falloffs and shadows as `direct_lighting`; shadow
-// lookups offset toward the light instead of along a normal.
+// camera (`view_dir`, world). Same lights and falloffs as `direct_lighting`; shadows from
+// `particle_light_shadow`.
 fn particle_direct(pos_vs: vec3<f32>, pos_ws: vec3<f32>, view_dir: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
     let rot = mat3x3<f32>(camera.inv_view[0].xyz, camera.inv_view[1].xyz, camera.inv_view[2].xyz);
     let V_vs = normalize(view_dir * rot);
@@ -2061,7 +2117,7 @@ fn particle_direct(pos_vs: vec3<f32>, pos_ws: vec3<f32>, view_dir: vec3<f32>, pi
         let dist = length(to_light);
         if dist >= light.radius { continue; }
         let L = to_light / dist;
-        let vis = local_shadow_of(light.shadow_slot, pos_ws, rot * L, pixel);
+        let vis = particle_light_shadow(light.shadow_slot, pos_ws, rot * L);
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
         color += light.color * vis * (light.intensity * falloff * particle_phase(dot(-L, V_vs)));
     }
@@ -2074,7 +2130,8 @@ fn particle_direct(pos_vs: vec3<f32>, pos_ws: vec3<f32>, view_dir: vec3<f32>, pi
         let L = to_light / dist;
         let cd = dot(-L, normalize(light.direction_vs));
         let t = clamp((cd - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
-        let vis = local_shadow_of(light.shadow_slot, pos_ws, rot * L, pixel);
+        if t <= 0.0 { continue; }
+        let vis = particle_light_shadow(light.shadow_slot, pos_ws, rot * L);
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
         color += light.color * vis * (light.intensity * t * t * falloff * particle_phase(dot(-L, V_vs)));
     }
@@ -2096,7 +2153,7 @@ fn particle_direct(pos_vs: vec3<f32>, pos_ws: vec3<f32>, view_dir: vec3<f32>, pi
         let area = 4.0 * half_r * half_u;
         let facing = area_facing(light, -L, normalize(cross(r_dir, u_dir)));
         if facing <= 0.0 { continue; }
-        let vis = local_shadow_of(light.shadow_slot, pos_ws, rot * L, pixel);
+        let vis = particle_light_shadow(light.shadow_slot, pos_ws, rot * L);
         color += light.color * vis
             * (light.intensity * facing * area / (dist2 + area) * particle_phase(dot(-L, V_vs)));
     }
@@ -2111,6 +2168,44 @@ fn particle_direct(pos_vs: vec3<f32>, pos_ws: vec3<f32>, view_dir: vec3<f32>, pi
     return color;
 }
 
+// Lights each live particle once, at its centre, for `vs_particle` (one thread per draw-list entry).
+// Particles off screen get nothing: they draw nothing either.
+@compute @workgroup_size(64)
+fn cs_particle_light(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    if i >= particle_state[1] { return; }
+    let p = particle_slots[particle_draw_list[i]];
+    let e = particle_params.emitters[particle_emitter(particle_draw_list[i])];
+    if (e.info.y & PARTICLE_FLAG_UNLIT) != 0u {
+        particle_light_out[i] = vec4f(e.color.rgb, 0.0);
+        return;
+    }
+
+    let clip = camera.view_proj * vec4f(p.pos, 1.0);
+    let screen = particle_params.screen.xy;
+    let reach = 1.0 + 2.0 * particle_radius_px(p, clip.w).y / screen;
+    if clip.w <= camera.depth_params.x || any(abs(clip.xy) > reach * clip.w) {
+        particle_light_out[i] = vec4f(0.0);
+        return;
+    }
+    let pixel = clamp((clip.xy / clip.w * vec2f(0.5, -0.5) + 0.5) * screen, vec2f(0.0), screen - 1.0);
+
+    let cam_pos = camera.inv_view[3].xyz;
+    let rot = mat3x3<f32>(camera.inv_view[0].xyz, camera.inv_view[1].xyz, camera.inv_view[2].xyz);
+    let pos_vs = (p.pos - cam_pos) * rot;
+    let view_dir = normalize(cam_pos - p.pos);
+    var light = vec3f(0.0);
+    if debug.disable_direct == 0u {
+        light += particle_direct(pos_vs, p.pos, view_dir, pixel) / PI;
+    }
+    if debug.disable_indirect == 0u && (e.info.y & PARTICLE_FLAG_LIGHT_ONLY) == 0u {
+        // DDGI is irradiance per hemisphere: a mote sees both, toward and away from the camera.
+        light += 0.5 * (sample_probe_irradiance(p.pos, view_dir, view_dir, view_dir)
+            + sample_probe_irradiance(p.pos, -view_dir, -view_dir, view_dir));
+    }
+    particle_light_out[i] = vec4f(e.color.rgb * light, 0.0);
+}
+
 @vertex
 fn vs_particle(@builtin(vertex_index) vi: u32, @builtin(instance_index) instance: u32) -> ParticleVertex {
     var out: ParticleVertex;
@@ -2118,20 +2213,15 @@ fn vs_particle(@builtin(vertex_index) vi: u32, @builtin(instance_index) instance
     out.pos = vec4f(2.0, 2.0, 2.0, 1.0);
     let slot = particle_draw_list[instance];
     let p = particle_slots[slot];
-
-    var ei = 0u;
-    for (var k = 0u; k < particle_params.counts.x; k++) {
-        let s = particle_params.emitters[k].slots;
-        if slot >= s.x && slot < s.x + s.y { ei = k; break; }
-    }
-    let e = particle_params.emitters[ei];
+    let e = particle_params.emitters[particle_emitter(slot)];
 
     let clip = camera.view_proj * vec4f(p.pos, 1.0);
     if clip.w <= camera.depth_params.x { return out; }
 
     let screen = particle_params.screen;
-    let radius_px = 0.5 * p.size * screen.z * 0.5 * screen.y / clip.w;
-    let drawn_px = max(radius_px, MIN_PARTICLE_RADIUS_PX);
+    let radii = particle_radius_px(p, clip.w);
+    let radius_px = radii.x;
+    let drawn_px = radii.y;
     let t = p.age / p.life;
     let fade = smoothstep(0.0, 0.1, t) * (1.0 - smoothstep(0.85, 1.0, t));
 
@@ -2142,9 +2232,8 @@ fn vs_particle(@builtin(vertex_index) vi: u32, @builtin(instance_index) instance
     let corner = corners[vi];
     out.pos = clip + vec4f(corner * (2.0 * drawn_px / screen.xy) * clip.w, 0.0, 0.0);
     out.corner = corner;
-    out.center = p.pos;
+    out.radiance = particle_light[instance].rgb;
     out.weight = e.color.a * fade * (radius_px / drawn_px) * (radius_px / drawn_px);
-    out.emitter = ei;
     out.depth = clip.w;
     out.resting = p.flags & PARTICLE_RESTING;
     return out;
@@ -2167,26 +2256,7 @@ fn fs_particle(in: ParticleVertex) -> @location(0) vec4<f32> {
         soft = select(0.0, 1.0, scene - in.depth > -PARTICLE_REST_TOLERANCE);
     }
     if soft <= 0.0 { discard; }
-
-    let e = particle_params.emitters[in.emitter];
-    var radiance = e.color.rgb;
-    if (e.info.y & PARTICLE_FLAG_UNLIT) == 0u {
-        let cam_pos = camera.inv_view[3].xyz;
-        let rot = mat3x3<f32>(camera.inv_view[0].xyz, camera.inv_view[1].xyz, camera.inv_view[2].xyz);
-        let pos_vs = (in.center - cam_pos) * rot;
-        let view_dir = normalize(cam_pos - in.center);
-        var light = vec3f(0.0);
-        if debug.disable_direct == 0u {
-            light += particle_direct(pos_vs, in.center, view_dir, in.pos.xy) / PI;
-        }
-        if debug.disable_indirect == 0u && (e.info.y & PARTICLE_FLAG_LIGHT_ONLY) == 0u {
-            // DDGI is irradiance per hemisphere: a mote sees both, toward and away from the camera.
-            light += 0.5 * (sample_probe_irradiance(in.center, view_dir, view_dir, view_dir)
-                + sample_probe_irradiance(in.center, -view_dir, -view_dir, view_dir));
-        }
-        radiance *= light;
-    }
-    return vec4f(radiance * (cp.exposure * in.weight * shape * soft), 0.0);
+    return vec4f(in.radiance * (cp.exposure * in.weight * shape * soft), 0.0);
 }
 
 // ---------------------------------------------------------------------------------------------
