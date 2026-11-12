@@ -450,7 +450,7 @@ pub struct LightingPass {
     transmission_id: ResourceId,
     depth_id: ResourceId,
     ao_id: ResourceId,
-    glass_depth_id: ResourceId,
+    contact_depth_id: ResourceId,
     glass_transmittance_id: ResourceId,
 
     lit_id: ResourceId,
@@ -521,7 +521,7 @@ impl LightingPass {
                 transmission_id: gbuffer.transmission_id,
                 depth_id: gbuffer.depth_id,
                 ao_id: ao.ao_id,
-                glass_depth_id: ao.glass_depth_id,
+                contact_depth_id: ao.contact_depth_id,
                 glass_transmittance_id: ao.glass_transmittance_id,
                 lit_id,
                 specular_weight_id,
@@ -550,7 +550,7 @@ impl PassDesc for LightingPass {
     }
 
     fn reads(&self) -> Vec<ResourceId> {
-        let mut reads = vec![self.albedo_id, self.normal_id, self.material_id, self.emissive_id, self.transmission_id, self.depth_id, self.ao_id, self.glass_depth_id, self.glass_transmittance_id];
+        let mut reads = vec![self.albedo_id, self.normal_id, self.material_id, self.emissive_id, self.transmission_id, self.depth_id, self.ao_id, self.contact_depth_id, self.glass_transmittance_id];
         reads.extend(self.bindings.reads());
         reads
     }
@@ -588,7 +588,7 @@ impl Pass for LightingPass {
             self.emissive_id,
             self.transmission_id,
             self.ao_id,
-            self.glass_depth_id,
+            self.contact_depth_id,
             self.glass_transmittance_id,
         ]
         .map(|id| ctx.views.get(&id).copied());
@@ -603,7 +603,7 @@ impl Pass for LightingPass {
             Some(emissive_view),
             Some(transmission_view),
             Some(ao_view),
-            Some(glass_depth_view),
+            Some(contact_depth_view),
             Some(glass_transmittance_view),
         ] = views
         else {
@@ -641,7 +641,7 @@ impl Pass for LightingPass {
                     texture_entry(5, wgpu::TextureViewDimension::D2, FILTERABLE),
                     texture_entry(15, wgpu::TextureViewDimension::D2, FILTERABLE),
                     texture_entry(16, wgpu::TextureViewDimension::D2, FILTERABLE),
-                    texture_entry(17, wgpu::TextureViewDimension::D2, wgpu::TextureSampleType::Depth),
+                    texture_entry(17, wgpu::TextureViewDimension::D2, wgpu::TextureSampleType::Float { filterable: false }),
                     texture_entry(18, wgpu::TextureViewDimension::D2, FILTERABLE),
                     texture_entry(19, wgpu::TextureViewDimension::D2Array, FILTERABLE),
                 ],
@@ -741,7 +741,7 @@ impl Pass for LightingPass {
             return;
         };
 
-        let key = [albedo_view, ao_view, glass_depth_view, glass_transmittance_view, &mask.view]
+        let key = [albedo_view, ao_view, contact_depth_view, glass_transmittance_view, &mask.view]
             .map(|v| std::ptr::from_ref(v) as usize);
         if self.gbuffer_bg.as_ref().is_none_or(|(k, _, _)| *k != key) {
             let bind_group = |mask_view| device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -759,7 +759,7 @@ impl Pass for LightingPass {
                         resource: wgpu::BindingResource::TextureView(transmission_view),
                     },
                     wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(ao_view) },
-                    wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::TextureView(glass_depth_view) },
+                    wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::TextureView(contact_depth_view) },
                     wgpu::BindGroupEntry {
                         binding: 18,
                         resource: wgpu::BindingResource::TextureView(glass_transmittance_view),

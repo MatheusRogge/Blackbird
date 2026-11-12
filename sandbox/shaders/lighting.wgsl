@@ -10,9 +10,10 @@
 @group(0) @binding(15) var t_transmission: texture_2d<f32>;
 // Screen-space ambient occlusion (rendering::pass::ao), 1 = unoccluded.
 @group(0) @binding(16) var t_ao: texture_2d<f32>;
-// The `ao` pass's glass prepass: the nearest glass in front of the opaque depth (reversed-Z, 0 =
-// none) and the light it lets through (rgb), for contact shadows.
-@group(0) @binding(17) var t_glass_depth: texture_depth_2d;
+// From the `ao` pass's glass prepass, for contact shadows: linear depth of the opaque surface (r)
+// and of the nearest glass in front of it (g), 0 for none; and the light that glass lets through
+// (rgb).
+@group(0) @binding(17) var t_contact_depth: texture_2d<f32>;
 @group(0) @binding(18) var t_glass_transmittance: texture_2d<f32>;
 // Half-resolution shadow mask (`fs_shadow_mask`), a layer per masked light. Only `fs_main` reads
 // it: the mask pass binds a placeholder here.
@@ -921,44 +922,43 @@ fn contact_shadow(geo_N: vec3<f32>, pos_ws: vec3<f32>, L_ws: vec3<f32>, max_leng
         // `s` is linear in screen space; the fade wants the distance along the ray.
         let t = s * k1 / k;
         let fade = saturate((1.0 - t) / CONTACT_END_FADE);
-        let scene_w = contact_depth(px, x_major);
+        let depths = contact_depth(px, x_major);
+        let scene_w = depths.x;
         if scene_w > 0.0 {
             shadow = max(shadow, contact_occlusion(ray_w - scene_w, ray_w) * fade);
             if shadow >= 1.0 {
                 return vec3f(0.0);
             }
         }
-        if glass {
-            let g = textureLoad(t_glass_depth, vec2<i32>(px), 0);
-            if g != 0.0 {
-                let occlusion = contact_occlusion(ray_w - linear_depth(g), ray_w) * fade;
-                through = min(through, mix(vec3f(1.0), textureLoad(t_glass_transmittance, vec2<i32>(px), 0).rgb, occlusion));
-            }
+        if glass && depths.y != 0.0 {
+            let occlusion = contact_occlusion(ray_w - depths.y, ray_w) * fade;
+            through = min(through, mix(vec3f(1.0), textureLoad(t_glass_transmittance, vec2<i32>(px), 0).rgb, occlusion));
         }
     }
     return through * (1.0 - shadow);
 }
 
-// Linear depth of the depth buffer at `px`, interpolated across the minor axis (y when `x_major`)
-// between the two nearest pixel centers; 0 for sky. Across a depth edge (the two differ by more than
-// the contact thickness) it takes the nearer, so silhouettes don't blend into what's behind them.
-fn contact_depth(px: vec2<f32>, x_major: bool) -> f32 {
+// Linear depth of the opaque surface at `px` (x), interpolated across the minor axis (y when
+// `x_major`) between the two nearest pixel centers, 0 for sky; and of the glass in front of it at
+// `px` (y), 0 for none. Across a depth edge (the two differ by more than the contact thickness) it
+// takes the nearer, so silhouettes don't blend into what's behind them.
+fn contact_depth(px: vec2<f32>, x_major: bool) -> vec2<f32> {
     let minor = select(px.x, px.y, x_major) - 0.5;
     let base = floor(minor);
     let a = vec2<i32>(select(vec2f(base, px.y), vec2f(px.x, base), x_major));
     let b = a + select(vec2<i32>(1, 0), vec2<i32>(0, 1), x_major);
     let size = vec2<i32>(i32(cp.screen_w), i32(cp.screen_h)) - 1;
-    let da = textureLoad(t_depth, clamp(a, vec2<i32>(0), size), 0);
-    let db = textureLoad(t_depth, clamp(b, vec2<i32>(0), size), 0);
-    if da == 0.0 || db == 0.0 {
-        return select(0.0, linear_depth(max(da, db)), max(da, db) != 0.0);
+    let da = textureLoad(t_contact_depth, clamp(a, vec2<i32>(0), size), 0).rg;
+    let db = textureLoad(t_contact_depth, clamp(b, vec2<i32>(0), size), 0).rg;
+    // `px`'s own pixel is the nearer of the two.
+    let glass = select(db.y, da.y, minor - base < 0.5);
+    if da.x == 0.0 || db.x == 0.0 {
+        return vec2f(max(da.x, db.x), glass);
     }
-    let wa = linear_depth(da);
-    let wb = linear_depth(db);
-    if abs(wa - wb) > CONTACT_THICKNESS {
-        return min(wa, wb);
+    if abs(da.x - db.x) > CONTACT_THICKNESS {
+        return vec2f(min(da.x, db.x), glass);
     }
-    return mix(wa, wb, minor - base);
+    return vec2f(mix(da.x, db.x, minor - base), glass);
 }
 
 // How much a sample `in_front` behind the depth buffer is occluded.

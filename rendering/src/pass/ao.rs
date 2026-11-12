@@ -23,6 +23,7 @@ use crate::{
 pub const AO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 const GLASS_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const GLASS_TRANSMITTANCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+pub const CONTACT_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Float;
 
 #[derive(Clone, Copy)]
 pub struct AoOutputs {
@@ -31,9 +32,13 @@ pub struct AoOutputs {
     pub glass_depth_id: ResourceId,
     /// That glass's transmittance in rgb, cleared to 1.
     pub glass_transmittance_id: ResourceId,
+    /// `CONTACT_DEPTH_FORMAT`: linear depth of the opaque surface (r) and of that glass (g), 0 for
+    /// none, so contact shadows march both with one load.
+    pub contact_depth_id: ResourceId,
 }
 
 struct Pipelines {
+    contact_depth: wgpu::RenderPipeline,
     glass: wgpu::RenderPipeline,
     glass_layout: wgpu::BindGroupLayout,
     ao: wgpu::RenderPipeline,
@@ -52,6 +57,7 @@ pub struct AoPass {
     output_id: ResourceId,
     glass_depth_id: ResourceId,
     glass_transmittance_id: ResourceId,
+    contact_depth_id: ResourceId,
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
     pipelines: Option<Pipelines>,
     /// Keyed by the input view addresses (screen textures move on resize).
@@ -79,6 +85,7 @@ impl AoPass {
         let output_id = target(AO_FORMAT);
         let glass_depth_id = target(GLASS_DEPTH_FORMAT);
         let glass_transmittance_id = target(GLASS_TRANSMITTANCE_FORMAT);
+        let contact_depth_id = target(CONTACT_DEPTH_FORMAT);
         let pass = Self {
             node_id: None,
             shader,
@@ -89,12 +96,13 @@ impl AoPass {
             output_id,
             glass_depth_id,
             glass_transmittance_id,
+            contact_depth_id,
             debug_flags,
             pipelines: None,
             bind_groups: None,
             glass_bg: None,
         };
-        (pass, AoOutputs { ao_id: output_id, glass_depth_id, glass_transmittance_id })
+        (pass, AoOutputs { ao_id: output_id, glass_depth_id, glass_transmittance_id, contact_depth_id })
     }
 
     fn create_pipelines(&self, device: &wgpu::Device) -> Pipelines {
@@ -169,34 +177,53 @@ impl AoPass {
             bind_group_layouts: &[Some(&glass_layout)],
             immediate_size: 0,
         });
-        let glass = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ao_glass"),
-            layout: Some(&glass_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_glass"),
-                buffers: &[Some(Vertex::buffer_descriptor())],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs_glass"),
-                targets: &[Some(GLASS_TRANSMITTANCE_FORMAT.into())],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: GLASS_DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        // Both draw into the glass pass's targets: transmittance, then contact depth.
+        let glass_pass_pipeline = |label, vs, fs, buffers: &[Option<wgpu::VertexBufferLayout<'_>>], masks: [wgpu::ColorWrites; 2], depth: (bool, wgpu::CompareFunction)| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&glass_pipeline_layout),
+                vertex: wgpu::VertexState { module: &module, entry_point: Some(vs), buffers, compilation_options: Default::default() },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(fs),
+                    targets: &[
+                        Some(wgpu::ColorTargetState { format: GLASS_TRANSMITTANCE_FORMAT, blend: None, write_mask: masks[0] }),
+                        Some(wgpu::ColorTargetState { format: CONTACT_DEPTH_FORMAT, blend: None, write_mask: masks[1] }),
+                    ],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: GLASS_DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth.0),
+                    depth_compare: Some(depth.1),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let contact_depth = glass_pass_pipeline(
+            "ao_contact_depth",
+            "vs_main",
+            "fs_contact_depth",
+            &[],
+            [wgpu::ColorWrites::empty(), wgpu::ColorWrites::ALL],
+            (false, wgpu::CompareFunction::Always),
+        );
+        // The depth test keeps the nearest glass, so the last write to a texel is its depth.
+        let glass = glass_pass_pipeline(
+            "ao_glass",
+            "vs_glass",
+            "fs_glass",
+            &[Some(Vertex::buffer_descriptor())],
+            [wgpu::ColorWrites::ALL, wgpu::ColorWrites::GREEN],
+            (true, wgpu::CompareFunction::GreaterEqual),
+        );
         Pipelines {
+            contact_depth,
             glass,
             glass_layout,
             ao: pipeline("ao", &ao_layout, "fs_ao"),
@@ -240,7 +267,7 @@ impl PassDesc for AoPass {
     }
 
     fn writes(&self) -> Vec<ResourceId> {
-        vec![self.raw_id, self.output_id, self.glass_depth_id, self.glass_transmittance_id]
+        vec![self.raw_id, self.output_id, self.glass_depth_id, self.glass_transmittance_id, self.contact_depth_id]
     }
 }
 
@@ -263,14 +290,24 @@ impl Pass for AoPass {
         world: &World,
     ) {
         let view = |id| ctx.views.get(id).copied();
-        let (Some(output), Some(raw), Some(depth), Some(normal), Some(glass_depth), Some(glass_transmittance)) = (
+        let (
+            Some(output),
+            Some(raw),
+            Some(depth),
+            Some(normal),
+            Some(glass_depth),
+            Some(glass_transmittance),
+            Some(contact_depth),
+        ) = (
             view(&self.output_id),
             view(&self.raw_id),
             view(&self.depth_id),
             view(&self.normal_id),
             view(&self.glass_depth_id),
             view(&self.glass_transmittance_id),
-        ) else {
+            view(&self.contact_depth_id),
+        )
+        else {
             return;
         };
         let Some(camera) = ctx.buffers.get(&self.camera_buffer_id) else { return };
@@ -342,12 +379,20 @@ impl Pass for AoPass {
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ao_glass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: glass_transmittance,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store },
-                })],
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: glass_transmittance,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: contact_depth,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    }),
+                ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: glass_depth,
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
@@ -355,9 +400,11 @@ impl Pass for AoPass {
                 }),
                 ..Default::default()
             });
+            pass.set_bind_group(0, glass_bg, &[]);
+            pass.set_pipeline(&pipelines.contact_depth);
+            pass.draw(0..3, 0..1);
             if !glass.is_empty() {
                 pass.set_pipeline(&pipelines.glass);
-                pass.set_bind_group(0, glass_bg, &[]);
                 pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
                 pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
                 for draw in glass {

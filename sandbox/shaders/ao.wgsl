@@ -103,12 +103,30 @@ fn vs_glass(@location(0) position: vec3<f32>, @builtin(instance_index) instance:
     return GlassVertex(camera.view_proj * m.model * vec4f(position, 1.0), through);
 }
 
+// The glass pass's targets: transmittance, and linear depths for `lighting`'s contact shadows
+// (r opaque, g glass, 0 for none).
+struct GlassTargets {
+    @location(0) transmittance: vec4<f32>,
+    @location(1) contact_depth: vec4<f32>,
+}
+
+fn linear_depth(d: f32) -> f32 {
+    let n = camera.depth_params.x;
+    let f = camera.depth_params.y;
+    return select(0.0, n * f / (d * (f - n) + n), d != 0.0);
+}
+
 @fragment
-fn fs_glass(in: GlassVertex) -> @location(0) vec4<f32> {
+fn fs_contact_depth(in: VertexOutput) -> GlassTargets {
+    return GlassTargets(vec4f(1.0), vec4f(linear_depth(textureLoad(t_depth, vec2<i32>(in.pos.xy), 0)), 0.0, 0.0, 0.0));
+}
+
+@fragment
+fn fs_glass(in: GlassVertex) -> GlassTargets {
     if in.pos.z < textureLoad(t_depth, vec2<i32>(in.pos.xy), 0) {
         discard;
     }
-    return vec4f(in.transmittance, 1.0);
+    return GlassTargets(vec4f(in.transmittance, 1.0), vec4f(0.0, linear_depth(in.pos.z), 0.0, 0.0));
 }
 
 // Horizon cosine of an occluder at `sample_pos`, pulled down to -1 (no occlusion) by the distance

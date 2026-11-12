@@ -15,6 +15,7 @@ use crate::{
     debug_flags::RenderDebugFlags,
     graph::{NodeId, RenderGraph},
     mesh::{Mesh, Vertex},
+    pass::ao::CONTACT_DEPTH_FORMAT,
     pass::cluster_assignment::ClusterOutputs,
     pass::light_upload::LightBuffers,
     pass::lighting::LightingBindings,
@@ -363,10 +364,11 @@ struct Capture {
     /// Keyed by (geometry generation, instance list generation).
     scene_bg: Option<((u64, u64), wgpu::BindGroup)>,
     instances: InstanceList,
-    /// Bindings 3 and 17: `direct_lighting` names the G-buffer and glass depths (and, at 18, the
-    /// glass transmittance) for contact shadows, which captures leave off, so 1×1 stand-ins
+    /// Bindings 3, 17 and 18: `direct_lighting` names the G-buffer depth, the contact depths and
+    /// the glass transmittance for contact shadows, which captures leave off, so 1×1 stand-ins
     /// satisfy the layout.
     no_depth: wgpu::TextureView,
+    no_contact_depth: wgpu::TextureView,
     no_glass: wgpu::TextureView,
     /// Depth only: back-face culled for single-sided opaque meshes, unculled and alpha-tested for
     /// masked and double-sided ones.
@@ -478,7 +480,7 @@ impl ReflectionProbePass {
                     ty: wgpu::BindingType::Texture {
                         multisampled: false,
                         view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     },
                     count: None,
                 },
@@ -594,9 +596,11 @@ impl ReflectionProbePass {
                 .create_view(&wgpu::TextureViewDescriptor::default())
         };
         let no_depth = stand_in("reflection_probe_no_depth", wgpu::TextureFormat::Depth32Float);
+        let no_contact_depth = stand_in("reflection_probe_no_contact_depth", CONTACT_DEPTH_FORMAT);
         let no_glass = stand_in("reflection_probe_no_glass", wgpu::TextureFormat::Rgba8Unorm);
         Capture {
             no_depth,
+            no_contact_depth,
             no_glass,
             scene_layout,
             scene_bg: None,
@@ -716,7 +720,7 @@ impl Pass for ReflectionProbePass {
                     wgpu::BindGroupEntry { binding: 7, resource: ctx.geometry.instance_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 9, resource: ids.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&capture.no_depth) },
-                    wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::TextureView(&capture.no_depth) },
+                    wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::TextureView(&capture.no_contact_depth) },
                     wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::TextureView(&capture.no_glass) },
                     wgpu::BindGroupEntry {
                         binding: 11,
