@@ -1014,6 +1014,10 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         light_count = light_grid[cluster_idx];
     }
 
+    // Lights the surface can't see (wholly below its plane unless it transmits light from behind,
+    // outside a spot's cone, behind a one-sided area light) skip their shadow lookup. The same
+    // horizon test for area lights made the pass slower (+4 ms in the corridor), so they keep theirs.
+    let transmits = any(surf_vs.transmission > vec3f(0.0));
     var color = vec3f(0.0);
     for (var i = 0u; i < light_count; i++) {
         var li = i;
@@ -1024,7 +1028,7 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
 
         let to_light = light.position_vs - pos_vs;
         let dist     = length(to_light);
-        if dist >= light.radius {
+        if dist >= light.radius || (!transmits && dot(N_vs, to_light) <= -light.source_radius) {
             continue;
         }
 
@@ -1047,6 +1051,9 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let L  = to_light / dist;
         let cd = dot(-L, normalize(light.direction_vs));
         let t  = clamp((cd - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
+        if t <= 0.0 || (!transmits && dot(N_vs, to_light) <= -light.source_radius) {
+            continue;
+        }
         let vis = local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
             view_to_world_dir(L), dist, contact_glass);
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
@@ -1069,6 +1076,9 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let u_dir = light.up_vs / half_u;
 
         let rel     = pos_vs - light.position_vs;
+        if light.two_sided <= 0.5 && dot(rel, normalize(cross(r_dir, u_dir))) <= 0.0 {
+            continue;
+        }
         let closest = light.position_vs
             + r_dir * clamp(dot(rel, r_dir), -half_r, half_r)
             + u_dir * clamp(dot(rel, u_dir), -half_u, half_u);
