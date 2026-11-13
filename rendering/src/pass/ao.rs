@@ -42,6 +42,8 @@ struct Pipelines {
     glass: wgpu::RenderPipeline,
     glass_layout: wgpu::BindGroupLayout,
     ao: wgpu::RenderPipeline,
+    /// `fs_ao` with `HAS_GLASS` off, for frames with no visible glass.
+    ao_no_glass: wgpu::RenderPipeline,
     ao_layout: wgpu::BindGroupLayout,
     blur: wgpu::RenderPipeline,
     blur_layout: wgpu::BindGroupLayout,
@@ -135,8 +137,8 @@ impl AoPass {
             texture(0, wgpu::TextureSampleType::Depth),
             texture(1, float),
             camera,
-            texture(5, wgpu::TextureSampleType::Depth),
             texture(6, float),
+            texture(7, wgpu::TextureSampleType::Float { filterable: false }),
         ];
         let ao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("ao"), entries: &entries });
         entries.push(texture(3, float));
@@ -144,7 +146,7 @@ impl AoPass {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("ao_blur"), entries: &entries });
 
         let module = self.shader.compile(device).expect("ao shader compilation failed");
-        let pipeline = |label, layout: &wgpu::BindGroupLayout, fs| {
+        let pipeline = |label, layout: &wgpu::BindGroupLayout, fs, constants: &[(&str, f64)]| {
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(label),
                 bind_group_layouts: &[Some(layout)],
@@ -163,7 +165,7 @@ impl AoPass {
                     module: &module,
                     entry_point: Some(fs),
                     targets: &[Some(AO_FORMAT.into())],
-                    compilation_options: Default::default(),
+                    compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
                 }),
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: None,
@@ -226,8 +228,9 @@ impl AoPass {
             contact_depth,
             glass,
             glass_layout,
-            ao: pipeline("ao", &ao_layout, "fs_ao"),
-            blur: pipeline("ao_blur", &blur_layout, "fs_blur"),
+            ao: pipeline("ao", &ao_layout, "fs_ao", &[]),
+            ao_no_glass: pipeline("ao_no_glass", &ao_layout, "fs_ao", &[("HAS_GLASS", 0.0)]),
+            blur: pipeline("ao_blur", &blur_layout, "fs_blur", &[]),
             ao_layout,
             blur_layout,
         }
@@ -337,7 +340,7 @@ impl Pass for AoPass {
             self.glass_bg = Some((glass_key, bind_group));
         }
 
-        let key: Vec<usize> = [raw, depth, normal, glass_depth, glass_transmittance]
+        let key: Vec<usize> = [raw, depth, normal, glass_transmittance, contact_depth]
             .iter()
             .map(|v| std::ptr::from_ref(*v) as usize)
             .collect();
@@ -346,8 +349,8 @@ impl Pass for AoPass {
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(normal) },
                 wgpu::BindGroupEntry { binding: 2, resource: camera.binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(glass_depth) },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(glass_transmittance) },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(contact_depth) },
             ];
             let ao = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ao"),
@@ -376,6 +379,7 @@ impl Pass for AoPass {
                 (!draw.bounds.outside_clip(view_proj? * h.entity.transform)).then_some(draw)
             })
             .collect();
+        let ao_pipeline = if glass.is_empty() { &pipelines.ao_no_glass } else { &pipelines.ao };
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ao_glass"),
@@ -413,7 +417,7 @@ impl Pass for AoPass {
             }
         }
         if ambient_occlusion {
-            fullscreen(encoder, "ao", raw, Some((&pipelines.ao, ao_bg)));
+            fullscreen(encoder, "ao", raw, Some((ao_pipeline, ao_bg)));
             fullscreen(encoder, "ao_blur", output, Some((&pipelines.blur, blur_bg)));
         } else {
             fullscreen(encoder, "ao_blur", output, None);

@@ -13,9 +13,11 @@
 // `fs_ao`'s output, read by `fs_blur`.
 @group(0) @binding(3) var t_raw:    texture_2d<f32>;
 @group(0) @binding(4) var<storage, read> models: array<Model>;
-// Nearest glass in front of the opaque depth (reversed-Z, 0 = none) and its transmittance (rgb).
-@group(0) @binding(5) var t_glass_depth:         texture_depth_2d;
+// Transmittance (rgb) of the nearest glass in front of the opaque depth.
 @group(0) @binding(6) var t_glass_transmittance: texture_2d<f32>;
+// Linear depth of the opaque surface (r) and of that glass (g), 0 for none: `fs_contact_depth` and
+// `fs_glass` fill it before `fs_ao`, which marches both with one load per step when glass is visible.
+@group(0) @binding(7) var t_contact_depth: texture_2d<f32>;
 
 // Mirrors rendering::arena::GpuModel.
 struct Model {
@@ -49,6 +51,9 @@ const DIRECTIONS: u32 = 2u;
 const STEPS: u32 = 6u;
 // A tap counts for the blur while it is within this fraction of the depth of the centre's plane.
 const BLUR_PLANE_TOLERANCE: f32 = 0.02;
+// False for frames with no visible glass: the march then reads the 4-byte G-buffer depth instead of
+// the 8-byte contact depths. It is bound by its cache footprint, so that is 1.5–2 ms at 2000×844.
+override HAS_GLASS: bool = true;
 
 
 struct VertexOutput {
@@ -114,6 +119,21 @@ fn linear_depth(d: f32) -> f32 {
     let n = camera.depth_params.x;
     let f = camera.depth_params.y;
     return select(0.0, n * f / (d * (f - n) + n), d != 0.0);
+}
+
+fn device_depth(linear: f32) -> f32 {
+    let n = camera.depth_params.x;
+    let f = camera.depth_params.y;
+    return select(0.0, (n * f / linear - n) / (f - n), linear != 0.0);
+}
+
+// Reversed-Z depths of the opaque surface (x) and the nearest glass (y) at `pixel`, 0 for none.
+fn march_depths(pixel: vec2<i32>) -> vec2<f32> {
+    if HAS_GLASS {
+        let linear = textureLoad(t_contact_depth, pixel, 0).rg;
+        return vec2f(device_depth(linear.r), device_depth(linear.g));
+    }
+    return vec2f(textureLoad(t_depth, pixel, 0), 0.0);
 }
 
 @fragment
@@ -192,13 +212,12 @@ fn fs_ao(in: VertexOutput) -> @location(0) vec4<f32> {
                 if any(sample_px < vec2f(0.0)) || any(sample_px >= dims) {
                     break;
                 }
-                let sample_depth = textureLoad(t_depth, vec2<i32>(sample_px), 0);
-                if sample_depth != 0.0 {
-                    horizon[side] = max(horizon[side], horizon_cos(world_pos(sample_px, sample_depth, dims), p, v));
+                let depths = march_depths(vec2<i32>(sample_px));
+                if depths.x != 0.0 {
+                    horizon[side] = max(horizon[side], horizon_cos(world_pos(sample_px, depths.x, dims), p, v));
                 }
-                let glass_depth = textureLoad(t_glass_depth, vec2<i32>(sample_px), 0);
-                if glass_depth != 0.0 {
-                    let cos_h = horizon_cos(world_pos(sample_px, glass_depth, dims), p, v);
+                if depths.y != 0.0 {
+                    let cos_h = horizon_cos(world_pos(sample_px, depths.y, dims), p, v);
                     if cos_h > glass_horizon[side] {
                         glass_horizon[side] = cos_h;
                         let through = textureLoad(t_glass_transmittance, vec2<i32>(sample_px), 0).rgb;
