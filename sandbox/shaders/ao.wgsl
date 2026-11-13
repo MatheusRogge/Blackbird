@@ -1,8 +1,9 @@
 // Ground-truth ambient occlusion (Jimenez et al. 2016, "Practical Real-Time Strategies for Accurate
 // Indirect Occlusion") over the G-buffer depth and normals, in world space. `fs_ao` integrates the
 // visible hemisphere over a few screen-space slices per pixel, each rotated by a 4×4 interleaved
-// pattern; `fs_blur` averages that 4×4 neighbourhood, weighted by how well each tap lies on the
-// centre pixel's surface, so the result sees 4 × DIRECTIONS slice angles without temporal history.
+// pattern, at half resolution; `fs_blur` upsamples by averaging the 4×4 nearest half-resolution
+// texels, weighted by how well each lies on the pixel's surface, so the result sees 4 × DIRECTIONS
+// slice angles without temporal history.
 // Glass isn't in the G-buffer depth: `vs_glass` / `fs_glass` first draw the nearest visible glass
 // surface into its own depth target, with the light it lets through, and `fs_ao` counts it as a
 // partial occluder (`lighting`'s contact shadows march it too).
@@ -159,25 +160,28 @@ fn horizon_cos(sample_pos: vec3<f32>, p: vec3<f32>, v: vec3<f32>) -> f32 {
     return mix(cos_h, -1.0, falloff);
 }
 
+// Half resolution: texel q integrates full-resolution pixel 2q; `fs_blur` upsamples.
 @fragment
 fn fs_ao(in: VertexOutput) -> @location(0) vec4<f32> {
     let dims = vec2f(textureDimensions(t_depth));
-    let pixel = vec2<i32>(in.pos.xy);
+    let half_texel = vec2<i32>(in.pos.xy);
+    let pixel = min(half_texel * 2, vec2<i32>(dims) - 1);
+    let center = vec2f(pixel) + 0.5;
     let depth = textureLoad(t_depth, pixel, 0);
     if depth == 0.0 {
         return vec4f(1.0);
     }
-    let p = world_pos(in.pos.xy, depth, dims);
+    let p = world_pos(center, depth, dims);
     let n = load_normal(pixel);
     let v = normalize(camera.inv_view[3].xyz - p);
 
-    let texel = length(world_pos(in.pos.xy + vec2f(1.0, 0.0), depth, dims) - p);
+    let texel = length(world_pos(center + vec2f(1.0, 0.0), depth, dims) - p);
     let radius_px = min(RADIUS / max(texel, 1e-6), MAX_RADIUS_FRACTION * dims.y);
     if radius_px < 1.0 {
         return vec4f(1.0);
     }
 
-    let cell = vec2<u32>(pixel) & vec2<u32>(3u);
+    let cell = vec2<u32>(half_texel) & vec2<u32>(3u);
     let rotation = (bayer(cell) + 0.5) / 16.0;
     let jitter = (bayer(cell.yx) + 0.5) / 16.0;
 
@@ -187,7 +191,7 @@ fn fs_ao(in: VertexOutput) -> @location(0) vec4<f32> {
         let phi = (f32(i) + rotation) * PI / f32(DIRECTIONS);
         let dir = vec2f(cos(phi), sin(phi));
         // The slice's world-space direction: toward the pixel next along `dir`, made orthogonal to v.
-        let toward = world_pos(in.pos.xy + dir, depth, dims) - p;
+        let toward = world_pos(center + dir, depth, dims) - p;
         let ortho = normalize(toward - v * dot(toward, v));
         let axis = cross(ortho, v);
         let n_proj = n - axis * dot(n, axis);
@@ -208,7 +212,7 @@ fn fs_ao(in: VertexOutput) -> @location(0) vec4<f32> {
             for (var j = 0u; j < STEPS; j++) {
                 let f = (f32(j) + jitter) / f32(STEPS);
                 let offset = max(f * f * radius_px, f32(j) + 1.0);
-                let sample_px = floor(in.pos.xy + dir * (offset * s)) + 0.5;
+                let sample_px = floor(center + dir * (offset * s)) + 0.5;
                 if any(sample_px < vec2f(0.0)) || any(sample_px >= dims) {
                     break;
                 }
@@ -251,20 +255,26 @@ fn fs_blur(in: VertexOutput) -> @location(0) vec4<f32> {
     let n = load_normal(pixel);
     let tolerance = BLUR_PLANE_TOLERANCE * length(camera.inv_view[3].xyz - p);
 
+    // The 4×4 half-resolution texels nearest the pixel, each at the full-resolution pixel it integrated.
+    let raw_max = vec2<i32>(textureDimensions(t_raw)) - 1;
+    let base = vec2<i32>(floor((vec2f(pixel) - 3.0) * 0.5));
     var sum = 0.0;
     var weight = 0.0;
-    for (var y = -2; y < 2; y++) {
-        for (var x = -2; x < 2; x++) {
-            let tap = clamp(pixel + vec2<i32>(x, y), vec2<i32>(0), vec2<i32>(dims) - 1);
+    for (var y = 0; y < 4; y++) {
+        for (var x = 0; x < 4; x++) {
+            let tap_texel = clamp(base + vec2<i32>(x, y), vec2<i32>(0), raw_max);
+            let tap = min(tap_texel * 2, vec2<i32>(dims) - 1);
             let tap_depth = textureLoad(t_depth, tap, 0);
             if tap_depth == 0.0 {
                 continue;
             }
             let off_plane = abs(dot(world_pos(vec2f(tap) + 0.5, tap_depth, dims) - p, n));
-            let w = saturate(1.0 - off_plane / tolerance) * pow(saturate(dot(load_normal(tap), n)), 8.0);
-            sum += textureLoad(t_raw, tap, 0).r * w;
+            // Tent over the distance to the pixel, so the window doesn't jump by a texel every 2 pixels.
+            let spread = 1.0 - abs(vec2f(tap - pixel)) / 5.0;
+            let w = saturate(1.0 - off_plane / tolerance) * pow(saturate(dot(load_normal(tap), n)), 8.0) * spread.x * spread.y;
+            sum += textureLoad(t_raw, tap_texel, 0).r * w;
             weight += w;
         }
     }
-    return vec4f(select(textureLoad(t_raw, pixel, 0).r, sum / weight, weight > 1e-4));
+    return vec4f(select(textureLoad(t_raw, min(pixel / 2, raw_max), 0).r, sum / weight, weight > 1e-4));
 }

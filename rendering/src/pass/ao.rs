@@ -1,7 +1,7 @@
 //! Screen-space ambient occlusion (`ao.wgsl`): draws the nearest visible glass into its own depth
 //! and transmittance targets (`Blend` meshes aren't in the G-buffer), then GTAO over the G-buffer
-//! depth, normals and that glass into a raw target, then a depth-aware 4×4 blur into the output
-//! `lighting` reads. With the `ambient_occlusion` debug flag off the output is cleared to 1. The
+//! depth, normals and that glass into a half-resolution raw target, then a depth-aware 4×4 blur
+//! that upsamples it into the output `lighting` reads. With the `ambient_occlusion` debug flag off the output is cleared to 1. The
 //! glass targets are also outputs: contact shadows in `lighting` march them and `ssr` reflects them,
 //! so they are drawn while any of the three is on.
 
@@ -55,7 +55,8 @@ pub struct AoPass {
     depth_id: ResourceId,
     normal_id: ResourceId,
     camera_buffer_id: ResourceId,
-    raw_id: ResourceId,
+    /// Half-resolution GTAO, recreated on resize.
+    raw: Option<wgpu::TextureView>,
     output_id: ResourceId,
     glass_depth_id: ResourceId,
     glass_transmittance_id: ResourceId,
@@ -83,7 +84,6 @@ impl AoPass {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             })
         };
-        let raw_id = target(AO_FORMAT);
         let output_id = target(AO_FORMAT);
         let glass_depth_id = target(GLASS_DEPTH_FORMAT);
         let glass_transmittance_id = target(GLASS_TRANSMITTANCE_FORMAT);
@@ -94,7 +94,7 @@ impl AoPass {
             depth_id,
             normal_id,
             camera_buffer_id,
-            raw_id,
+            raw: None,
             output_id,
             glass_depth_id,
             glass_transmittance_id,
@@ -270,7 +270,7 @@ impl PassDesc for AoPass {
     }
 
     fn writes(&self) -> Vec<ResourceId> {
-        vec![self.raw_id, self.output_id, self.glass_depth_id, self.glass_transmittance_id, self.contact_depth_id]
+        vec![self.output_id, self.glass_depth_id, self.glass_transmittance_id, self.contact_depth_id]
     }
 }
 
@@ -280,6 +280,7 @@ impl Pass for AoPass {
     }
 
     fn on_resize(&mut self, _width: u32, _height: u32) {
+        self.raw = None;
         self.bind_groups = None;
         self.glass_bg = None;
     }
@@ -295,7 +296,6 @@ impl Pass for AoPass {
         let view = |id| ctx.views.get(id).copied();
         let (
             Some(output),
-            Some(raw),
             Some(depth),
             Some(normal),
             Some(glass_depth),
@@ -303,7 +303,6 @@ impl Pass for AoPass {
             Some(contact_depth),
         ) = (
             view(&self.output_id),
-            view(&self.raw_id),
             view(&self.depth_id),
             view(&self.normal_id),
             view(&self.glass_depth_id),
@@ -325,6 +324,21 @@ impl Pass for AoPass {
             self.pipelines = Some(self.create_pipelines(device));
         }
         let Some(pipelines) = &self.pipelines else { return };
+        let (w, h) = ctx.surface_size;
+        let raw = self.raw.get_or_insert_with(|| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("ao_raw"),
+                    size: wgpu::Extent3d { width: w.div_ceil(2), height: h.div_ceil(2), depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: AO_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        });
 
         let glass_key = (std::ptr::from_ref(depth) as usize, ctx.geometry.generation());
         if self.glass_bg.as_ref().is_none_or(|(k, _)| *k != glass_key) {
@@ -340,7 +354,7 @@ impl Pass for AoPass {
             self.glass_bg = Some((glass_key, bind_group));
         }
 
-        let key: Vec<usize> = [raw, depth, normal, glass_transmittance, contact_depth]
+        let key: Vec<usize> = [&*raw, depth, normal, glass_transmittance, contact_depth]
             .iter()
             .map(|v| std::ptr::from_ref(*v) as usize)
             .collect();
@@ -368,7 +382,6 @@ impl Pass for AoPass {
         let Some((_, ao_bg, blur_bg)) = &self.bind_groups else { return };
         let Some((_, glass_bg)) = &self.glass_bg else { return };
 
-        let (w, h) = ctx.surface_size;
         let view_proj = world.get_entities::<Camera>().first().map(|c| c.view_proj_matrix(w as f32 / h as f32));
         let glass: Vec<_> = world
             .get_entity_handles::<Mesh>()
