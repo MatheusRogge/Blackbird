@@ -99,6 +99,9 @@ struct ProbeTraceFrame {
     frame_rotation: mat3x3<f32>,
     inv_view:       mat4x4<f32>,
     frame_index:    u32,
+    // This frame traces the probes whose index ≡ phase (mod interval).
+    phase:          u32,
+    interval:       u32,
 }
 
 struct TraceResult {
@@ -485,10 +488,10 @@ fn sample_sky(ray_dir: vec3<f32>) -> vec3<f32> {
 
 // ── Main compute entry ────────────────────────────────────────────────────────
 
-@compute @workgroup_size(32, 1, 1)
+@compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ray_index   = gid.x;
-    let probe_index = gid.y;
+    let probe_index = gid.y * frame.interval + frame.phase;
 
     if ray_index   >= probe_params.rays_per_probe { return; }
     if probe_index >= probe_params.probe_count    { return; }

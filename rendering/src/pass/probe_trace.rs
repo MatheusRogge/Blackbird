@@ -1,5 +1,5 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytemuck::{Pod, Zeroable};
 use engine_core::world::World;
@@ -11,7 +11,7 @@ use crate::{
     pass::{
         Pass, PassContext, PassDesc,
         bvh_upload::BvhOutputs,
-        probe_atlas::{ProbeAtlasOutputs, PROBE_COUNT, RAYS_PER_PROBE},
+        probe_atlas::{ProbeAtlasOutputs, ProbeSlice, PROBE_COUNT, RAYS_PER_PROBE},
         light_upload::LightBuffers,
     },
     resource::{ResourceDescriptor, ResourceId},
@@ -19,6 +19,8 @@ use crate::{
 };
 
 const RAY_BUFFER_SIZE: u64 = (PROBE_COUNT * RAYS_PER_PROBE * 16) as u64;
+/// Mirrors `@workgroup_size` of `probe_trace.wgsl`'s `main`.
+const WORKGROUP_SIZE: u32 = 64;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -26,12 +28,17 @@ struct ProbeTraceFrame {
     frame_rotation: [[f32; 4]; 3], // mat3x3 col-major, each col padded → 48 bytes
     inv_view: [[f32; 4]; 4],       // mat4x4 → 64 bytes
     frame_index: u32,              // offset 112
-    _pad: [u32; 3],                // offset 116 → total 128 bytes
+    /// The probes traced: index ≡ phase (mod interval).
+    phase: u32,                    // offset 116
+    interval: u32,                 // offset 120
+    _pad: u32,                     // offset 124 → total 128 bytes
 }
 
 pub struct ProbeTraceOutputs {
     pub ray_radiance_id: ResourceId,
     pub ray_direction_id: ResourceId,
+    /// `ProbeTraceFrame`, for `probe_update`'s slice.
+    pub frame_uniform_id: ResourceId,
 }
 
 pub struct ProbeTracePass {
@@ -50,7 +57,7 @@ pub struct ProbeTracePass {
     irradiance_atlas_ids: [ResourceId; 2],
     visibility_atlas_ids: [ResourceId; 2],
     current_atlas: Arc<AtomicUsize>,
-    update_due: Arc<AtomicBool>,
+    update_slice: Arc<Mutex<ProbeSlice>>,
     pipeline: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::Sampler)>,
     /// `bind_groups[i]` reads probe atlas `i`, for the bounces after the first. The atlases are
     /// `history_reads`: `probe_update` writes them from this pass's rays.
@@ -82,7 +89,7 @@ impl ProbeTracePass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let outputs = ProbeTraceOutputs { ray_radiance_id, ray_direction_id };
+        let outputs = ProbeTraceOutputs { ray_radiance_id, ray_direction_id, frame_uniform_id };
 
         (
             Self {
@@ -101,7 +108,7 @@ impl ProbeTracePass {
                 irradiance_atlas_ids: probe_atlas.irradiance_atlas_ids,
                 visibility_atlas_ids: probe_atlas.visibility_atlas_ids,
                 current_atlas: Arc::clone(&probe_atlas.current_atlas),
-                update_due: Arc::clone(&probe_atlas.update_due),
+                update_slice: Arc::clone(&probe_atlas.update_slice),
                 pipeline: None,
                 bind_groups: [None, None],
                 frame_uniform_id,
@@ -204,9 +211,7 @@ impl Pass for ProbeTracePass {
         world: &World,
     ) {
         self.frame_index = self.frame_index.wrapping_add(1);
-        if !self.update_due.load(Ordering::Relaxed) {
-            return;
-        }
+        let slice = *self.update_slice.lock().expect("update_slice poisoned");
 
         let Some(&bvh_nodes_buf) = ctx.buffers.get(&self.bvh_nodes_id) else { return };
         let Some(&bvh_tris_buf) = ctx.buffers.get(&self.bvh_tris_id) else { return };
@@ -234,7 +239,9 @@ impl Pass for ProbeTracePass {
             frame_rotation: make_frame_rotation(self.frame_index),
             inv_view: mat4_to_cols(inv_view),
             frame_index: self.frame_index,
-            _pad: [0; 3],
+            phase: slice.phase,
+            interval: slice.interval,
+            _pad: 0,
         };
         frame_buf.write(queue, bytemuck::bytes_of(&frame_data));
 
@@ -418,6 +425,6 @@ impl Pass for ProbeTracePass {
         });
         compute_pass.set_pipeline(pipeline);
         compute_pass.set_bind_group(0, bg, &[]);
-        compute_pass.dispatch_workgroups(RAYS_PER_PROBE / 32, PROBE_COUNT, 1);
+        compute_pass.dispatch_workgroups(RAYS_PER_PROBE / WORKGROUP_SIZE, PROBE_COUNT.div_ceil(slice.interval), 1);
     }
 }

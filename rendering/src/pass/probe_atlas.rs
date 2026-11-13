@@ -1,5 +1,5 @@
-use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::AtomicUsize;
 
 use bytemuck::{Pod, Zeroable};
 use engine_core::world::World;
@@ -27,6 +27,12 @@ pub const IRRADIANCE_ATLAS_WIDTH: u32 = PROBES_PER_ROW * (IRRADIANCE_TEXEL_SIZE 
 pub const IRRADIANCE_ATLAS_HEIGHT: u32 = PROBES_PER_COL * (IRRADIANCE_TEXEL_SIZE + 2);
 pub const VISIBILITY_ATLAS_WIDTH: u32 = PROBES_PER_ROW * (VISIBILITY_TEXEL_SIZE + 2);
 pub const VISIBILITY_ATLAS_HEIGHT: u32 = PROBES_PER_COL * (VISIBILITY_TEXEL_SIZE + 2);
+
+// Copied whole by `probe_update` so the probes it skips carry over to the other ping-pong side.
+const ATLAS_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::TEXTURE_BINDING
+    .union(wgpu::TextureUsages::STORAGE_BINDING)
+    .union(wgpu::TextureUsages::COPY_SRC)
+    .union(wgpu::TextureUsages::COPY_DST);
 
 pub struct ProbeGridConfig {
     pub grid_dim: [u32; 3],
@@ -72,8 +78,17 @@ pub struct ProbeAtlasOutputs {
     pub probe_params_id: ResourceId,
     /// Which slot (0 or 1) was written most recently — read by LightingPass.
     pub current_atlas: Arc<AtomicUsize>,
-    /// Whether the probes update this frame (`RenderDebugFlags::ddgi_update_interval`).
-    pub update_due: Arc<AtomicBool>,
+    /// The probes traced and updated this frame.
+    pub update_slice: Arc<Mutex<ProbeSlice>>,
+}
+
+/// The probes whose index ≡ `phase` (mod `interval`, `RenderDebugFlags::ddgi_update_interval`):
+/// each probe updates every `interval` frames, a slice of them every frame, so the cost is flat
+/// instead of all of it every `interval`th frame.
+#[derive(Clone, Copy)]
+pub struct ProbeSlice {
+    pub phase: u32,
+    pub interval: u32,
 }
 
 pub struct ProbeAtlasPass {
@@ -82,7 +97,7 @@ pub struct ProbeAtlasPass {
     probe_params_id: ResourceId,
     debug_flags: Arc<RwLock<RenderDebugFlags>>,
     frame: u32,
-    update_due: Arc<AtomicBool>,
+    update_slice: Arc<Mutex<ProbeSlice>>,
 }
 
 impl ProbeAtlasPass {
@@ -95,24 +110,24 @@ impl ProbeAtlasPass {
             graph.alloc_resource_id(ResourceDescriptor::FixedTexture {
                 size: wgpu::Extent3d { width: IRRADIANCE_ATLAS_WIDTH, height: IRRADIANCE_ATLAS_HEIGHT, depth_or_array_layers: 1 },
                 format: wgpu::TextureFormat::Rgba16Float,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+                usage: ATLAS_USAGE,
             }),
             graph.alloc_resource_id(ResourceDescriptor::FixedTexture {
                 size: wgpu::Extent3d { width: IRRADIANCE_ATLAS_WIDTH, height: IRRADIANCE_ATLAS_HEIGHT, depth_or_array_layers: 1 },
                 format: wgpu::TextureFormat::Rgba16Float,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+                usage: ATLAS_USAGE,
             }),
         ];
         let visibility_atlas_ids = [
             graph.alloc_resource_id(ResourceDescriptor::FixedTexture {
                 size: wgpu::Extent3d { width: VISIBILITY_ATLAS_WIDTH, height: VISIBILITY_ATLAS_HEIGHT, depth_or_array_layers: 1 },
                 format: wgpu::TextureFormat::Rgba16Float,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+                usage: ATLAS_USAGE,
             }),
             graph.alloc_resource_id(ResourceDescriptor::FixedTexture {
                 size: wgpu::Extent3d { width: VISIBILITY_ATLAS_WIDTH, height: VISIBILITY_ATLAS_HEIGHT, depth_or_array_layers: 1 },
                 format: wgpu::TextureFormat::Rgba16Float,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+                usage: ATLAS_USAGE,
             }),
         ];
 
@@ -122,13 +137,13 @@ impl ProbeAtlasPass {
         });
 
         let current_atlas = Arc::new(AtomicUsize::new(0));
-        let update_due = Arc::new(AtomicBool::new(false));
+        let update_slice = Arc::new(Mutex::new(ProbeSlice { phase: 0, interval: 1 }));
         let outputs = ProbeAtlasOutputs {
             irradiance_atlas_ids,
             visibility_atlas_ids,
             probe_params_id,
             current_atlas,
-            update_due: Arc::clone(&update_due),
+            update_slice: Arc::clone(&update_slice),
         };
 
         (
@@ -138,7 +153,7 @@ impl ProbeAtlasPass {
                 probe_params_id,
                 debug_flags,
                 frame: 0,
-                update_due,
+                update_slice,
             },
             outputs,
         )
@@ -192,8 +207,9 @@ impl Pass for ProbeAtlasPass {
         let (indirect_intensity, bounce) = (flags.ddgi_indirect_intensity, flags.ddgi_bounce);
         let interval = flags.ddgi_update_interval.max(1);
         drop(flags);
-        self.update_due.store(self.frame == 0, Ordering::Relaxed);
-        self.frame = (self.frame + 1) % interval;
+        let phase = self.frame % interval;
+        *self.update_slice.lock().expect("update_slice poisoned") = ProbeSlice { phase, interval };
+        self.frame = (phase + 1) % interval;
 
         let max_ray_distance = {
             let dim = self.config.grid_dim;

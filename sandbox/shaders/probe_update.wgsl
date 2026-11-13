@@ -28,6 +28,17 @@ struct ProbeGridParams {
 @group(0) @binding(5) var vis_prev: texture_2d<f32>;
 @group(0) @binding(6) var vis_next: texture_storage_2d<rgba16float, write>;
 
+// probe_trace.wgsl's frame uniform: this frame updates the probes whose index ≡ phase (mod
+// interval), the ones it traced. The pass copies the others over beforehand.
+struct ProbeTraceFrame {
+    frame_rotation: mat3x3<f32>,
+    inv_view:       mat4x4<f32>,
+    frame_index:    u32,
+    phase:          u32,
+    interval:       u32,
+}
+@group(0) @binding(7) var<uniform> frame: ProbeTraceFrame;
+
 fn octahedral_decode(uv: vec2<f32>) -> vec3<f32> {
     var f = uv * 2.0 - vec2f(1.0);
     var n = vec3f(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
@@ -166,7 +177,7 @@ fn relocate(base: u32, offset: vec3<f32>) -> vec3<f32> {
 fn update_irradiance(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tx          = gid.x;
     let ty          = gid.y;
-    let probe_index = gid.z;
+    let probe_index = gid.z * frame.interval + frame.phase;
 
     if probe_index >= probe_params.probe_count      { return; }
     let cell = probe_cell(probe_index);
@@ -208,7 +219,7 @@ fn update_irradiance(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn update_visibility(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tx          = gid.x;
     let ty          = gid.y;
-    let probe_index = gid.z;
+    let probe_index = gid.z * frame.interval + frame.phase;
 
     if probe_index >= probe_params.probe_count       { return; }
     let cell = probe_cell(probe_index);

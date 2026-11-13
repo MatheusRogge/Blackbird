@@ -159,11 +159,11 @@ pub(crate) struct LightingBindings {
     shadowed_buffer_id: ResourceId,
 
     layouts: Option<LightingLayouts>,
-    // Buffer-only bind groups never change. The shadow and probe groups are rebuilt when the
-    // shadow map or the active irradiance atlas view changes.
+    // Buffer-only bind groups never change. The shadow group is rebuilt when the shadow map
+    // changes, the probe group of each ping-pong side when that side's irradiance atlas view does.
     cluster_bg: Option<wgpu::BindGroup>,
     shadow_bg: Option<(usize, wgpu::BindGroup)>,
-    probe_bg: Option<(usize, wgpu::BindGroup)>,
+    probe_bg: [Option<(usize, wgpu::BindGroup)>; 2],
     debug_flags_bg: Option<wgpu::BindGroup>,
 }
 
@@ -205,7 +205,7 @@ impl LightingBindings {
             layouts: None,
             cluster_bg: None,
             shadow_bg: None,
-            probe_bg: None,
+            probe_bg: [None, None],
             debug_flags_bg: None,
         }
     }
@@ -386,7 +386,7 @@ impl LightingBindings {
         let atlas = self.current_atlas.load(Ordering::Relaxed);
         let irradiance = view(&self.irradiance_atlas_ids[atlas])?;
         let irradiance_ptr = irradiance as *const wgpu::TextureView as usize;
-        if self.probe_bg.as_ref().is_none_or(|(ptr, _)| *ptr != irradiance_ptr) {
+        if self.probe_bg[atlas].as_ref().is_none_or(|(ptr, _)| *ptr != irradiance_ptr) {
             let visibility = view(&self.visibility_atlas_ids[atlas])?;
             let params = buffer(&self.probe_params_id)?;
             let camera = buffer(&self.camera_buffer_id)?;
@@ -410,7 +410,7 @@ impl LightingBindings {
                     wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&reflection.sampler) },
                 ],
             });
-            self.probe_bg = Some((irradiance_ptr, bind_group));
+            self.probe_bg[atlas] = Some((irradiance_ptr, bind_group));
         }
 
         if self.debug_flags_bg.is_none() {
@@ -429,7 +429,7 @@ impl LightingBindings {
         Some([
             self.cluster_bg.as_ref()?,
             &self.shadow_bg.as_ref()?.1,
-            &self.probe_bg.as_ref()?.1,
+            &self.probe_bg[atlas].as_ref()?.1,
             self.debug_flags_bg.as_ref()?,
         ])
     }
