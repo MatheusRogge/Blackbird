@@ -34,14 +34,22 @@ pub struct GpuAreaLight {
     pub position_vs: [f32; 3],
     pub intensity: f32,
     pub right_vs: [f32; 3],
-    /// 1 = emits from both faces, 0 = only toward `right × up`.
-    pub two_sided: f32,
+    /// `AREA_TWO_SIDED` (else it emits only toward `right × up`) | `AREA_DIFFUSE_ONLY`.
+    pub flags: u32,
     pub up_vs: [f32; 3],
     /// Index into `ShadowedLights`, or `SHADOW_SLOT_NONE`.
     pub shadow_slot: u32,
     pub color: [f32; 3],
-    pub _pad2: f32,
+    /// Distance from the rectangle beyond which shading ignores it, fading it out over the last
+    /// quarter; `f32::MAX` for none.
+    pub range: f32,
 }
+
+pub const AREA_TWO_SIDED: u32 = 1;
+/// The light of an emissive mesh: the reflection passes already show the mesh itself, so an
+/// analytic highlight would count it twice. Diffuse light falls off with distance, so these lights
+/// also get a range.
+pub const AREA_DIFFUSE_ONLY: u32 = 2;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]

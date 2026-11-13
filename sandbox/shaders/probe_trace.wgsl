@@ -81,11 +81,11 @@ struct GpuAreaLight {
     position_vs: vec3<f32>,
     intensity:   f32,
     right_vs:    vec3<f32>,
-    two_sided:   f32,
+    flags:       u32,
     up_vs:       vec3<f32>,
     _pad1:       f32,
     color:       vec3<f32>,
-    _pad2:       f32,
+    range:       f32,
 }
 
 struct LightCounts {
@@ -456,14 +456,16 @@ fn shade_hit(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>, tri: BvhTri
             + u_dir * clamp(dot(rel, u_dir), -half_u, half_u);
         let to_light = closest - pos;
         let dist     = max(length(to_light), 1e-2);
+        if dist >= light.range { continue; }
         let L        = to_light / dist;
         let n_dot_l  = dot(normal, L);
         if n_dot_l <= 0.0 || bvh_trace(origin, L, dist - bias, true).hit { continue; }
 
         let area   = 4.0 * half_r * half_u;
         let c      = dot(-L, cross(r_dir, u_dir));
-        let facing = select(max(c, 0.0), abs(c), light.two_sided > 0.5);
-        radiance += brdf * light.color * (light.intensity * n_dot_l * facing * area / (dist * dist + area));
+        let facing = select(max(c, 0.0), abs(c), (light.flags & 1u) != 0u);
+        let fade   = saturate((light.range - dist) / (0.25 * light.range));
+        radiance += brdf * light.color * (light.intensity * n_dot_l * facing * area / (dist * dist + area) * fade * fade);
     }
 
     // Further bounces: the hit reflects what the probes gathered around it last update, so light

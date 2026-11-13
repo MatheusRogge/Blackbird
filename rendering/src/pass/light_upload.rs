@@ -11,7 +11,7 @@ use crate::{
     graph::{NodeId, RenderGraph},
     light::{
         emissive::{self, EmissiveRect, SharedEmissiveLights},
-        AreaLight, GpuAreaLight, GpuPointLight, GpuSkyLight, GpuSpotLight, LightCounts,
+        AREA_DIFFUSE_ONLY, AREA_TWO_SIDED, AreaLight, GpuAreaLight, GpuPointLight, GpuSkyLight, GpuSpotLight, LightCounts,
         MAX_AREA_LIGHTS, MAX_POINT_LIGHTS, MAX_SKY_LIGHTS, MAX_SPOT_LIGHTS, PointLight, SkyLight,
         SpotLight, SHADOW_KIND_AREA, SHADOW_KIND_POINT, SHADOW_KIND_SPOT, SHADOW_SLOT_NONE, ShadowedLights,
         SharedShadowCasters, SpotShadow,
@@ -27,6 +27,13 @@ const MIN_EMISSIVE_FLUX: f32 = 0.01;
 /// An area light's shadow range ends where its illuminance drops below this (lux), up to the max.
 const MIN_SHADOW_ILLUMINANCE: f32 = 1e-3;
 const MAX_AREA_SHADOW_RANGE: f32 = 50.0;
+
+/// Where an area light's illuminance (≈ L·A / d²) falls below `MIN_SHADOW_ILLUMINANCE`, for its
+/// shadow map and its shading alike.
+fn area_range(l: &AreaLight) -> f32 {
+    let area = 4.0 * l.right.mag() * l.up.mag();
+    (l.intensity * area / MIN_SHADOW_ILLUMINANCE).sqrt().clamp(1.0, MAX_AREA_SHADOW_RANGE)
+}
 /// How far in front of a one-sided area light its shadow map is centred.
 const AREA_SHADOW_OFFSET: f32 = 0.02;
 /// Spot lights up to this outer angle get one atlas tile instead of a cube.
@@ -238,6 +245,7 @@ impl Pass for LightUploadPass {
             let flags = self.debug_flags.read().expect("debug_flags poisoned");
             (flags.emissive_lights, flags.shadows)
         };
+        let scene_areas = areas.len();
         let mut emitters = HashSet::new();
         if emissive_lights {
             let free = MAX_AREA_LIGHTS - areas.len();
@@ -279,17 +287,20 @@ impl Pass for LightUploadPass {
             })
             .collect();
 
-        let to_gpu = |l: &AreaLight| GpuAreaLight {
-            position_vs: to_vs(l.position),
-            intensity: l.intensity,
-            right_vs: dir_to_vs(l.right),
-            two_sided: if l.two_sided { 1.0 } else { 0.0 },
-            up_vs: dir_to_vs(l.up),
-            shadow_slot: SHADOW_SLOT_NONE,
-            color: l.color.into(),
-            _pad2: 0.0,
+        let to_gpu = |(i, l): (usize, &AreaLight)| {
+            let emissive = i >= scene_areas;
+            GpuAreaLight {
+                position_vs: to_vs(l.position),
+                intensity: l.intensity,
+                right_vs: dir_to_vs(l.right),
+                flags: if l.two_sided { AREA_TWO_SIDED } else { 0 } | if emissive { AREA_DIFFUSE_ONLY } else { 0 },
+                up_vs: dir_to_vs(l.up),
+                shadow_slot: SHADOW_SLOT_NONE,
+                color: l.color.into(),
+                range: if emissive { area_range(l) } else { f32::MAX },
+            }
         };
-        let mut area_lights: Vec<GpuAreaLight> = areas.iter().map(to_gpu).collect();
+        let mut area_lights: Vec<GpuAreaLight> = areas.iter().enumerate().map(to_gpu).collect();
 
         // The lights most likely to matter on screen: flux over squared distance to the camera.
         let candidate = |kind: u32, i: usize, position: ultraviolet::Vec3, origin, range: f32, flux: f32, half_size, spot, front| {
@@ -324,8 +335,7 @@ impl Pass for LightUploadPass {
                 let sides = if l.two_sided { 2.0 } else { 1.0 };
                 let area = 4.0 * l.right.mag() * l.up.mag();
                 let flux = sides * std::f32::consts::PI * l.intensity * area;
-                // Where its illuminance (≈ L·A / d²) falls below MIN_SHADOW_ILLUMINANCE.
-                let range = (l.intensity * area / MIN_SHADOW_ILLUMINANCE).sqrt().clamp(1.0, MAX_AREA_SHADOW_RANGE);
+                let range = area_range(l);
                 // One-sided lights shadow from just in front, so their own emitter mesh isn't a caster.
                 let front = (!l.two_sided).then(|| l.right.cross(l.up).normalized());
                 let origin = l.position + front.unwrap_or_default() * AREA_SHADOW_OFFSET;

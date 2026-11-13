@@ -731,18 +731,30 @@ struct GpuAreaLight {
     position_vs: vec3<f32>,
     intensity: f32,
     right_vs: vec3<f32>,
-    two_sided: f32,
+    // AREA_TWO_SIDED | AREA_DIFFUSE_ONLY.
+    flags: u32,
     up_vs: vec3<f32>,
     // Index into `shadowed`, or SHADOW_SLOT_NONE.
     shadow_slot: u32,
     color: vec3<f32>,
-    _pad2: f32,
+    // Ignored beyond this distance from the rectangle (rendering::light::GpuAreaLight::range).
+    range: f32,
+}
+
+const AREA_TWO_SIDED: u32 = 1u;
+// An emissive mesh's light: the reflection passes show the mesh, so it gets no highlight.
+const AREA_DIFFUSE_ONLY: u32 = 2u;
+
+// Fades an area light out over the last quarter of its range.
+fn area_range_fade(dist2: f32, range: f32) -> f32 {
+    let w = saturate((range - sqrt(dist2)) / (0.25 * range));
+    return w * w;
 }
 
 // Cosine at an area light for light leaving along `dir`. One-sided lights are dark behind.
 fn area_facing(light: GpuAreaLight, dir: vec3<f32>, normal: vec3<f32>) -> f32 {
     let c = dot(dir, normal);
-    return select(max(c, 0.0), abs(c), light.two_sided > 0.5);
+    return select(max(c, 0.0), abs(c), (light.flags & AREA_TWO_SIDED) != 0u);
 }
 
 struct LightCounts {
@@ -1066,6 +1078,9 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
     // the falloff stays bounded as the surface approaches the light.
     for (var i = 0u; i < light_counts.num_area; i++) {
         let light = area_lights[i];
+        if (light.flags & AREA_DIFFUSE_ONLY) != 0u {
+            continue;
+        }
 
         let half_r = length(light.right_vs);
         let half_u = length(light.up_vs);
@@ -1076,7 +1091,7 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let u_dir = light.up_vs / half_u;
 
         let rel     = pos_vs - light.position_vs;
-        if light.two_sided <= 0.5 && dot(rel, normalize(cross(r_dir, u_dir))) <= 0.0 {
+        if (light.flags & AREA_TWO_SIDED) == 0u && dot(rel, normalize(cross(r_dir, u_dir))) <= 0.0 {
             continue;
         }
         let closest = light.position_vs
@@ -1115,6 +1130,39 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let spec_facing = area_facing(light, -L_spec, normal);
         color += specular_brdf(surf_vs, L_spec, spec_alpha) * radiance
             * (spec_facing * area / (spec_dist2 + area));
+    }
+
+    // Emissive meshes' lights: diffuse only, within their range. A loop of their own: dropping
+    // their specular inside the loop above, by branch or by a zero factor, made `lighting` 3.5 ms
+    // slower in the corridor.
+    for (var i = 0u; i < light_counts.num_area; i++) {
+        let light = area_lights[i];
+        if (light.flags & AREA_DIFFUSE_ONLY) == 0u {
+            continue;
+        }
+        let half_r = length(light.right_vs);
+        let half_u = length(light.up_vs);
+        let r_dir = light.right_vs / half_r;
+        let u_dir = light.up_vs / half_u;
+        let normal = normalize(cross(r_dir, u_dir));
+        let rel = pos_vs - light.position_vs;
+        if (light.flags & AREA_TWO_SIDED) == 0u && dot(rel, normal) <= 0.0 {
+            continue;
+        }
+        let closest = light.position_vs
+            + r_dir * clamp(dot(rel, r_dir), -half_r, half_r)
+            + u_dir * clamp(dot(rel, u_dir), -half_u, half_u);
+        let to_light = closest - pos_vs;
+        let dist2 = max(dot(to_light, to_light), 1e-4);
+        if dist2 >= light.range * light.range {
+            continue;
+        }
+        let L = to_light * inverseSqrt(dist2);
+        let area = 4.0 * half_r * half_u;
+        let radiance = light.color * (light.intensity * area_range_fade(dist2, light.range))
+            * local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
+                view_to_world_dir(L), sqrt(dist2), contact_glass);
+        color += diffuse_brdf(surf_vs, L) * radiance * (area_facing(light, -L, normal) * area / (dist2 + area));
     }
 
     for (var i = 0u; i < cp.num_sky_lights; i++) {
@@ -2149,13 +2197,14 @@ fn particle_direct(pos_vs: vec3<f32>, pos_ws: vec3<f32>, view_dir: vec3<f32>, pi
             + u_dir * clamp(dot(rel, u_dir), -half_u, half_u);
         let to_light = closest - pos_vs;
         let dist2 = max(dot(to_light, to_light), 1e-4);
+        if dist2 >= light.range * light.range { continue; }
         let L = to_light * inverseSqrt(dist2);
         let area = 4.0 * half_r * half_u;
         let facing = area_facing(light, -L, normalize(cross(r_dir, u_dir)));
         if facing <= 0.0 { continue; }
         let vis = particle_light_shadow(light.shadow_slot, pos_ws, rot * L);
-        color += light.color * vis
-            * (light.intensity * facing * area / (dist2 + area) * particle_phase(dot(-L, V_vs)));
+        color += light.color * vis * (light.intensity * facing * area / (dist2 + area)
+            * area_range_fade(dist2, light.range) * particle_phase(dot(-L, V_vs)));
     }
 
     for (var i = 0u; i < cp.num_sky_lights; i++) {
