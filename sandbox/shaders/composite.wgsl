@@ -98,7 +98,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // object borders or creases, while grazing floors still blur.
     let dims = vec2<f32>(textureDimensions(t_ssr));
     let radius = weight.a * BLUR_RADIUS_PX;
-    let rotation = interleaved_gradient_noise(in.pos.xy) * 6.28318531;
+    // One rotation per 4×4 block: neighbouring pixels then read neighbouring texels, where a
+    // rotation per pixel scattered every tap over the disc and the blur cost 3× as much.
+    let rotation = interleaved_gradient_noise(floor(in.pos.xy * 0.25)) * 6.28318531;
     let depth = load_depth(px);
     let gradient = depth_gradient(px, depth);
     var ssr = textureLoad(t_ssr, px, 0);
