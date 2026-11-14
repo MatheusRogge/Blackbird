@@ -34,6 +34,21 @@ fn area_range(l: &AreaLight) -> f32 {
     let area = 4.0 * l.right.mag() * l.up.mag();
     (l.intensity * area / MIN_SHADOW_ILLUMINANCE).sqrt().clamp(1.0, MAX_AREA_SHADOW_RANGE)
 }
+/// Exposed radiance of the faintest light tail kept: one 8-bit sRGB step above black after
+/// `present`'s ACES, whose slope there is ≈ 0.21.
+const MIN_VISIBLE_RADIANCE: f32 = 1.4e-3;
+/// The albedo `MIN_VISIBLE_RADIANCE` is reached on.
+const CULL_ALBEDO: f32 = 0.8;
+
+/// Where a point or spot light's diffuse illuminance on an albedo `CULL_ALBEDO` surface drops below
+/// `MIN_VISIBLE_RADIANCE` at this exposure, within its authored range. Only `probe_trace` uses it:
+/// its hits are diffuse. Direct lighting keeps the authored range, since a wet street's grazing
+/// highlights of lamps far down it stay visible well past that, and cutting them was where the
+/// clusters' gain came from (Osaka's middle distance lost its sheen).
+fn cull_range(intensity: f32, radius: f32, exposure: f32) -> f32 {
+    let min_illuminance = MIN_VISIBLE_RADIANCE * std::f32::consts::PI / (CULL_ALBEDO * exposure.max(1e-12));
+    (intensity / min_illuminance).sqrt().min(radius)
+}
 /// How far in front of a one-sided area light its shadow map is centred.
 const AREA_SHADOW_OFFSET: f32 = 0.02;
 /// Spot lights up to this outer angle get one atlas tile instead of a cube.
@@ -266,7 +281,8 @@ impl Pass for LightUploadPass {
                 intensity: l.intensity,
                 source_radius: l.source_radius,
                 shadow_slot: SHADOW_SLOT_NONE,
-                _pad: [0.0; 2],
+                cull_range: cull_range(l.intensity, l.radius, camera.exposure),
+                _pad: 0.0,
             })
             .collect();
 
@@ -283,7 +299,7 @@ impl Pass for LightUploadPass {
                 intensity: l.intensity,
                 source_radius: l.source_radius,
                 shadow_slot: SHADOW_SLOT_NONE,
-                _pad: 0.0,
+                cull_range: cull_range(l.intensity, l.radius, camera.exposure),
             })
             .collect();
 

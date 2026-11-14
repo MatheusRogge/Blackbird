@@ -57,9 +57,9 @@ struct GpuPointLight {
     color:         vec3<f32>,
     intensity:     f32,
     source_radius: f32,
-    _pad0:         f32,
-    _pad1:         f32,
-    _pad2:         f32,
+    shadow_slot:   u32,
+    cull_range:    f32,
+    _pad:          f32,
 }
 
 // Scalar padding: a trailing vec3 would be 16-aligned and break the 64-byte Rust layout.
@@ -72,8 +72,8 @@ struct GpuSpotLight {
     outer_cos:    f32,
     intensity:     f32,
     source_radius: f32,
-    _pad1:         f32,
-    _pad2:         f32,
+    shadow_slot:   u32,
+    cull_range:    f32,
 }
 
 // right_vs / up_vs are half-extent vectors of the rectangle. One-sided lights emit toward right × up.
@@ -282,6 +282,12 @@ fn range_attenuation(dist: f32, range: f32) -> f32 {
     return window * window / max(dist * dist, 1e-4);
 }
 
+// Fades a light out over the last quarter of its cull range, as in lighting.wgsl.
+fn range_fade(dist: f32, range: f32) -> f32 {
+    let w = saturate((range - dist) / (0.25 * range));
+    return w * w;
+}
+
 // Karis' analytic fit of the split-sum environment BRDF. Same as in lighting.wgsl.
 fn env_brdf_approx(f0: vec3<f32>, roughness: f32, n_dot_v: f32) -> vec3<f32> {
     let c0 = vec4f(-1.0, -0.0275, -0.572, 0.022);
@@ -420,24 +426,26 @@ fn shade_hit(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>, tri: BvhTri
         let light    = point_lights[i];
         let to_light = view_to_world(light.position_vs) - pos;
         let dist     = length(to_light);
-        if dist >= light.radius { continue; }
+        if dist >= light.cull_range { continue; }
         let L        = to_light / dist;
         let n_dot_l  = dot(normal, L);
         if n_dot_l <= 0.0 || bvh_trace(origin, L, dist - bias, true).hit { continue; }
-        radiance += brdf * light.color * (light.intensity * n_dot_l * range_attenuation(dist, light.radius));
+        radiance += brdf * light.color * (light.intensity * n_dot_l * range_attenuation(dist, light.radius)
+            * range_fade(dist, light.cull_range));
     }
 
     for (var i = 0u; i < light_counts.num_spot; i++) {
         let light    = spot_lights[i];
         let to_light = view_to_world(light.position_vs) - pos;
         let dist     = length(to_light);
-        if dist >= light.radius { continue; }
+        if dist >= light.cull_range { continue; }
         let L        = to_light / dist;
         let dir_ws   = normalize((frame.inv_view * vec4<f32>(light.direction_vs, 0.0)).xyz);
         let t        = clamp((dot(-L, dir_ws) - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
         let n_dot_l  = dot(normal, L);
         if t <= 0.0 || n_dot_l <= 0.0 || bvh_trace(origin, L, dist - bias, true).hit { continue; }
-        radiance += brdf * light.color * (light.intensity * n_dot_l * t * t * range_attenuation(dist, light.radius));
+        radiance += brdf * light.color * (light.intensity * n_dot_l * t * t * range_attenuation(dist, light.radius)
+            * range_fade(dist, light.cull_range));
     }
 
     // Representative point, as in lighting.wgsl: the closest point on the rectangle, scaled by its area.
@@ -464,8 +472,8 @@ fn shade_hit(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>, tri: BvhTri
         let area   = 4.0 * half_r * half_u;
         let c      = dot(-L, cross(r_dir, u_dir));
         let facing = select(max(c, 0.0), abs(c), (light.flags & 1u) != 0u);
-        let fade   = saturate((light.range - dist) / (0.25 * light.range));
-        radiance += brdf * light.color * (light.intensity * n_dot_l * facing * area / (dist * dist + area) * fade * fade);
+        radiance += brdf * light.color * (light.intensity * n_dot_l * facing * area / (dist * dist + area)
+            * range_fade(dist, light.range));
     }
 
     // Further bounces: the hit reflects what the probes gathered around it last update, so light

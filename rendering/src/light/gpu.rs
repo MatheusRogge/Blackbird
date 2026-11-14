@@ -9,7 +9,9 @@ pub struct GpuPointLight {
     pub source_radius: f32,
     /// Index into `ShadowedLights`, or `SHADOW_SLOT_NONE`.
     pub shadow_slot: u32,
-    pub _pad: [f32; 2],
+    /// `light_upload::cull_range`: GI (`probe_trace`) ignores the light past it.
+    pub cull_range: f32,
+    pub _pad: f32,
 }
 
 #[repr(C)]
@@ -25,7 +27,8 @@ pub struct GpuSpotLight {
     pub source_radius: f32,
     /// Index into `ShadowedLights`, or `SHADOW_SLOT_NONE`.
     pub shadow_slot: u32,
-    pub _pad: f32,
+    /// As `GpuPointLight::cull_range`.
+    pub cull_range: f32,
 }
 
 #[repr(C)]
