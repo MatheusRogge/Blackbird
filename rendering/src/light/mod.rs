@@ -6,7 +6,7 @@ pub mod virtual_shadow;
 
 pub use entity::{AreaLight, PointLight, SkyLight, SpotLight};
 pub use gpu::{
-    AREA_DIFFUSE_ONLY, AREA_TWO_SIDED, GpuAreaLight, GpuPointLight, GpuSkyLight, GpuSpotLight, LightCounts, MAX_SHADOWED_LIGHTS, SHADOW_KIND_AREA, SHADOW_KIND_POINT,
+    AREA_EMISSIVE, AREA_TWO_SIDED, GpuAreaLight, GpuPointLight, GpuSkyLight, GpuSpotLight, LightCounts, MAX_SHADOWED_LIGHTS, SHADOW_KIND_AREA, SHADOW_KIND_POINT,
     SHADOW_KIND_SPOT, SHADOW_MASK_LAYERS, SHADOW_SLOT_NONE, ShadowCaster, ShadowedLights, SharedShadowCasters, SpotShadow,
 };
 

@@ -37,7 +37,7 @@ pub struct GpuAreaLight {
     pub position_vs: [f32; 3],
     pub intensity: f32,
     pub right_vs: [f32; 3],
-    /// `AREA_TWO_SIDED` (else it emits only toward `right × up`) | `AREA_DIFFUSE_ONLY`.
+    /// `AREA_TWO_SIDED` (else it emits only toward `right × up`) | `AREA_EMISSIVE`.
     pub flags: u32,
     pub up_vs: [f32; 3],
     /// Index into `ShadowedLights`, or `SHADOW_SLOT_NONE`.
@@ -49,10 +49,9 @@ pub struct GpuAreaLight {
 }
 
 pub const AREA_TWO_SIDED: u32 = 1;
-/// The light of an emissive mesh: the reflection passes already show the mesh itself, so an
-/// analytic highlight would count it twice. Diffuse light falls off with distance, so these lights
-/// also get a range.
-pub const AREA_DIFFUSE_ONLY: u32 = 2;
+/// The light of an emissive mesh. These get a range: unranged, their highlights washed over the
+/// reflections of Osaka's signs, which the reflection passes already show.
+pub const AREA_EMISSIVE: u32 = 2;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]

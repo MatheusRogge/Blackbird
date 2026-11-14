@@ -11,7 +11,7 @@ use crate::{
     graph::{NodeId, RenderGraph},
     light::{
         emissive::{self, EmissiveRect, SharedEmissiveLights},
-        AREA_DIFFUSE_ONLY, AREA_TWO_SIDED, AreaLight, GpuAreaLight, GpuPointLight, GpuSkyLight, GpuSpotLight, LightCounts,
+        AREA_EMISSIVE, AREA_TWO_SIDED, AreaLight, GpuAreaLight, GpuPointLight, GpuSkyLight, GpuSpotLight, LightCounts,
         MAX_AREA_LIGHTS, MAX_POINT_LIGHTS, MAX_SKY_LIGHTS, MAX_SPOT_LIGHTS, PointLight, SkyLight,
         SpotLight, SHADOW_KIND_AREA, SHADOW_KIND_POINT, SHADOW_KIND_SPOT, SHADOW_SLOT_NONE, ShadowedLights,
         SharedShadowCasters, SpotShadow,
@@ -309,7 +309,7 @@ impl Pass for LightUploadPass {
                 position_vs: to_vs(l.position),
                 intensity: l.intensity,
                 right_vs: dir_to_vs(l.right),
-                flags: if l.two_sided { AREA_TWO_SIDED } else { 0 } | if emissive { AREA_DIFFUSE_ONLY } else { 0 },
+                flags: if l.two_sided { AREA_TWO_SIDED } else { 0 } | if emissive { AREA_EMISSIVE } else { 0 },
                 up_vs: dir_to_vs(l.up),
                 shadow_slot: SHADOW_SLOT_NONE,
                 color: l.color.into(),
