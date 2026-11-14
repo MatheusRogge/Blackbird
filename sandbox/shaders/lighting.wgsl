@@ -397,13 +397,21 @@ const SHADOW_MASK_LAYERS: u32 = 4u;
 // only, so forward shading always looks shadows up itself).
 var<private> mask_vis: array<vec3<f32>, 4>;
 var<private> mask_ready: bool = false;
+// Set by the reflection probe capture (`shade_probe`).
+var<private> probe_shading: bool = false;
 
 // Shadow map and contact visibility of a local light (`slot`, toward `L_ws` over `max_length`).
 // In the deferred pass by the slot's tier (rendering::light::ShadowedLights): from the shadow mask,
 // or past it without contact shadows and with a small PCF kernel or one tap (PCSS and the contact
-// march were ~70 % and ~25 % of `lighting` with 24 shadowed lights). Elsewhere looked up here in
-// full. `shadow_N` offsets the shadow map lookup, `geo_N` starts the contact march.
+// march were ~70 % and ~25 % of `lighting` with 24 shadowed lights). The reflection probe capture
+// takes one tap for every light: the cube is prefiltered and mostly seen blurred or behind SSR, so
+// full PCSS there (Osaka 5.9 / 14.1 ms mean / max) looked the same as this (2.0 / 5.3).
+// Elsewhere looked up here in full. `shadow_N` offsets the shadow map lookup, `geo_N` starts the
+// contact march.
 fn local_visibility(slot: u32, pos_ws: vec3<f32>, shadow_N: vec3<f32>, pixel: vec2<f32>, geo_N: vec3<f32>, L_ws: vec3<f32>, max_length: f32, contact_glass: bool) -> vec3<f32> {
+    if probe_shading && slot != SHADOW_SLOT_NONE {
+        return light_shadow_tap(slot, pos_ws, L_ws);
+    }
     if mask_ready && slot != SHADOW_SLOT_NONE {
         let tier = shadowed.tier[slot / 4u][slot % 4u];
         if tier < SHADOW_MASK_LAYERS {
@@ -1981,6 +1989,7 @@ fn shade_probe(in: ForwardVertex, front_facing: bool, m: Model, base: vec4<f32>)
     let surf_vs = Surface(normalize(N * rot), normalize(view_dir * rot), diffuse_color, f0, alpha, transmission);
     let surf_ws = Surface(N, view_dir, diffuse_color, f0, alpha, transmission);
 
+    probe_shading = true;
     var color = emissive;
     if debug.disable_direct == 0u {
         color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, -pos_vs.z, true, vec3f(0.0), false);
