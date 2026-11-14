@@ -395,6 +395,83 @@ fn probe_irradiance(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>) -> v
     return irradiance / max(weight_total, 1e-5);
 }
 
+const PROBE_LIGHT_SAMPLES: u32 = 2u;
+
+fn luminance(c: vec3<f32>) -> f32 {
+    return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+struct LocalLight {
+    // Unshadowed light at the hit (× brdf = the radiance it adds); zero when it can't reach it.
+    radiance: vec3<f32>,
+    L: vec3<f32>,
+    dist: f32,
+}
+
+// Local light `j`, counting the point lights, then the spots, then the area lights.
+fn local_light(j: u32, pos: vec3<f32>, normal: vec3<f32>) -> LocalLight {
+    var out: LocalLight;
+    out.radiance = vec3f(0.0);
+    out.L = normal;
+    out.dist = 1.0;
+    if j < light_counts.num_point {
+        let light    = point_lights[j];
+        let to_light = view_to_world(light.position_vs) - pos;
+        let dist     = length(to_light);
+        if dist >= light.cull_range { return out; }
+        let L        = to_light / dist;
+        let n_dot_l  = dot(normal, L);
+        if n_dot_l <= 0.0 { return out; }
+        out.L = L;
+        out.dist = dist;
+        out.radiance = light.color * (light.intensity * n_dot_l * range_attenuation(dist, light.radius)
+            * range_fade(dist, light.cull_range));
+        return out;
+    }
+    if j < light_counts.num_point + light_counts.num_spot {
+        let light    = spot_lights[j - light_counts.num_point];
+        let to_light = view_to_world(light.position_vs) - pos;
+        let dist     = length(to_light);
+        if dist >= light.cull_range { return out; }
+        let L        = to_light / dist;
+        let dir_ws   = normalize((frame.inv_view * vec4<f32>(light.direction_vs, 0.0)).xyz);
+        let t        = clamp((dot(-L, dir_ws) - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
+        let n_dot_l  = dot(normal, L);
+        if t <= 0.0 || n_dot_l <= 0.0 { return out; }
+        out.L = L;
+        out.dist = dist;
+        out.radiance = light.color * (light.intensity * n_dot_l * t * t * range_attenuation(dist, light.radius)
+            * range_fade(dist, light.cull_range));
+        return out;
+    }
+    // Representative point, as in lighting.wgsl: the closest point on the rectangle, scaled by its area.
+    let light  = area_lights[j - light_counts.num_point - light_counts.num_spot];
+    let half_r = length(light.right_vs);
+    let half_u = length(light.up_vs);
+    if half_r <= 0.0 || half_u <= 0.0 { return out; }
+    let center = view_to_world(light.position_vs);
+    let r_dir  = (frame.inv_view * vec4<f32>(light.right_vs / half_r, 0.0)).xyz;
+    let u_dir  = (frame.inv_view * vec4<f32>(light.up_vs / half_u, 0.0)).xyz;
+    let rel     = pos - center;
+    let closest = center
+        + r_dir * clamp(dot(rel, r_dir), -half_r, half_r)
+        + u_dir * clamp(dot(rel, u_dir), -half_u, half_u);
+    let to_light = closest - pos;
+    let dist     = max(length(to_light), 1e-2);
+    if dist >= light.range { return out; }
+    let L        = to_light / dist;
+    let n_dot_l  = dot(normal, L);
+    if n_dot_l <= 0.0 { return out; }
+    let area   = 4.0 * half_r * half_u;
+    let c      = dot(-L, cross(r_dir, u_dir));
+    let facing = select(max(c, 0.0), abs(c), (light.flags & 1u) != 0u);
+    out.L = L;
+    out.dist = dist;
+    out.radiance = light.color * (light.intensity * n_dot_l * facing * area / (dist * dist + area)
+        * range_fade(dist, light.range));
+    return out;
+}
+
 // Radiance leaving the hit toward the probe. The specular part uses the reflectance seen from
 // the probe but is spread like diffuse: tracing the real lobe would make glossy floors flicker
 // through the probes, and the probes only store irradiance anyway.
@@ -422,58 +499,43 @@ fn shade_hit(pos: vec3<f32>, normal: vec3<f32>, to_probe: vec3<f32>, tri: BvhTri
         radiance += brdf * sky_lights[i].color * sky_lights[i].intensity * n_dot_l;
     }
 
-    for (var i = 0u; i < light_counts.num_point; i++) {
-        let light    = point_lights[i];
-        let to_light = view_to_world(light.position_vs) - pos;
-        let dist     = length(to_light);
-        if dist >= light.cull_range { continue; }
-        let L        = to_light / dist;
-        let n_dot_l  = dot(normal, L);
-        if n_dot_l <= 0.0 || bvh_trace(origin, L, dist - bias, true).hit { continue; }
-        radiance += brdf * light.color * (light.intensity * n_dot_l * range_attenuation(dist, light.radius)
-            * range_fade(dist, light.cull_range));
+    let num_local = light_counts.num_point + light_counts.num_spot + light_counts.num_area;
+    var total = 0.0;
+    var contributing = 0u;
+    for (var j = 0u; j < num_local; j++) {
+        let w = luminance(local_light(j, pos, normal).radiance);
+        total += w;
+        contributing += select(0u, 1u, w > 0.0);
     }
-
-    for (var i = 0u; i < light_counts.num_spot; i++) {
-        let light    = spot_lights[i];
-        let to_light = view_to_world(light.position_vs) - pos;
-        let dist     = length(to_light);
-        if dist >= light.cull_range { continue; }
-        let L        = to_light / dist;
-        let dir_ws   = normalize((frame.inv_view * vec4<f32>(light.direction_vs, 0.0)).xyz);
-        let t        = clamp((dot(-L, dir_ws) - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
-        let n_dot_l  = dot(normal, L);
-        if t <= 0.0 || n_dot_l <= 0.0 || bvh_trace(origin, L, dist - bias, true).hit { continue; }
-        radiance += brdf * light.color * (light.intensity * n_dot_l * t * t * range_attenuation(dist, light.radius)
-            * range_fade(dist, light.cull_range));
-    }
-
-    // Representative point, as in lighting.wgsl: the closest point on the rectangle, scaled by its area.
-    for (var i = 0u; i < light_counts.num_area; i++) {
-        let light  = area_lights[i];
-        let half_r = length(light.right_vs);
-        let half_u = length(light.up_vs);
-        if half_r <= 0.0 || half_u <= 0.0 { continue; }
-        let center = view_to_world(light.position_vs);
-        let r_dir  = (frame.inv_view * vec4<f32>(light.right_vs / half_r, 0.0)).xyz;
-        let u_dir  = (frame.inv_view * vec4<f32>(light.up_vs / half_u, 0.0)).xyz;
-
-        let rel     = pos - center;
-        let closest = center
-            + r_dir * clamp(dot(rel, r_dir), -half_r, half_r)
-            + u_dir * clamp(dot(rel, u_dir), -half_u, half_u);
-        let to_light = closest - pos;
-        let dist     = max(length(to_light), 1e-2);
-        if dist >= light.range { continue; }
-        let L        = to_light / dist;
-        let n_dot_l  = dot(normal, L);
-        if n_dot_l <= 0.0 || bvh_trace(origin, L, dist - bias, true).hit { continue; }
-
-        let area   = 4.0 * half_r * half_u;
-        let c      = dot(-L, cross(r_dir, u_dir));
-        let facing = select(max(c, 0.0), abs(c), (light.flags & 1u) != 0u);
-        radiance += brdf * light.color * (light.intensity * n_dot_l * facing * area / (dist * dist + area)
-            * range_fade(dist, light.range));
+    if contributing <= PROBE_LIGHT_SAMPLES {
+        for (var j = 0u; j < num_local; j++) {
+            let l = local_light(j, pos, normal);
+            if luminance(l.radiance) > 0.0 && !bvh_trace(origin, l.L, l.dist - bias, true).hit {
+                radiance += brdf * l.radiance;
+            }
+        }
+    } else {
+        // Systematic sampling over the lights' unshadowed contributions: PROBE_LIGHT_SAMPLES evenly
+        // spaced thresholds on their running sum, so a light holding 1/PROBE_LIGHT_SAMPLES of the
+        // total is always picked and only the picked ones trace a shadow ray. Each pick is weighted
+        // by 1 / its expected pick count; the probes' temporal blend averages the rest.
+        let step = total / f32(PROBE_LIGHT_SAMPLES);
+        var next = next_random() * step;
+        var running = 0.0;
+        for (var j = 0u; j < num_local && next < total; j++) {
+            let l = local_light(j, pos, normal);
+            let w = luminance(l.radiance);
+            if w <= 0.0 { continue; }
+            running += w;
+            var picks = 0u;
+            while next < running && picks < PROBE_LIGHT_SAMPLES {
+                picks++;
+                next += step;
+            }
+            if picks > 0u && !bvh_trace(origin, l.L, l.dist - bias, true).hit {
+                radiance += brdf * l.radiance * (f32(picks) * step / w);
+            }
+        }
     }
 
     // Further bounces: the hit reflects what the probes gathered around it last update, so light
