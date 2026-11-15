@@ -42,11 +42,18 @@ impl Aabb {
         ]
     }
 
+    /// The bounds of this box under the affine `transform` (Arvo's method: the centre moves, the
+    /// half extent goes through the transform's absolute values).
     pub fn transformed(&self, transform: Mat4) -> Self {
         if self.is_empty() {
             return *self;
         }
-        Self::from_points(self.corners().map(|c| transform.transform_point3(c)))
+        let center = (self.min + self.max) * 0.5;
+        let half = (self.max - self.min) * 0.5;
+        let c = transform.cols;
+        let moved = c[3].truncated() + c[0].truncated() * center.x + c[1].truncated() * center.y + c[2].truncated() * center.z;
+        let reach = c[0].truncated().abs() * half.x + c[1].truncated().abs() * half.y + c[2].truncated().abs() * half.z;
+        Self { min: moved - reach, max: moved + reach }
     }
 
     /// Whether the box is entirely outside one plane of the clip volume `clip_from_local` maps it
@@ -127,5 +134,17 @@ mod tests {
             assert_eq!(frustum.excludes(&b), b.outside_clip(clip), "box {b:?}");
         }
         assert!(frustum.excludes(&Aabb::empty()));
+    }
+
+    #[test]
+    fn transformed_bounds_are_the_transformed_corners_bounds() {
+        let transform = Mat4::from_translation(Vec3::new(3.0, -1.0, 7.0))
+            * Mat4::from_euler_angles(0.3, -1.1, 2.0)
+            * Mat4::from_nonuniform_scale(Vec3::new(2.0, 0.5, -1.5));
+        let b = Aabb { min: Vec3::new(-1.0, 0.0, 2.0), max: Vec3::new(0.5, 3.0, 2.5) };
+        let expected = Aabb::from_points(b.corners().map(|c| transform.transform_point3(c)));
+        let got = b.transformed(transform);
+        assert!((got.min - expected.min).mag() < 1e-4 && (got.max - expected.max).mag() < 1e-4, "{got:?} vs {expected:?}");
+        assert!(Aabb::empty().transformed(transform).is_empty());
     }
 }

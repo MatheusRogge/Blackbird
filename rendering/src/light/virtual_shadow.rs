@@ -55,6 +55,23 @@ pub const fn mip_offset(mip: u32) -> u32 {
     offset
 }
 
+/// Calls `f` with the index of every set bit of `mask`.
+fn for_each_bit(mask: &[u32], mut f: impl FnMut(u32)) {
+    for (word, &bits) in mask.iter().enumerate() {
+        let mut bits = bits;
+        while bits != 0 {
+            f((word * 32) as u32 + bits.trailing_zeros());
+            bits &= bits - 1;
+        }
+    }
+}
+
+/// The mip of the virtual page at `index` (`PageKey::index`).
+fn mip_of(index: u32) -> u32 {
+    let rest = index % PAGES_PER_FACE;
+    (1..MIPS).take_while(|&mip| rest >= mip_offset(mip)).count() as u32
+}
+
 /// One virtual page: `slot * 6 + face` its face, `x` / `y` its page within `mip`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PageKey {
@@ -215,26 +232,48 @@ impl VirtualShadows {
     /// pool is full. Requests the pool can't serve stay unbacked; lookups fall back to coarser
     /// pages.
     pub fn request(&mut self, mask: &[u32], frame: u64) {
-        let mut missing = Vec::new();
-        for (word, &bits) in mask.iter().enumerate() {
-            let mut bits = bits;
-            while bits != 0 {
-                let index = (word * 32) as u32 + bits.trailing_zeros();
-                bits &= bits - 1;
-                if index as usize >= TABLE_LEN || !self.face_enabled(index / PAGES_PER_FACE) {
-                    continue;
-                }
-                match self.resident[index as usize] {
-                    NOT_RESIDENT => missing.push(index),
-                    page => self.pages[page as usize].last_requested = frame,
-                }
+        let mut missing = false;
+        for_each_bit(mask, |index| {
+            if index as usize >= TABLE_LEN || !self.face_enabled(index / PAGES_PER_FACE) {
+                return;
             }
+            match self.resident[index as usize] {
+                NOT_RESIDENT => missing = true,
+                page => self.pages[page as usize].last_requested = frame,
+            }
+        });
+        let mut victims: Vec<u16> = (0..POOL_PAGES as u16)
+            .filter(|&page| {
+                let p = &self.pages[page as usize];
+                p.owner.is_some() && !p.pinned && p.last_requested < frame
+            })
+            .collect();
+        // With a full pool, far more pages are asked for than can ever be served (the corridor
+        // with 24 lights: ~17 000 a frame); sorting them all was most of the pass's CPU time.
+        if !missing || self.free.is_empty() && victims.is_empty() {
+            return;
         }
-        missing.sort_by_key(|&i| std::cmp::Reverse(PageKey::from_index(i).mip));
-        for index in missing {
-            if self.allocate(index, frame, false).is_none() {
-                break;
+        let mut by_mip: [Vec<u32>; MIPS as usize] = Default::default();
+        for_each_bit(mask, |index| {
+            if (index as usize) < TABLE_LEN
+                && self.face_enabled(index / PAGES_PER_FACE)
+                && self.resident[index as usize] == NOT_RESIDENT
+            {
+                by_mip[mip_of(index) as usize].push(index);
             }
+        });
+        victims.sort_by_key(|&page| self.pages[page as usize].last_requested);
+        let mut victims = victims.into_iter();
+        for &index in by_mip.iter().rev().flatten() {
+            let page = match self.free.pop() {
+                Some(page) => page,
+                None => {
+                    let Some(victim) = victims.next() else { break };
+                    self.evict(victim);
+                    self.free.pop().expect("an evicted page is free")
+                }
+            };
+            self.assign(page, index, frame, false);
         }
     }
 
@@ -299,9 +338,13 @@ impl VirtualShadows {
                 self.free.pop()?
             }
         };
+        self.assign(page, index, frame, pinned);
+        Some(page)
+    }
+
+    fn assign(&mut self, page: u16, index: u32, frame: u64, pinned: bool) {
         self.pages[page as usize] = Physical { owner: Some(index), last_requested: frame, rendered: false, rendered_frame: 0, pinned };
         self.resident[index as usize] = page;
-        Some(page)
     }
 
     fn evict(&mut self, page: u16) {
@@ -352,6 +395,7 @@ mod tests {
             PageKey::whole(42),
         ] {
             assert_eq!(PageKey::from_index(key.index()), key);
+            assert_eq!(mip_of(key.index()), key.mip);
         }
         assert_eq!(PageKey::whole(0).index(), PAGES_PER_FACE - 1);
     }

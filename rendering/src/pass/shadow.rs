@@ -1,6 +1,5 @@
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 
 use bytemuck::{Pod, Zeroable};
 use engine_core::{
@@ -277,8 +276,8 @@ pub struct ShadowPass {
     clear_tint_pipeline: Option<wgpu::RenderPipeline>,
     /// What each slot's pages are rendered for.
     rendered: [Option<ShadowCaster>; MAX_SHADOWED_LIGHTS],
-    /// Every caster's `Caster::identity` and world bounds last frame, to find what moved.
-    last_casters: HashMap<EntityKey, (u64, Aabb)>,
+    /// Every caster's transform and world bounds last frame, to find what moved.
+    last_casters: HashMap<EntityKey, (Mat4, Aabb)>,
     last_generation: u64,
     frame: u64,
     local_params: LocalShadowParams,
@@ -458,11 +457,11 @@ impl ShadowPass {
         let mut casters_now = HashMap::with_capacity(self.last_casters.len());
         for caster in opaque.iter().chain(masked).chain(glass) {
             match self.last_casters.remove(&caster.id) {
-                Some((identity, _)) if identity == caster.identity => {}
+                Some((transform, _)) if transform == caster.transform => {}
                 Some((_, old)) => moved.push(old.union(&caster.bounds)),
                 None => moved.push(caster.bounds),
             }
-            casters_now.insert(caster.id, (caster.identity, caster.bounds));
+            casters_now.insert(caster.id, (caster.transform, caster.bounds));
         }
         moved.extend(self.last_casters.values().map(|&(_, old)| old));
         self.last_casters = casters_now;
@@ -732,24 +731,18 @@ struct Caster<'d> {
     draw: &'d MeshDraw,
     /// The albedo texture (`albedo_key`) for masked meshes and glass, 0 for opaque ones.
     key: u64,
-    /// Hash of the mesh's id and transform: a change means it moved.
-    identity: u64,
+    transform: Mat4,
 }
 
 impl<'d> Caster<'d> {
     fn new(handle: &EntityHandle<'_, Mesh>, geometry: &'d GeometryArena, textured: bool) -> Option<Self> {
         let draw = geometry.get(handle.id)?;
-        let mut hasher = std::hash::DefaultHasher::new();
-        handle.id.hash(&mut hasher);
-        for value in handle.entity.transform.as_array() {
-            value.to_bits().hash(&mut hasher);
-        }
         Some(Self {
             id: handle.id,
             bounds: draw.bounds.transformed(handle.entity.transform),
             draw,
             key: if textured { albedo_key(handle.entity) } else { 0 },
-            identity: hasher.finish(),
+            transform: handle.entity.transform,
         })
     }
 }
