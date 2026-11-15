@@ -414,6 +414,24 @@ impl GltfScene {
     pub fn pose(&mut self, world: &mut World, index: usize, time: f32) {
         let Some(playing) = self.clips.get(index) else { return };
         let samples: Vec<(Target, Value)> = playing.clip.sample(time).map(|(t, v)| (*t, v)).collect();
+        self.apply_samples(world, samples);
+    }
+
+    /// Applies every clip as if all had started together `elapsed` seconds ago, each wrapping or
+    /// holding at its end at its own speed, without touching any clip's playback.
+    pub fn pose_all(&mut self, world: &mut World, elapsed: f32) {
+        let samples: Vec<(Target, Value)> = self
+            .clips
+            .iter()
+            .flat_map(|playing| {
+                let time = playing.clip.local_time(elapsed * playing.playback.speed);
+                playing.clip.sample(time).map(|(t, v)| (*t, v))
+            })
+            .collect();
+        self.apply_samples(world, samples);
+    }
+
+    fn apply_samples(&mut self, world: &mut World, samples: Vec<(Target, Value)>) {
         let mut moved = false;
         for (target, value) in samples {
             moved |= self.apply(world, target, value);
@@ -466,16 +484,7 @@ impl GltfScene {
                 samples.extend(playing.clip.sample(time).map(|(target, value)| (*target, value)));
             }
         }
-        if samples.is_empty() {
-            return;
-        }
-        let mut moved = false;
-        for (target, value) in samples {
-            moved |= self.apply(world, target, value);
-        }
-        if moved {
-            self.update_transforms(world, &HashSet::new());
-        }
+        self.apply_samples(world, samples);
     }
 
     /// Writes one sampled value, first remembering what it replaces (`reset_animation`). Returns
@@ -755,6 +764,35 @@ mod tests {
         scene.reset_animation(&mut world);
         let camera = world.get_entities::<Camera>()[0];
         assert_eq!((camera.eye.z, camera.fovy), (0.0, 1.0));
+    }
+
+    #[test]
+    fn pose_all_plays_every_clip_from_one_start() {
+        let json = r#"{
+            "asset": { "version": "2.0" },
+            "cameras": [{ "type": "perspective", "perspective": { "yfov": 1.0, "znear": 0.1 } }],
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "camera": 0 }],
+            "extras": { "blackbird_animations": [
+                { "name": "Dolly", "autoplay": false, "speed": 2.0, "tracks": [{ "pointer": "/nodes/0/translation",
+                    "keys": [{ "time": 0.0, "value": [0, 0, 0] }, { "time": 2.0, "value": [0, 0, -4] }] }] },
+                { "name": "Zoom", "autoplay": false, "loop": false, "tracks": [{ "pointer": "/cameras/0/perspective/yfov",
+                    "keys": [{ "time": 0.0, "value": 1.0 }, { "time": 2.0, "value": 0.5 }] }] }] }
+        }"#;
+        let (document, buffers, images) = gltf::import_slice(json.as_bytes()).expect("valid glTF");
+        let mut scene = GltfScene::new(std::sync::Arc::new(crate::GLTFAsset { document, buffers, images }));
+        let mut world = World::default();
+        while scene.load_batch(&mut world, 10) {}
+
+        // Dolly at twice the speed has wrapped to 1 s; Zoom is at 1.5 s, then holds at its end.
+        scene.pose_all(&mut world, 1.5);
+        let camera = world.get_entities::<Camera>()[0];
+        assert!((camera.eye.z + 2.0).abs() < 1e-5);
+        assert!((camera.fovy - 0.625).abs() < 1e-5);
+        scene.pose_all(&mut world, 3.0);
+        assert!((world.get_entities::<Camera>()[0].fovy - 0.5).abs() < 1e-5);
+        assert!(scene.clips().iter().all(|c| c.playback.elapsed == 0.0), "posing doesn't advance playback");
     }
 
     /// A glTF animation moving node 0 from the origin to y = 2 over a second.

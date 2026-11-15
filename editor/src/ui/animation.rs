@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use engine_core::animation::{Curve, Interpolation, Key, Value};
 
-use crate::animation::{self, EditorClip, EditorTarget, components};
+use crate::animation::{self, EditorClip, EditorTarget, PlayAll, components};
 use crate::state::EditorState;
 use engine::gltf::animation::Target;
 
@@ -80,6 +80,9 @@ fn draw_header(ui: &mut Ui, state: &mut EditorState) {
             state.clips.push(EditorClip::new(name));
             select_clip(state, Some(state.clips.len() - 1));
         }
+        if !state.clips.is_empty() {
+            draw_play_all(ui, state);
+        }
         let Some(index) = state.timeline.clip.filter(|&c| c < state.clips.len()) else { return };
 
         ui.separator();
@@ -88,14 +91,19 @@ fn draw_header(ui: &mut Ui, state: &mut EditorState) {
         if ui.button(play).on_hover_text("Play / pause (previews in the viewport)").clicked() {
             timeline.playing = !timeline.playing;
             timeline.preview = true;
+            timeline.all = None;
         }
         if ui.button("⏹").on_hover_text("Stop: back to the start, preview off").clicked() {
             timeline.playing = false;
             timeline.time = 0.0;
             timeline.preview = false;
         }
-        ui.toggle_value(&mut timeline.preview, "👁 Preview")
-            .on_hover_text("Show the clip at the playhead in the viewport. Off shows the scene as edited.");
+        if ui.toggle_value(&mut timeline.preview, "👁 Preview")
+            .on_hover_text("Show the clip at the playhead in the viewport. Off shows the scene as edited.")
+            .changed()
+        {
+            timeline.all = None;
+        }
         let duration = state.clips[index].duration();
         ui.add(egui::DragValue::new(&mut state.timeline.time).speed(0.01).range(0.0..=duration.max(0.0)).suffix(" s"));
         ui.label(egui::RichText::new(format!("/ {duration:.2} s")).weak());
@@ -122,6 +130,28 @@ fn draw_header(ui: &mut Ui, state: &mut EditorState) {
             select_clip(state, next);
         }
     });
+}
+
+/// Play / pause / stop for every clip at once, from the same start.
+fn draw_play_all(ui: &mut Ui, state: &mut EditorState) {
+    let timeline = &mut state.timeline;
+    let playing = timeline.all.is_some_and(|a| a.playing);
+    let label = if playing { "⏸ All" } else { "▶ All" };
+    let hover = "Play every clip at once from the start, each at its own speed and looping as set, as the game plays them";
+    if ui.button(label).on_hover_text(hover).clicked() {
+        let all = timeline.all.get_or_insert_with(PlayAll::default);
+        all.playing = !playing;
+        timeline.playing = false;
+        timeline.preview = false;
+    }
+    if let Some(all) = &mut timeline.all {
+        if ui.button("⏹ All").on_hover_text("Stop every clip: the viewport shows the scene as edited").clicked() {
+            timeline.all = None;
+        } else {
+            ui.add(egui::DragValue::new(&mut all.time).speed(0.01).range(0.0..=f32::MAX).suffix(" s"))
+                .on_hover_text("Seconds since every clip started");
+        }
+    }
 }
 
 fn select_clip(state: &mut EditorState, clip: Option<usize>) {
@@ -446,6 +476,7 @@ fn draw_curves(ui: &mut Ui, state: &mut EditorState, clip_index: usize) {
         state.timeline.time = view.time_at(pointer.x).min(clip.duration().max(0.0));
         state.timeline.preview = true;
         state.timeline.playing = false;
+        state.timeline.all = None;
     }
 
     // Every track's keys, faintly, so the timing of the whole clip is visible.

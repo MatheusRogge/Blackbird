@@ -98,16 +98,26 @@ pub struct Timeline {
     pub playing: bool,
     /// The viewport shows the clip at `time`. Turned on by playing or scrubbing.
     pub preview: bool,
+    /// Every clip previewing together instead, as the game plays them. Takes over from `preview`.
+    pub all: Option<PlayAll>,
     /// The curve view's time and (shown) value ranges; `None` fits the clip / the track.
     pub view_time: Option<(f32, f32)>,
     pub view_values: Option<(f32, f32)>,
+}
+
+/// Seconds since every clip started together, each at its own speed and wrapping or holding at
+/// its end.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlayAll {
+    pub time: f32,
+    pub playing: bool,
 }
 
 impl Timeline {
     /// Drops selections that no longer exist (after undo or a load).
     pub fn clamp(&mut self, clips: &[EditorClip]) {
         let Some(clip) = self.clip.and_then(|c| clips.get(c)) else {
-            *self = Self { show: self.show, ..Self::default() };
+            *self = Self { show: self.show, all: self.all.filter(|_| !clips.is_empty()), ..Self::default() };
             return;
         };
         let Some(track) = self.track.and_then(|t| clip.tracks.get(t)) else {
@@ -361,7 +371,7 @@ fn camera_nodes(state: &EditorState, camera: usize) -> Vec<usize> {
 
 /// The previewed clip, if the viewport shows one, and the playhead.
 fn previewed(state: &EditorState) -> Option<(&EditorClip, f32)> {
-    let clip = state.timeline.clip.filter(|_| state.timeline.preview)?;
+    let clip = state.timeline.clip.filter(|_| state.timeline.preview && state.timeline.all.is_none())?;
     Some((state.clips.get(clip)?, state.timeline.time))
 }
 
