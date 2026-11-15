@@ -93,14 +93,12 @@ struct DebugFlags {
 // slot's maps and the light they were rendered for are in `local_shadow.faces`.
 struct ShadowedLights {
     count: u32,
-    // The slot in each shadow mask layer (SHADOW_SLOT_NONE for none), and each slot's tier
-    // (slot / 4, slot % 4): its layer, SHADOW_TIER_FILTERED, or SHADOW_SLOT_NONE (one tap).
+    // The slot in each shadow mask layer (SHADOW_SLOT_NONE for none), and each slot's layer at
+    // (slot / 4, slot % 4), SHADOW_SLOT_NONE if it has none.
     mask_slots: vec4<u32>,
-    tier: array<vec4<u32>, 8>,
+    layer: array<vec4<u32>, 8>,
 }
 
-// Mirrors rendering::light::SHADOW_TIER_FILTERED.
-const SHADOW_TIER_FILTERED: u32 = 0xfffffffeu;
 
 // Mirrors rendering::light::SHADOW_SLOT_NONE.
 const SHADOW_SLOT_NONE: u32 = 0xffffffffu;
@@ -216,7 +214,7 @@ fn vsm_kernel_mip(mip: u32, kernel_texels: f32) -> vec2<f32> {
 // PCF radius is the light's size × (receiver − blocker) / blocker, so shadows are sharp at contact
 // and soften away from it. Search and filter move to coarser mips when wider than
 // MAX_PENUMBRA_TEXELS, so a penumbra keeps its world size whatever the mip.
-fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>, pcss: bool) -> vec3<f32> {
+fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
     let first = local_shadow.faces[slot * 6u];
     let light = first.light;
     let shape = first.shape;
@@ -308,7 +306,7 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>, pcss:
 
     var radius_texels = 1.5;
     var filter_mip = mip;
-    if pcss && light.w > 0.0 {
+    if light.w > 0.0 {
         // Blocker search over where occluders as far as two thirds of the way back to the light
         // can still partly hide it: light size × (receiver − blocker) / (receiver × blocker).
         // Glass counts as a blocker too, so its shadows soften with distance like opaque ones.
@@ -386,9 +384,9 @@ fn light_shadow(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>, pcss:
 
 // Visibility of a local light at this pixel, tinted by glass: its shadow if it has a shadow slot,
 // else 1.
-fn local_shadow_of(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>, pcss: bool) -> vec3<f32> {
+fn local_shadow_of(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
     if debug.disable_shadows != 0u || slot == SHADOW_SLOT_NONE { return vec3f(1.0); }
-    return light_shadow(slot, pos, N, pixel, pcss);
+    return light_shadow(slot, pos, N, pixel);
 }
 
 // Mirrors rendering::light::SHADOW_MASK_LAYERS.
@@ -401,28 +399,26 @@ var<private> mask_ready: bool = false;
 var<private> probe_shading: bool = false;
 
 // Shadow map and contact visibility of a local light (`slot`, toward `L_ws` over `max_length`).
-// In the deferred pass by the slot's tier (rendering::light::ShadowedLights): from the shadow mask,
-// or past it without contact shadows and with a small PCF kernel or one tap (PCSS and the contact
-// march were ~70 % and ~25 % of `lighting` with 24 shadowed lights). The reflection probe capture
+// In the deferred pass (rendering::light::ShadowedLights): from the shadow mask, or past it from
+// `light_shadow_tap`'s four bilinear taps without contact shadows (PCSS and the contact march were
+// ~70 % and ~25 % of `lighting` with 24 shadowed lights; a 12-tap PCF for 8 of them still cost
+// 21 ms in Osaka, four taps cost what one does). The reflection probe capture
 // takes one tap for every light: the cube is prefiltered and mostly seen blurred or behind SSR, so
 // full PCSS there (Osaka 5.9 / 14.1 ms mean / max) looked the same as this (2.0 / 5.3).
 // Elsewhere looked up here in full. `shadow_N` offsets the shadow map lookup, `geo_N` starts the
 // contact march.
 fn local_visibility(slot: u32, pos_ws: vec3<f32>, shadow_N: vec3<f32>, pixel: vec2<f32>, geo_N: vec3<f32>, L_ws: vec3<f32>, max_length: f32, contact_glass: bool) -> vec3<f32> {
     if probe_shading && slot != SHADOW_SLOT_NONE {
-        return light_shadow_tap(slot, pos_ws, L_ws);
+        return light_shadow_tap(slot, pos_ws, L_ws, false);
     }
     if mask_ready && slot != SHADOW_SLOT_NONE {
-        let tier = shadowed.tier[slot / 4u][slot % 4u];
-        if tier < SHADOW_MASK_LAYERS {
-            return mask_vis[tier];
+        let layer = shadowed.layer[slot / 4u][slot % 4u];
+        if layer < SHADOW_MASK_LAYERS {
+            return mask_vis[layer];
         }
-        if tier == SHADOW_TIER_FILTERED {
-            return local_shadow_of(slot, pos_ws, shadow_N, pixel, false);
-        }
-        return light_shadow_tap(slot, pos_ws, L_ws);
+        return light_shadow_tap(slot, pos_ws, L_ws, true);
     }
-    return min(local_shadow_of(slot, pos_ws, shadow_N, pixel, true),
+    return min(local_shadow_of(slot, pos_ws, shadow_N, pixel),
         contact_shadow(select(vec3f(0.0), geo_N, slot != SHADOW_SLOT_NONE), pos_ws, L_ws, max_length, contact_glass));
 }
 
@@ -1390,7 +1386,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
             if first.shape.x == 0.0 || distance(pos_ws, first.light.xyz) > first.shape.w {
                 continue;
             }
-            light_shadow(slot, pos_ws, N, in.pos.xy, true);
+            light_shadow(slot, pos_ws, N, in.pos.xy);
             if vsm_resolved_mip >= 0.0 {
                 return unreflective(colors[u32(vsm_resolved_mip)] * 0.5 + albedo * 0.5);
             }
@@ -1400,7 +1396,7 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
     if debug.view == 5u {
         var vis = vec3f(1.0);
         for (var slot = 0u; slot < min(shadowed.count, 3u); slot++) {
-            vis[slot] = dot(light_shadow(slot, pos_ws, N, in.pos.xy, true), vec3f(1.0 / 3.0));
+            vis[slot] = dot(light_shadow(slot, pos_ws, N, in.pos.xy), vec3f(1.0 / 3.0));
         }
         return unreflective(vis);
     }
@@ -2148,10 +2144,10 @@ fn particle_sky_shadow(pos_vs: vec3<f32>, depth_vs: f32) -> vec3<f32> {
 }
 
 // The cheapest `light_shadow`: one bilinear comparison (plus glass tint) at the mip a screen pixel
-// spans there, offset toward the light (`L`, world). For particles, too small and blurred for
-// penumbrae (the full filter at every light cost Osaka's rain ~20 ms), and the least important
-// shadowed lights.
-fn light_shadow_tap(slot: u32, pos: vec3<f32>, L: vec3<f32>) -> vec3<f32> {
+// spans there, offset toward the light (`L`, world), or four with `filtered`. One for particles,
+// too small and blurred for penumbrae (the full filter at every light cost Osaka's rain ~20 ms),
+// and the reflection probe capture; four for the deferred pass's lights outside the shadow mask.
+fn light_shadow_tap(slot: u32, pos: vec3<f32>, L: vec3<f32>, filtered: bool) -> vec3<f32> {
     if debug.disable_shadows != 0u || slot == SHADOW_SLOT_NONE { return vec3f(1.0); }
     let shape = local_shadow.faces[slot * 6u].shape;
     let d = pos - local_shadow.faces[slot * 6u].light.xyz;
@@ -2179,7 +2175,23 @@ fn light_shadow_tap(slot: u32, pos: vec3<f32>, L: vec3<f32>) -> vec3<f32> {
     if at.w == 0.0 || (shape.x < 1.5 && (clip.w <= 0.0 || any(abs(ndc.xy) > vec2f(1.0)))) {
         return vec3f(1.0);
     }
-    let opaque = textureSampleCompareLevel(t_local_shadow, s_shadow, at.xy, ndc.z);
+    var opaque = 0.0;
+    if filtered {
+        // Four comparisons half a texel around the lookup, kept inside its physical page: a
+        // 3×3-texel tent. Looking up each tap's page instead (or a 12-tap PCF) cost several times
+        // as much across the whole pass, through the shader's register count.
+        let atlas = f32(textureDimensions(t_local_shadow).x);
+        let px = at.xy * atlas;
+        let lo = floor(px / VSM_PAGE) * VSM_PAGE + 0.5;
+        let hi = lo + VSM_PAGE - 1.0;
+        opaque = 0.25 * (
+            textureSampleCompareLevel(t_local_shadow, s_shadow, clamp(px + vec2f(-0.5, -0.5), lo, hi) / atlas, ndc.z)
+            + textureSampleCompareLevel(t_local_shadow, s_shadow, clamp(px + vec2f(0.5, -0.5), lo, hi) / atlas, ndc.z)
+            + textureSampleCompareLevel(t_local_shadow, s_shadow, clamp(px + vec2f(-0.5, 0.5), lo, hi) / atlas, ndc.z)
+            + textureSampleCompareLevel(t_local_shadow, s_shadow, clamp(px + vec2f(0.5, 0.5), lo, hi) / atlas, ndc.z));
+    } else {
+        opaque = textureSampleCompareLevel(t_local_shadow, s_shadow, at.xy, ndc.z);
+    }
     if opaque <= 0.0 { return vec3f(0.0); }
     return opaque * local_glass_tint(at.xy, clip.w - texel0 * f32(1u << u32(at.z)));
 }
@@ -2200,7 +2212,7 @@ fn particle_direct(pos_vs: vec3<f32>, pos_ws: vec3<f32>, view_dir: vec3<f32>, pi
         let dist = length(to_light);
         if dist >= light.radius { continue; }
         let L = to_light / dist;
-        let vis = light_shadow_tap(light.shadow_slot, pos_ws, rot * L);
+        let vis = light_shadow_tap(light.shadow_slot, pos_ws, rot * L, false);
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
         color += light.color * vis * (light.intensity * falloff * particle_phase(dot(-L, V_vs)));
     }
@@ -2214,7 +2226,7 @@ fn particle_direct(pos_vs: vec3<f32>, pos_ws: vec3<f32>, view_dir: vec3<f32>, pi
         let cd = dot(-L, normalize(light.direction_vs));
         let t = clamp((cd - light.outer_cos) / max(light.inner_cos - light.outer_cos, 1e-4), 0.0, 1.0);
         if t <= 0.0 { continue; }
-        let vis = light_shadow_tap(light.shadow_slot, pos_ws, rot * L);
+        let vis = light_shadow_tap(light.shadow_slot, pos_ws, rot * L, false);
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
         color += light.color * vis * (light.intensity * t * t * falloff * particle_phase(dot(-L, V_vs)));
     }
@@ -2237,7 +2249,7 @@ fn particle_direct(pos_vs: vec3<f32>, pos_ws: vec3<f32>, view_dir: vec3<f32>, pi
         let area = 4.0 * half_r * half_u;
         let facing = area_facing(light, -L, normalize(cross(r_dir, u_dir)));
         if facing <= 0.0 { continue; }
-        let vis = light_shadow_tap(light.shadow_slot, pos_ws, rot * L);
+        let vis = light_shadow_tap(light.shadow_slot, pos_ws, rot * L, false);
         color += light.color * vis * (light.intensity * facing * area / (dist2 + area)
             * area_range_fade(dist2, light.range) * particle_phase(dot(-L, V_vs)));
     }

@@ -65,38 +65,31 @@ pub struct GpuSkyLight {
 /// Local lights with a shadow map in the atlas, one slot each; lights point at theirs through
 /// `shadow_slot`. Everything about a slot's map (origin, planes, tiles) is in the `shadow` pass's
 /// `LocalShadowParams`, written when the map is rendered, since rendering can lag the light.
-/// `count` is one past the last used slot. Slots get a quality tier by importance, for `lighting`'s
-/// deferred pass: the `SHADOW_MASK_LAYERS` most important a layer of its half-resolution shadow
-/// mask (PCSS and contact shadows), the next `FILTERED_SHADOW_LIGHTS` a fixed small PCF kernel, the
-/// rest one bilinear tap; neither of the latter marches contact shadows. `mask_slots[layer]` is the
-/// slot in a layer and `tier[slot / 4][slot % 4]` a slot's tier: its layer, `SHADOW_TIER_FILTERED`,
-/// or `SHADOW_SLOT_NONE`.
+/// `count` is one past the last used slot. For `lighting`'s deferred pass, the `SHADOW_MASK_LAYERS`
+/// most important slots each get a layer of its half-resolution shadow mask (PCSS and contact
+/// shadows); the rest get four bilinear taps and no contact shadows. `mask_slots[layer]` is the
+/// slot in a layer and `layer[slot / 4][slot % 4]` a slot's layer, or `SHADOW_SLOT_NONE`.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShadowedLights {
     pub count: u32,
     pub _pad: [u32; 3],
     pub mask_slots: [u32; SHADOW_MASK_LAYERS],
-    pub tier: [[u32; 4]; MAX_SHADOWED_LIGHTS / 4],
+    pub layer: [[u32; 4]; MAX_SHADOWED_LIGHTS / 4],
 }
 
 impl ShadowedLights {
-    /// Tiers `slots` in order (most important first).
+    /// Masks the first `SHADOW_MASK_LAYERS` of `slots` (most important first).
     pub fn new(count: u32, slots: impl IntoIterator<Item = u32>) -> Self {
         let mut lights = Self {
             count,
             _pad: [0; 3],
             mask_slots: [SHADOW_SLOT_NONE; SHADOW_MASK_LAYERS],
-            tier: [[SHADOW_SLOT_NONE; 4]; MAX_SHADOWED_LIGHTS / 4],
+            layer: [[SHADOW_SLOT_NONE; 4]; MAX_SHADOWED_LIGHTS / 4],
         };
-        for (rank, slot) in slots.into_iter().take(SHADOW_MASK_LAYERS + FILTERED_SHADOW_LIGHTS).enumerate() {
-            let tier = if rank < SHADOW_MASK_LAYERS {
-                lights.mask_slots[rank] = slot;
-                rank as u32
-            } else {
-                SHADOW_TIER_FILTERED
-            };
-            lights.tier[slot as usize / 4][slot as usize % 4] = tier;
+        for (layer, slot) in slots.into_iter().take(SHADOW_MASK_LAYERS).enumerate() {
+            lights.mask_slots[layer] = slot;
+            lights.layer[slot as usize / 4][slot as usize % 4] = layer as u32;
         }
         lights
     }
@@ -131,8 +124,8 @@ pub struct ShadowCaster {
     /// The light's half size (half extent for area lights, source radius for point and spot
     /// lights), which sets the penumbra.
     pub half_size: f32,
-    /// Rank among this frame's shadowed lights, 0 the most important: sets its shadow tier
-    /// (`ShadowedLights`) and `page_bias`.
+    /// Rank among this frame's shadowed lights, 0 the most important: sets whether `lighting`
+    /// shades it from its shadow mask (`ShadowedLights`) and its `page_bias`.
     pub rank: u32,
 }
 
@@ -183,11 +176,6 @@ pub const SHADOW_SLOT_NONE: u32 = u32::MAX;
 /// Layers of `lighting`'s half-resolution shadow mask (one shadowed light each). Mirrored in
 /// `lighting.wgsl`.
 pub const SHADOW_MASK_LAYERS: usize = 4;
-/// Shadowed lights after the masked ones that get a small PCF kernel instead of one tap
-/// (`ShadowedLights`).
-pub const FILTERED_SHADOW_LIGHTS: usize = 8;
-/// Mirrored in `lighting.wgsl`.
-pub const SHADOW_TIER_FILTERED: u32 = u32::MAX - 1;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
