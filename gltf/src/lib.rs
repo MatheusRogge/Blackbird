@@ -7,6 +7,7 @@ pub mod particles;
 use assets::{Asset, AssetError, AssetResolver, LoadContext};
 use engine_core::{entity::EntityKey, world::World};
 use gltf::{Gltf, buffer, image, image::Format, mesh::util::ReadIndices};
+use rayon::prelude::*;
 use rendering::{
     TextureAsset,
     camera::Camera,
@@ -74,6 +75,24 @@ fn decode_image(bytes: &[u8], uri: &str) -> Result<image::Data, GLTFAssetError> 
     })
 }
 
+fn load_image(ctx: &LoadContext<'_>, img: gltf::Image<'_>, buffers: &[buffer::Data]) -> Result<image::Data, GLTFAssetError> {
+    Ok(match img.source() {
+        image::Source::Uri { uri, .. } if let Some(file) = external_uri(uri) => decode_image(&ctx.read_relative(&file)?, uri)?,
+        source => image::Data::from_source(source, Some(Path::new("")), buffers)?,
+    })
+}
+
+/// Reads and decodes the images on rayon's pool: one by one, Osaka's 93 PNGs took 0.3 s (2 s with
+/// a cold disk cache).
+fn load_images(
+    ctx: &LoadContext<'_>,
+    document: &gltf::Document,
+    buffers: &[buffer::Data],
+) -> Result<Vec<image::Data>, GLTFAssetError> {
+    let images: Vec<gltf::Image<'_>> = document.images().collect();
+    images.into_par_iter().map(|img| load_image(ctx, img, buffers)).collect()
+}
+
 impl AssetResolver for GLTFAssetResolver {
     type Asset = GLTFAsset;
     type Error = GLTFAssetError;
@@ -101,18 +120,7 @@ impl AssetResolver for GLTFAssetResolver {
             }
             buffers.push(data);
         }
-
-        let mut images = Vec::new();
-        for img in document.images() {
-            let data = match img.source() {
-                image::Source::Uri { uri, .. } if let Some(file) = external_uri(uri) => {
-                    decode_image(&ctx.read_relative(&file)?, uri)?
-                }
-                source => image::Data::from_source(source, Some(Path::new("")), &buffers)?,
-            };
-            images.push(data);
-        }
-
+        let images = load_images(ctx, &document, &buffers)?;
         Ok(GLTFAsset { document, buffers, images })
     }
 

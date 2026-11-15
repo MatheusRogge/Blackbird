@@ -2,7 +2,7 @@
 
 glTF 2.0 / GLB support. Converts documents into `rendering` entities in an `engine_core::World`. `src/lib.rs` handles loading and scenes, `src/lights.rs` handles scene lights, `src/objects.rs` the editor's placed objects. Wraps the upstream `gltf` crate (same name, so it's referenced as `::gltf` inside).
 
-Depends on `assets`, `engine_core`, `rendering`, plus `image`, `urlencoding` and `serde_json`.
+Depends on `assets`, `engine_core`, `rendering`, plus `image`, `rayon`, `urlencoding` and `serde_json`.
 
 ## API
 
@@ -25,7 +25,7 @@ scene.node_emitters() -> &HashMap<usize, EntityKey>        // glTF node index �
 gltf::local_matrix(&node) -> Mat4             // node transform relative to its parent
 ```
 
-`engine::register_asset_resolvers` registers the resolver for `"gltf"` and `"glb"`. The resolver eagerly imports all buffers and images. External URIs go through `LoadContext::read_relative`, so packs work. Images are always decoded to RGBA8. Don't go back to `gltf::import_buffers`/`import_images`: they read the filesystem directly.
+`engine::register_asset_resolvers` registers the resolver for `"gltf"` and `"glb"`. The resolver eagerly imports all buffers and images. External URIs go through `LoadContext::read_relative`, so packs work. Images are read and decoded on rayon's pool (Osaka's 93 PNGs: 0.3 → 0.1 s on 4 cores), always to RGBA8. Don't go back to `gltf::import_buffers`/`import_images`: they read the filesystem directly.
 
 ### `camera.rs`
 Camera settings in `extras`: `PhysicalCamera { aperture, shutter_speed (s), iso }` under a camera's `blackbird_physical` (`ev100()`, `exposure() = 1 / (1.2 · 2^EV100)`), and the main camera's node index under the default scene's `blackbird_main_camera`. The editor writes both in `editor/src/export.rs`.

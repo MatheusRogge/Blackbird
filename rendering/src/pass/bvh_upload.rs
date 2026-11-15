@@ -19,8 +19,8 @@ use crate::{
     texture::TextureAsset,
 };
 
-/// Frames a transform change must stay unchanged before the BVH is rebuilt, so
-/// dragging a mesh doesn't rebuild it every frame.
+/// Frames a change to the meshes or their transforms must stay unchanged before the BVH is
+/// rebuilt, so dragging a mesh or streaming a scene in doesn't rebuild it every frame.
 const SETTLE_FRAMES: u32 = 10;
 
 /// A mesh in the uploaded BVH, so a change to its emissive (e.g. an animated material) is
@@ -45,10 +45,10 @@ pub struct BvhUploadPass {
     nodes_id: ResourceId,
     tris_id: ResourceId,
     info_id: ResourceId,
-    last_mesh_count: usize,
     dirty: bool,
-    built_transforms: Vec<Mat4>,
-    seen_transforms: Vec<Mat4>,
+    /// Every mesh and its transform, as built and as last seen.
+    built_meshes_state: Vec<(EntityKey, Mat4)>,
+    seen_meshes_state: Vec<(EntityKey, Mat4)>,
     settled_frames: u32,
     node_count: Arc<AtomicU32>,
     /// `TextureAsset::mean` per (`TextureAsset::id`, sRGB), pruned to live textures on each rebuild.
@@ -87,10 +87,9 @@ impl BvhUploadPass {
                 nodes_id,
                 tris_id,
                 info_id,
-                last_mesh_count: 0,
                 dirty: true,
-                built_transforms: Vec::new(),
-                seen_transforms: Vec::new(),
+                built_meshes_state: Vec::new(),
+                seen_meshes_state: Vec::new(),
                 settled_frames: 0,
                 node_count,
                 texture_means: HashMap::new(),
@@ -136,20 +135,17 @@ impl Pass for BvhUploadPass {
         let handles = world.get_entity_handles::<Mesh>();
         let meshes: Vec<&Mesh> = handles.iter().map(|h| h.entity).collect();
 
-        if meshes.len() != self.last_mesh_count {
-            self.last_mesh_count = meshes.len();
-            self.dirty = true;
-        }
-
-        let transforms: Vec<Mat4> = meshes.iter().map(|m| m.transform).collect();
-        if transforms != self.built_transforms {
-            if transforms == self.seen_transforms {
+        let state: Vec<(EntityKey, Mat4)> = handles.iter().map(|h| (h.id, h.entity.transform)).collect();
+        if state != self.built_meshes_state {
+            if state == self.seen_meshes_state {
                 self.settled_frames += 1;
             } else {
                 self.settled_frames = 0;
-                self.seen_transforms.clone_from(&transforms);
+                self.seen_meshes_state.clone_from(&state);
             }
-            if self.settled_frames >= SETTLE_FRAMES {
+            // The first meshes build at once; later changes (a scene streaming in at a few nodes
+            // a frame) wait, as each rebuild is the whole scene's (Osaka: 640 ms).
+            if self.settled_frames >= SETTLE_FRAMES || self.built_meshes_state.is_empty() {
                 self.dirty = true;
             }
         }
@@ -161,7 +157,7 @@ impl Pass for BvhUploadPass {
         }
         self.dirty = false;
         self.settled_frames = 0;
-        self.built_transforms = transforms;
+        self.built_meshes_state = state;
 
         self.built_meshes.clear();
         if meshes.is_empty() {
