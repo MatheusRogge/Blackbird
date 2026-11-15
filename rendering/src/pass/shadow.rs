@@ -54,6 +54,8 @@ pub const LOCAL_SHADOW_FACES: usize = MAX_SHADOWED_LIGHTS * 6;
 /// light. 16-bit float so that depth keeps its precision. Glass shadows are soft, so they use a
 /// lower resolution than the depth maps.
 const GLASS_TINT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// The local tint atlas has the depth atlas's page layout at 1 / this the resolution.
+const LOCAL_TINT_SCALE: u32 = 2;
 pub const GLASS_TINT_SIZE: u32 = 1024;
 /// Clear value: no tint, and a depth beyond any receiver.
 const GLASS_TINT_CLEAR: wgpu::Color = wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0e4 };
@@ -132,7 +134,7 @@ pub struct ShadowOutputs {
     pub local_shadow_params_id: ResourceId,
     /// `GLASS_TINT_FORMAT`, `NUM_CASCADES` layers of `GLASS_TINT_SIZE`².
     pub glass_tint_id: ResourceId,
-    /// `GLASS_TINT_FORMAT` `ATLAS_SIZE`² atlas, laid out like the depth atlas.
+    /// `GLASS_TINT_FORMAT` atlas laid out like the depth atlas, at 1 / `LOCAL_TINT_SCALE` its size.
     pub local_glass_tint_id: ResourceId,
     /// Storage `u32` per virtual page (`virtual_shadow::TABLE_LEN`): physical page + 1, 0 if not
     /// resident.
@@ -338,7 +340,7 @@ impl ShadowPass {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         };
         let glass_tint_id = graph.alloc_resource_id(tint_map(GLASS_TINT_SIZE, NUM_CASCADES as u32));
-        let local_glass_tint_id = graph.alloc_resource_id(tint_map(ATLAS_SIZE, 1));
+        let local_glass_tint_id = graph.alloc_resource_id(tint_map(ATLAS_SIZE / LOCAL_TINT_SCALE, 1));
         let local_pages_id = graph.alloc_resource_id(ResourceDescriptor::UploadBuffer {
             size: (TABLE_LEN * std::mem::size_of::<u32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -554,6 +556,12 @@ impl ShadowPass {
                 pass.set_viewport(x as f32, y as f32, PAGE_SIZE as f32, PAGE_SIZE as f32, 0.0, 1.0);
                 pass.set_scissor_rect(x, y, PAGE_SIZE, PAGE_SIZE);
             };
+            let tint_viewport = |pass: &mut wgpu::RenderPass<'_>, page: u16| {
+                let (x, y) = page_origin(page);
+                let (x, y, size) = (x / LOCAL_TINT_SCALE, y / LOCAL_TINT_SCALE, PAGE_SIZE / LOCAL_TINT_SCALE);
+                pass.set_viewport(x as f32, y as f32, size as f32, size as f32, 0.0, 1.0);
+                pass.set_scissor_rect(x, y, size, size);
+            };
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow_local_pages"),
@@ -609,7 +617,7 @@ impl ShadowPass {
                 ..Default::default()
             });
             for &(page, vp, offset, _) in &pages {
-                viewport(&mut pass, page);
+                tint_viewport(&mut pass, page);
                 pass.set_pipeline(clear_tint);
                 pass.draw(0..3, 0..1);
                 if glass.is_empty() {
