@@ -391,15 +391,20 @@ fn local_shadow_of(slot: u32, pos: vec3<f32>, N: vec3<f32>, pixel: vec2<f32>) ->
 
 // Mirrors rendering::light::SHADOW_MASK_LAYERS.
 const SHADOW_MASK_LAYERS: u32 = 4u;
-// This pixel's upsampled shadow mask, one entry per layer, when `mask_ready` (set by `fs_main`
-// only, so forward shading always looks shadows up itself).
+// This pixel's upsampled shadow mask, one entry per layer (set by `fs_main` only).
 var<private> mask_vis: array<vec3<f32>, 4>;
-var<private> mask_ready: bool = false;
+// Whether `fs_main` shades local shadows from the mask (`local_visibility`'s `deferred`). A
+// pipeline constant, so the full lookup path compiles out of `fs_main`: compiled in (unreachable
+// but for the debug toggle), it cost 2 ms in Osaka through the shader's register count. Off for
+// the `shadow_mask` debug flag's pipeline (rendering::pass::lighting), where every pixel looks its
+// local shadows up itself.
+override SHADOW_MASK: bool = true;
 // Set by the reflection probe capture (`shade_probe`).
 var<private> probe_shading: bool = false;
 
 // Shadow map and contact visibility of a local light (`slot`, toward `L_ws` over `max_length`).
-// In the deferred pass (rendering::light::ShadowedLights): from the shadow mask, or past it from
+// 1 for a light without a slot. With `deferred` (`fs_main`, rendering::light::ShadowedLights): from
+// the shadow mask, or past it from
 // `light_shadow_tap`'s four bilinear taps without contact shadows (PCSS and the contact march were
 // ~70 % and ~25 % of `lighting` with 24 shadowed lights; a 12-tap PCF for 8 of them still cost
 // 21 ms in Osaka, four taps cost what one does). The reflection probe capture
@@ -407,19 +412,21 @@ var<private> probe_shading: bool = false;
 // full PCSS there (Osaka 5.9 / 14.1 ms mean / max) looked the same as this (2.0 / 5.3).
 // Elsewhere looked up here in full. `shadow_N` offsets the shadow map lookup, `geo_N` starts the
 // contact march.
-fn local_visibility(slot: u32, pos_ws: vec3<f32>, shadow_N: vec3<f32>, pixel: vec2<f32>, geo_N: vec3<f32>, L_ws: vec3<f32>, max_length: f32, contact_glass: bool) -> vec3<f32> {
-    if probe_shading && slot != SHADOW_SLOT_NONE {
+fn local_visibility(slot: u32, pos_ws: vec3<f32>, shadow_N: vec3<f32>, pixel: vec2<f32>, geo_N: vec3<f32>, L_ws: vec3<f32>, max_length: f32, contact_glass: bool, deferred: bool) -> vec3<f32> {
+    if slot == SHADOW_SLOT_NONE {
+        return vec3f(1.0);
+    }
+    if probe_shading {
         return light_shadow_tap(slot, pos_ws, L_ws, false);
     }
-    if mask_ready && slot != SHADOW_SLOT_NONE {
+    if deferred {
         let layer = shadowed.layer[slot / 4u][slot % 4u];
         if layer < SHADOW_MASK_LAYERS {
             return mask_vis[layer];
         }
         return light_shadow_tap(slot, pos_ws, L_ws, true);
     }
-    return min(local_shadow_of(slot, pos_ws, shadow_N, pixel),
-        contact_shadow(select(vec3f(0.0), geo_N, slot != SHADOW_SLOT_NONE), pos_ws, L_ws, max_length, contact_glass));
+    return min(local_shadow_of(slot, pos_ws, shadow_N, pixel), contact_shadow(geo_N, pos_ws, L_ws, max_length, contact_glass));
 }
 
 fn octahedral_encode(n: vec3<f32>) -> vec2<f32> {
@@ -1028,7 +1035,7 @@ fn view_to_world_dir(v: vec3<f32>) -> vec3<f32> {
 // whichever cascade contains the point. A nonzero `geo_N` (the geometric normal) adds contact
 // shadows, which march the camera view's depth, so the probe capture passes 0; `contact_glass` is
 // `contact_shadow`'s `glass`.
-fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws: vec3<f32>, pixel: vec2<f32>, depth_vs: f32, probe_capture: bool, geo_N: vec3<f32>, contact_glass: bool) -> vec3<f32> {
+fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws: vec3<f32>, pixel: vec2<f32>, depth_vs: f32, probe_capture: bool, geo_N: vec3<f32>, contact_glass: bool, deferred: bool) -> vec3<f32> {
     let N = surf_ws.N;
     let N_vs = surf_vs.N;
     let alpha = surf_vs.alpha;
@@ -1058,7 +1065,7 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         }
 
         let vis = local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
-            view_to_world_dir(to_light / dist), dist, contact_glass);
+            view_to_world_dir(to_light / dist), dist, contact_glass, deferred);
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
         color += sphere_light_brdf(surf_vs, to_light, dist, light.source_radius) * light.color * vis
             * (light.intensity * falloff);
@@ -1080,80 +1087,25 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
             continue;
         }
         let vis = local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
-            view_to_world_dir(L), dist, contact_glass);
+            view_to_world_dir(L), dist, contact_glass, deferred);
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
         color += sphere_light_brdf(surf_vs, to_light, dist, light.source_radius) * light.color * vis
             * (light.intensity * t * t * falloff);
     }
 
-    // Representative-point approximation. Diffuse takes light from the closest point on the
-    // rectangle, specular from where the reflection ray meets it, both scaled by the area so
-    // the falloff stays bounded as the surface approaches the light.
+    // Area lights, representative-point approximation. Diffuse takes light from the closest point
+    // on the rectangle, specular from where the reflection ray meets it, both scaled by the area so
+    // the falloff stays bounded as the surface approaches the light. Emissive meshes' lights end at
+    // their range (unranged, they washed over the reflections of Osaka's signs, which the reflection
+    // passes already show); the scene's have `range` f32::MAX. One loop for both: a second copy of
+    // the body cost 3.5 ms in Osaka through the shader's register count.
     for (var i = 0u; i < light_counts.num_area; i++) {
         let light = area_lights[i];
-        if (light.flags & AREA_EMISSIVE) != 0u {
-            continue;
-        }
-
         let half_r = length(light.right_vs);
         let half_u = length(light.up_vs);
         if half_r <= 0.0 || half_u <= 0.0 {
             continue;
         }
-        let r_dir = light.right_vs / half_r;
-        let u_dir = light.up_vs / half_u;
-
-        let rel     = pos_vs - light.position_vs;
-        if (light.flags & AREA_TWO_SIDED) == 0u && dot(rel, normalize(cross(r_dir, u_dir))) <= 0.0 {
-            continue;
-        }
-        let closest = light.position_vs
-            + r_dir * clamp(dot(rel, r_dir), -half_r, half_r)
-            + u_dir * clamp(dot(rel, u_dir), -half_u, half_u);
-
-        let to_light = closest - pos_vs;
-        let dist2    = max(dot(to_light, to_light), 1e-4);
-        let L        = to_light * inverseSqrt(dist2);
-
-        let area     = 4.0 * half_r * half_u;
-        let normal   = normalize(cross(r_dir, u_dir));
-        let radiance = light.color * light.intensity
-            * local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
-                view_to_world_dir(L), sqrt(dist2), contact_glass);
-        let facing   = area_facing(light, -L, normal);
-        color += diffuse_brdf(surf_vs, L) * radiance * (facing * area / (dist2 + area));
-
-        // A ray parallel to or facing away from the plane falls back to the closest point.
-        let R     = reflect(-surf_vs.V, N_vs);
-        let r_dot = dot(R, normal);
-        let t_hit = dot(light.position_vs - pos_vs, normal) / select(r_dot, 1.0, abs(r_dot) < 1e-4);
-        var spec_point = closest;
-        if abs(r_dot) >= 1e-4 && t_hit > 0.0 {
-            let hit = pos_vs + R * t_hit - light.position_vs;
-            spec_point = light.position_vs
-                + r_dir * clamp(dot(hit, r_dir), -half_r, half_r)
-                + u_dir * clamp(dot(hit, u_dir), -half_u, half_u);
-        }
-        let to_spec     = spec_point - pos_vs;
-        let spec_dist2  = max(dot(to_spec, to_spec), 1e-4);
-        let L_spec      = to_spec * inverseSqrt(spec_dist2);
-        // Karis' sphere-light widening, using the radius of a disc with the rectangle's area.
-        let source_r    = sqrt(area / PI);
-        let spec_alpha  = clamp(alpha + source_r / (2.0 * sqrt(spec_dist2)), 0.0, 1.0);
-        let spec_facing = area_facing(light, -L_spec, normal);
-        color += specular_brdf(surf_vs, L_spec, spec_alpha) * radiance
-            * (spec_facing * area / (spec_dist2 + area));
-    }
-
-    // Emissive meshes' lights, within their range. A loop of their own: unranged, they washed over
-    // the reflections of Osaka's signs (which the reflection passes already show).
-    for (var i = 0u; i < light_counts.num_area; i++) {
-        let light = area_lights[i];
-        if (light.flags & AREA_EMISSIVE) == 0u {
-            continue;
-        }
-        let half_r = length(light.right_vs);
-        let half_u = length(light.up_vs);
         let r_dir = light.right_vs / half_r;
         let u_dir = light.up_vs / half_u;
         let normal = normalize(cross(r_dir, u_dir));
@@ -1173,7 +1125,7 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let area = 4.0 * half_r * half_u;
         let radiance = light.color * (light.intensity * area_range_fade(dist2, light.range))
             * local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
-                view_to_world_dir(L), sqrt(dist2), contact_glass);
+                view_to_world_dir(L), sqrt(dist2), contact_glass, deferred);
         color += diffuse_brdf(surf_vs, L) * radiance * (area_facing(light, -L, normal) * area / (dist2 + area));
 
         let R = reflect(-surf_vs.V, N_vs);
@@ -1440,10 +1392,10 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
     }
 
     if debug.disable_direct == 0u {
-        if debug.disable_shadow_mask == 0u && shadowed.mask_slots.x != SHADOW_SLOT_NONE {
+        if SHADOW_MASK && shadowed.mask_slots.x != SHADOW_SLOT_NONE {
             upsample_shadow_mask(frag_xy, pos_ws, N, depth_vs);
         }
-        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, depth_vs, false, geometric_normal(frag_xy, pos_ws, view_dir), true);
+        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, depth_vs, false, geometric_normal(frag_xy, pos_ws, view_dir), true, SHADOW_MASK);
     }
 
     color += emissive;
@@ -1504,7 +1456,6 @@ fn upsample_shadow_mask(pixel: vec2<i32>, pos_ws: vec3<f32>, N: vec3<f32>, depth
         }
         mask_vis[layer] = vis;
     }
-    mask_ready = true;
 }
 
 struct ShadowMaskOutput {
@@ -1542,7 +1493,7 @@ fn fs_shadow_mask(in: VertexOutput) -> ShadowMaskOutput {
                 continue;
             }
             let L = to_light / dist;
-            vis[layer] = local_visibility(slot, pos_ws, select(N, -N, dot(N, L) < 0.0), frag, geo_N, L, dist, true);
+            vis[layer] = local_visibility(slot, pos_ws, select(N, -N, dot(N, L) < 0.0), frag, geo_N, L, dist, true, false);
         }
     }
     return ShadowMaskOutput(vec4f(vis[0], 1.0), vec4f(vis[1], 1.0), vec4f(vis[2], 1.0), vec4f(vis[3], 1.0));
@@ -1832,7 +1783,7 @@ fn fs_forward(in: ForwardVertex, @builtin(front_facing) front_facing: bool) -> @
 
     var color = emissive * coverage;
     if debug.disable_direct == 0u {
-        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, -pos_vs.z, false, Ng, false);
+        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, -pos_vs.z, false, Ng, false, false);
     }
     // Exposed, unlike `color`: screen-space hits are exposed.
     var reflected = vec3f(0.0);
@@ -1988,7 +1939,7 @@ fn shade_probe(in: ForwardVertex, front_facing: bool, m: Model, base: vec4<f32>)
     probe_shading = true;
     var color = emissive;
     if debug.disable_direct == 0u {
-        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, -pos_vs.z, true, vec3f(0.0), false);
+        color += direct_lighting(surf_vs, surf_ws, pos_vs, pos_ws, in.pos.xy, -pos_vs.z, true, vec3f(0.0), false, false);
     }
     if debug.disable_indirect == 0u {
         color += diffuse_color * sample_probe_irradiance(pos_ws, N, N, view_dir);

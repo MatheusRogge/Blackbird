@@ -439,6 +439,8 @@ pub struct LightingPass {
     node_id: Option<NodeId>,
     shader: ShaderAsset,
     pipeline: Option<wgpu::RenderPipeline>,
+    /// `fs_main` with `SHADOW_MASK` off, for the `shadow_mask` debug flag.
+    no_mask_pipeline: Option<wgpu::RenderPipeline>,
     mask_pipeline: Option<wgpu::RenderPipeline>,
     gbuffer_bgl: Option<wgpu::BindGroupLayout>,
     sampler: Option<wgpu::Sampler>,
@@ -512,6 +514,7 @@ impl LightingPass {
                 node_id: None,
                 shader,
                 pipeline: None,
+                no_mask_pipeline: None,
                 mask_pipeline: None,
                 gbuffer_bgl: None,
                 sampler: None,
@@ -666,31 +669,35 @@ impl Pass for LightingPass {
             let target = |format| {
                 Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })
             };
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("lighting_pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some("fs_main"),
-                    targets: &[
-                        target(wgpu::TextureFormat::Rgba16Float),
-                        target(SPECULAR_WEIGHT_FORMAT),
-                        target(wgpu::TextureFormat::Rgba16Float),
-                    ],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
+            let main_pipeline = |label, constants: &[(&str, f64)]| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some("fs_main"),
+                        targets: &[
+                            target(wgpu::TextureFormat::Rgba16Float),
+                            target(SPECULAR_WEIGHT_FORMAT),
+                            target(wgpu::TextureFormat::Rgba16Float),
+                        ],
+                        compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+            let pipeline = main_pipeline("lighting_pipeline", &[]);
+            let no_mask_pipeline = main_pipeline("lighting_no_mask_pipeline", &[("SHADOW_MASK", 0.0)]);
             let mask_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("shadow_mask_pipeline"),
                 layout: Some(&pipeline_layout),
@@ -721,6 +728,7 @@ impl Pass for LightingPass {
             });
 
             self.pipeline = Some(pipeline);
+            self.no_mask_pipeline = Some(no_mask_pipeline);
             self.mask_pipeline = Some(mask_pipeline);
             self.gbuffer_bgl = Some(gbuffer_bgl);
             self.sampler = Some(sampler);
@@ -733,8 +741,9 @@ impl Pass for LightingPass {
             self.shadow_mask = Some(ShadowMask::new(device, mask_size));
         }
 
-        let (Some(pipeline), Some(mask_pipeline), Some(gbuffer_bgl), Some(sampler), Some(mask), Some(placeholder)) = (
+        let (Some(pipeline), Some(no_mask_pipeline), Some(mask_pipeline), Some(gbuffer_bgl), Some(sampler), Some(mask), Some(placeholder)) = (
             &self.pipeline,
+            &self.no_mask_pipeline,
             &self.mask_pipeline,
             &self.gbuffer_bgl,
             &self.sampler,
@@ -814,7 +823,7 @@ impl Pass for LightingPass {
             ..Default::default()
         });
 
-        pass.set_pipeline(pipeline);
+        pass.set_pipeline(if gpu_flags.disable_shadow_mask == 0 { pipeline } else { no_mask_pipeline });
         pass.set_bind_group(0, gbuffer_bg, &[]);
         for (i, bind_group) in lighting_bgs.into_iter().enumerate() {
             pass.set_bind_group(i as u32 + 1, bind_group, &[]);
