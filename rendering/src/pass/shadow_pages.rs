@@ -21,8 +21,10 @@ use crate::{
 
 const SHADER: &str = include_str!("shadow_pages.wgsl");
 const MASK_BYTES: u64 = (REQUEST_WORDS * std::mem::size_of::<u32>()) as u64;
-/// Mirrors the workgroup size of `cs_main`, over half-resolution pixels.
+/// Mirrors the workgroup size of `cs_main`.
 const WORKGROUP: u32 = 8;
+/// Mirrors `PIXEL_STEP` in `shadow_pages.wgsl`: one thread per this many pixels on each axis.
+const PIXEL_STEP: u32 = 4;
 /// Enough that one buffer is always free while others wait to be mapped and read.
 const RING: usize = 3;
 
@@ -226,7 +228,7 @@ impl Pass for ShadowPagesPass {
             pass.set_pipeline(&gpu.pipeline);
             pass.set_bind_group(0, bind_group, &[]);
             let (width, height) = ctx.surface_size;
-            pass.dispatch_workgroups(width.div_ceil(2 * WORKGROUP), height.div_ceil(2 * WORKGROUP), 1);
+            pass.dispatch_workgroups(width.div_ceil(PIXEL_STEP * WORKGROUP), height.div_ceil(PIXEL_STEP * WORKGROUP), 1);
         }
         encoder.copy_buffer_to_buffer(&gpu.mask, 0, buffer, 0, MASK_BYTES);
         *state = State::Copied;

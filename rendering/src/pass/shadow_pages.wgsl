@@ -1,9 +1,10 @@
-// Page requests for local light virtual shadow maps (rendering::pass::shadow_pages): every visible
-// pixel (at half resolution) asks, for each shadowed light in range, for the page of its face at
+// Page requests for local light virtual shadow maps (rendering::pass::shadow_pages): every fourth
+// visible pixel on each axis asks, for each shadowed light in range, for the page of its face at
 // the mip whose texel matches the pixel's footprint, and the two coarser mips above it (the PCSS
-// filter moves to coarser mips for wide penumbrae), widened by the filter's reach. Mirrors the
-// page layout of rendering::light::virtual_shadow and the mip choice of `light_shadow` in
-// lighting.wgsl.
+// filter moves to coarser mips for wide penumbrae), widened by the filter's reach. The widening
+// (KERNEL_TEXELS at that mip, at least 8 pixels) also covers the pixels in between: at half
+// resolution the pass cost 4.4 ms in Osaka for the same images. Mirrors the page layout of
+// rendering::light::virtual_shadow and the mip choice of `light_shadow` in lighting.wgsl.
 
 const VIRTUAL_SIZE: f32 = 8192.0;
 const PAGES0: u32 = 64u;
@@ -12,6 +13,8 @@ const PAGES_PER_FACE: u32 = 5461u;
 const MAX_SHADOWED_LIGHTS: u32 = 32u;
 // Mirrors MAX_PENUMBRA_TEXELS in lighting.wgsl: the filter's reach around a lookup, in texels.
 const KERNEL_TEXELS: f32 = 16.0;
+// Mirrors PIXEL_STEP in rendering::pass::shadow_pages: one thread per this many pixels per axis.
+const PIXEL_STEP: u32 = 4u;
 // Requested mips: the footprint's and this many coarser ones.
 const EXTRA_MIPS: u32 = 2u;
 
@@ -41,13 +44,10 @@ struct LocalShadowParams {
 @group(0) @binding(2) var<uniform> local_shadow: LocalShadowParams;
 @group(0) @binding(3) var<storage, read_write> requests: array<atomic<u32>>;
 
+// Pages of the mips before `mip`: Σ (64 >> m)² = 4096 · (1 − 4^−mip) / (3/4), exact in integers
+// (as `vsm_mip_offset` in lighting.wgsl).
 fn mip_offset(mip: u32) -> u32 {
-    var offset = 0u;
-    for (var m = 0u; m < mip; m++) {
-        let n = PAGES0 >> m;
-        offset += n * n;
-    }
-    return offset;
+    return (16384u - (16384u >> (2u * mip))) / 3u;
 }
 
 fn request(face_index: u32, mip: u32, page: vec2<u32>) {
@@ -59,7 +59,7 @@ fn request(face_index: u32, mip: u32, page: vec2<u32>) {
 @compute @workgroup_size(8, 8)
 fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(t_depth);
-    let pixel = id.xy * 2u;
+    let pixel = id.xy * PIXEL_STEP;
     if any(pixel >= size) {
         return;
     }
