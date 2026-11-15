@@ -162,6 +162,7 @@ impl RenderGraphBuilder for RenderGraphPBRBuilder {
             &mut graph,
             gbuffer_outputs.depth_id,
             gbuffer_outputs.normal_id,
+            gbuffer_outputs.material_id,
             camera_buffer_id,
             self.ao_shader,
             Arc::clone(&debug_flags),

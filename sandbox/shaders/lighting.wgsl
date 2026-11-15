@@ -8,8 +8,6 @@
 @group(0) @binding(5) var t_emissive: texture_2d<f32>;
 // rgb: diffuse transmission color, a: diffuse transmission factor.
 @group(0) @binding(15) var t_transmission: texture_2d<f32>;
-// Screen-space ambient occlusion (rendering::pass::ao), 1 = unoccluded.
-@group(0) @binding(16) var t_ao: texture_2d<f32>;
 // From the `ao` pass's glass prepass, for contact shadows: linear depth of the opaque surface (r)
 // and of the nearest glass in front of it (g), 0 for none; and the light that glass lets through
 // (rgb).
@@ -1318,10 +1316,10 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
         case 2u: { return unreflective(textureSample(t_normal, s_linear, in.uv).rgb); }
         case 3u: {
             let material = textureSample(t_material, s_linear, in.uv);
-            return unreflective(vec3f(material.rg, material.b * textureLoad(t_ao, frag_xy, 0).r));
+            return unreflective(material.rgb);
         }
         case 4u: { return unreflective(textureSample(t_emissive, s_linear, in.uv).rgb * cp.exposure); }
-        case 7u: { return unreflective(vec3f(textureSample(t_material, s_linear, in.uv).b * textureLoad(t_ao, frag_xy, 0).r)); }
+        case 7u: { return unreflective(vec3f(textureSample(t_material, s_linear, in.uv).b)); }
         default: {}
     }
 
@@ -1333,7 +1331,8 @@ fn fs_main(in: VertexOutput) -> LightingOutput {
     let metallic   = material.g;
     let emissive   = textureSample(t_emissive, s_linear, in.uv).rgb;
     let transmission_raw = textureSample(t_transmission, s_linear, in.uv);
-    let ao         = material.b * textureLoad(t_ao, frag_xy, 0).r;
+    // The material's occlusion times `ao`'s (rendering::pass::ao writes it into this channel).
+    let ao         = material.b;
 
     // Reconstruct view-space depth from reversed-Z depth buffer value.
     // z_view_pos = z_near * z_far / (depth * (z_far - z_near) + z_near)
