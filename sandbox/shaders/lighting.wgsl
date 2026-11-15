@@ -1035,6 +1035,13 @@ fn view_to_world_dir(v: vec3<f32>) -> vec3<f32> {
 // whichever cascade contains the point. A nonzero `geo_N` (the geometric normal) adds contact
 // shadows, which march the camera view's depth, so the probe capture passes 0; `contact_glass` is
 // `contact_shadow`'s `glass`.
+// Exposed radiance below which a local light's unshadowed contribution at a pixel is dropped,
+// shadow lookup and all: a quarter of the darkest 8-bit step after ACES (MIN_VISIBLE_RADIANCE in
+// rendering::pass::light_upload). Osaka's lights reach far past where they show (point lights to
+// 144–387 m, emissive meshes' to 50 m), and their shadow lookups at pixels where they add nothing
+// were 6 of `lighting`'s 35 ms; skipping them darkened 0.14 % of pixels by more than a level.
+const FAINT_LIGHT_RADIANCE: f32 = 3.5e-4;
+
 fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws: vec3<f32>, pixel: vec2<f32>, depth_vs: f32, probe_capture: bool, geo_N: vec3<f32>, contact_glass: bool, deferred: bool) -> vec3<f32> {
     let N = surf_ws.N;
     let N_vs = surf_vs.N;
@@ -1047,7 +1054,8 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
     }
 
     // Lights the surface can't see (wholly below its plane unless it transmits light from behind,
-    // outside a spot's cone, behind a one-sided area light) skip their shadow lookup. The same
+    // outside a spot's cone, behind a one-sided area light) skip their shadow lookup, and so do
+    // lights whose unshadowed contribution here is below FAINT_LIGHT_RADIANCE. The same
     // horizon test for area lights made the pass slower (+4 ms in the corridor), so they keep theirs.
     let transmits = any(surf_vs.transmission > vec3f(0.0));
     var color = vec3f(0.0);
@@ -1064,11 +1072,14 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
             continue;
         }
 
-        let vis = local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
-            view_to_world_dir(to_light / dist), dist, contact_glass, deferred);
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
-        color += sphere_light_brdf(surf_vs, to_light, dist, light.source_radius) * light.color * vis
+        let lit = sphere_light_brdf(surf_vs, to_light, dist, light.source_radius) * light.color
             * (light.intensity * falloff);
+        if max(lit.r, max(lit.g, lit.b)) * cp.exposure < FAINT_LIGHT_RADIANCE {
+            continue;
+        }
+        color += lit * local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
+            view_to_world_dir(to_light / dist), dist, contact_glass, deferred);
     }
 
     for (var i = 0u; i < light_counts.num_spot; i++) {
@@ -1086,11 +1097,14 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         if t <= 0.0 || (!transmits && dot(N_vs, to_light) <= -light.source_radius) {
             continue;
         }
-        let vis = local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
-            view_to_world_dir(L), dist, contact_glass, deferred);
         let falloff = range_attenuation(max(dist, light.source_radius), light.radius);
-        color += sphere_light_brdf(surf_vs, to_light, dist, light.source_radius) * light.color * vis
+        let lit = sphere_light_brdf(surf_vs, to_light, dist, light.source_radius) * light.color
             * (light.intensity * t * t * falloff);
+        if max(lit.r, max(lit.g, lit.b)) * cp.exposure < FAINT_LIGHT_RADIANCE {
+            continue;
+        }
+        color += lit * local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
+            view_to_world_dir(L), dist, contact_glass, deferred);
     }
 
     // Area lights, representative-point approximation. Diffuse takes light from the closest point
@@ -1123,10 +1137,8 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         }
         let L = to_light * inverseSqrt(dist2);
         let area = 4.0 * half_r * half_u;
-        let radiance = light.color * (light.intensity * area_range_fade(dist2, light.range))
-            * local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
-                view_to_world_dir(L), sqrt(dist2), contact_glass, deferred);
-        color += diffuse_brdf(surf_vs, L) * radiance * (area_facing(light, -L, normal) * area / (dist2 + area));
+        let radiance = light.color * (light.intensity * area_range_fade(dist2, light.range));
+        var lit = diffuse_brdf(surf_vs, L) * radiance * (area_facing(light, -L, normal) * area / (dist2 + area));
 
         let R = reflect(-surf_vs.V, N_vs);
         let r_dot = dot(R, normal);
@@ -1142,8 +1154,13 @@ fn direct_lighting(surf_vs: Surface, surf_ws: Surface, pos_vs: vec3<f32>, pos_ws
         let spec_dist2 = max(dot(to_spec, to_spec), 1e-4);
         let L_spec = to_spec * inverseSqrt(spec_dist2);
         let spec_alpha = clamp(surf_vs.alpha + sqrt(area / PI) / (2.0 * sqrt(spec_dist2)), 0.0, 1.0);
-        color += specular_brdf(surf_vs, L_spec, spec_alpha) * radiance
+        lit += specular_brdf(surf_vs, L_spec, spec_alpha) * radiance
             * (area_facing(light, -L_spec, normal) * area / (spec_dist2 + area));
+        if max(lit.r, max(lit.g, lit.b)) * cp.exposure < FAINT_LIGHT_RADIANCE {
+            continue;
+        }
+        color += lit * local_visibility(light.shadow_slot, pos_ws, shadow_normal(N, N_vs, to_light), pixel, geo_N,
+            view_to_world_dir(L), sqrt(dist2), contact_glass, deferred);
     }
 
     for (var i = 0u; i < cp.num_sky_lights; i++) {
