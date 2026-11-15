@@ -2419,7 +2419,8 @@ fn trace_bvh(ro: vec3<f32>, rd: vec3<f32>, max_dist: f32) -> BvhHit {
     var best = BvhHit(-1.0, 0u);
     var t_max = max_dist;
     let inv_rd = 1.0 / rd;
-    // Node index and the entry distance it was pushed with.
+    // Node index and the entry distance it was pushed with. At most one per level above the
+    // current node: rendering::bvh::MAX_BVH_DEPTH (32) keeps the tree within it.
     var stack: array<vec2<u32>, 32>;
     var sp = 0;
     var node_index = 0u;

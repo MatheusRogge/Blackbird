@@ -172,8 +172,10 @@ fn ray_tri_hit(ro: vec3<f32>, rd: vec3<f32>, v0: vec3<f32>, v1: vec3<f32>, v2: v
 
 // ── Iterative BVH traversal ───────────────────────────────────────────────────
 
-// Seeded per ray in `main`, advanced by every cut-out test.
+// Seeded per ray in `main`, advanced by the light sampling.
 var<private> rng_state: u32;
+// The ray's seed, for draws that must not depend on the order triangles are tested in.
+var<private> ray_seed: u32;
 
 fn next_random() -> f32 {
     rng_state = rng_state * 747796405u + 2891336453u;
@@ -182,12 +184,25 @@ fn next_random() -> f32 {
     return f32(word >> 8u) / 16777216.0;
 }
 
+fn hash_u32(x: u32) -> u32 {
+    let state = x * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
 // Alpha-tested (cut-out) triangles store the fraction of their area that is solid. A ray passes
 // through the rest with that probability; the probes' temporal blend averages it into partial
-// occlusion.
+// occlusion. The draw hashes the ray's seed with the triangle's first vertex, so it doesn't
+// depend on the traversal order: drawn from a stream advanced per test, it changed with the BVH's
+// layout, and so did every later draw of the ray (the light sampling), shifting the GI.
 fn passes_cutout(tri: BvhTriangle) -> bool {
     let coverage = unpack4x8unorm(tri.roughness_coverage).y;
-    return coverage < 1.0 && next_random() >= coverage;
+    if coverage >= 1.0 {
+        return false;
+    }
+    let v = bitcast<vec3<u32>>(tri.v0);
+    let h = hash_u32(ray_seed ^ hash_u32(v.x ^ hash_u32(v.y ^ hash_u32(v.z))));
+    return f32(h >> 8u) / 16777216.0 >= coverage;
 }
 
 // With `any_hit`, returns at the first hit closer than `max_dist` (for shadow rays), without the
@@ -571,6 +586,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let out_idx = probe_index * probe_params.rays_per_probe + ray_index;
     rng_state = out_idx * 1973u + frame.frame_index * 9277u + 26699u;
     next_random();
+    ray_seed = rng_state;
 
     if bvh_info.enabled == 0u {
         ray_radiance[out_idx]  = vec4f(0.0, 0.0, 0.0, probe_params.max_ray_distance);
