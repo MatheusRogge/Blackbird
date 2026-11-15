@@ -131,7 +131,8 @@ pub struct ShadowCaster {
     /// The light's half size (half extent for area lights, source radius for point and spot
     /// lights), which sets the penumbra.
     pub half_size: f32,
-    /// Rank among this frame's shadowed lights, 0 the most important. Orders re-renders.
+    /// Rank among this frame's shadowed lights, 0 the most important: sets its shadow tier
+    /// (`ShadowedLights`) and `page_bias`.
     pub rank: u32,
 }
 
@@ -153,6 +154,14 @@ impl ShadowCaster {
     /// Near and far planes of its faces' projections.
     pub fn planes(&self) -> (f32, f32) {
         (LOCAL_SHADOW_NEAR, self.range.max(LOCAL_SHADOW_NEAR * 2.0))
+    }
+
+    /// Mips this light's virtual pages yield to more important lights' when the page pool runs
+    /// short (`VirtualShadows::request`): none for the shadow-masked lights, one for the rest.
+    /// Two for the one-tap lights starved the hospital corridor's own lights once 24 brighter
+    /// ones were added near the camera.
+    pub fn page_bias(&self) -> u32 {
+        u32::from(self.rank as usize >= SHADOW_MASK_LAYERS)
     }
 
     /// Whether this light's maps would be drawn differently from `other`'s (rank aside).

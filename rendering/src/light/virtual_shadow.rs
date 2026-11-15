@@ -66,10 +66,25 @@ fn for_each_bit(mask: &[u32], mut f: impl FnMut(u32)) {
     }
 }
 
-/// The mip of the virtual page at `index` (`PageKey::index`).
+const MIP_OFFSETS: [u32; MIPS as usize] = {
+    let mut offsets = [0; MIPS as usize];
+    let mut mip = 0;
+    while mip < MIPS {
+        offsets[mip as usize] = mip_offset(mip);
+        mip += 1;
+    }
+    offsets
+};
+
+/// The mip of the virtual page at `index` (`PageKey::index`). Called per requested page, tens of
+/// thousands of times a frame.
 fn mip_of(index: u32) -> u32 {
     let rest = index % PAGES_PER_FACE;
-    (1..MIPS).take_while(|&mip| rest >= mip_offset(mip)).count() as u32
+    let mut mip = 0;
+    while mip + 1 < MIPS && rest >= MIP_OFFSETS[mip as usize + 1] {
+        mip += 1;
+    }
+    mip
 }
 
 /// One virtual page: `slot * 6 + face` its face, `x` / `y` its page within `mip`.
@@ -146,6 +161,17 @@ struct Physical {
     rendered_frame: u64,
     /// A face's coarsest page, never evicted while its slot is shadowed.
     pinned: bool,
+    /// `page_priority` of its owner when last requested: lower is more important.
+    priority: u32,
+}
+
+const UNUSED: Physical = Physical { owner: None, last_requested: 0, rendered: false, rendered_frame: 0, pinned: false, priority: 0 };
+
+/// How important the page at `index` is to keep resident, lower first: coarser mips before finer
+/// ones, each light's offset by its `bias` (`ShadowCaster::page_bias`), so when the pool runs short
+/// the important lights keep their detail and the others fall back to coarser mips.
+fn page_priority(index: u32, bias: &[u32; MAX_SHADOWED_LIGHTS]) -> u32 {
+    MIPS - 1 - mip_of(index) + bias[(index / PAGES_PER_FACE) as usize / 6]
 }
 
 pub struct VirtualShadows {
@@ -165,7 +191,7 @@ impl Default for VirtualShadows {
         Self {
             table: vec![0; TABLE_LEN],
             resident: vec![NOT_RESIDENT; TABLE_LEN],
-            pages: vec![Physical { owner: None, last_requested: 0, rendered: false, rendered_frame: 0, pinned: false }; POOL_PAGES as usize],
+            pages: vec![UNUSED; POOL_PAGES as usize],
             free: (0..POOL_PAGES as u16).rev().collect(),
             dirty: vec![false; MAX_SHADOWED_LIGHTS * 6],
             enabled: [[false; 6]; MAX_SHADOWED_LIGHTS],
@@ -227,59 +253,82 @@ impl VirtualShadows {
     }
 
     /// Applies a page request mask (a bit per table entry): requested resident pages are marked
-    /// used at `frame`, and missing ones of enabled faces are allocated, coarsest mip first so a
-    /// full pool still serves the fallbacks, evicting the least recently requested page when the
-    /// pool is full. Requests the pool can't serve stay unbacked; lookups fall back to coarser
-    /// pages.
-    pub fn request(&mut self, mask: &[u32], frame: u64) {
-        let mut missing = false;
+    /// used at `frame`, and missing ones of enabled faces are allocated by `page_priority` (with
+    /// per-slot `bias`), taking free pages, then pages nobody asked for this round (least recently
+    /// asked first), then asked-for pages strictly less important than the one coming in. Requests
+    /// the pool can't serve stay unbacked; lookups fall back to coarser pages. Allocating coarsest
+    /// first across all lights instead filled Osaka's pool with every light's mip 4–6 pages and
+    /// left none finer, even for the lights that matter.
+    pub fn request(&mut self, mask: &[u32], frame: u64, bias: &[u32; MAX_SHADOWED_LIGHTS]) {
+        let mut best_missing = u32::MAX;
         for_each_bit(mask, |index| {
             if index as usize >= TABLE_LEN || !self.face_enabled(index / PAGES_PER_FACE) {
                 return;
             }
+            let priority = page_priority(index, bias);
             match self.resident[index as usize] {
-                NOT_RESIDENT => missing = true,
-                page => self.pages[page as usize].last_requested = frame,
+                NOT_RESIDENT => best_missing = best_missing.min(priority),
+                page => {
+                    let p = &mut self.pages[page as usize];
+                    p.last_requested = frame;
+                    p.priority = priority;
+                }
             }
         });
+        let expendable = |p: &Physical| p.last_requested < frame || p.priority > best_missing;
         let mut victims: Vec<u16> = (0..POOL_PAGES as u16)
             .filter(|&page| {
                 let p = &self.pages[page as usize];
-                p.owner.is_some() && !p.pinned && p.last_requested < frame
+                p.owner.is_some() && !p.pinned && expendable(p)
             })
             .collect();
         // With a full pool, far more pages are asked for than can ever be served (the corridor
         // with 24 lights: ~17 000 a frame); sorting them all was most of the pass's CPU time.
-        if !missing || self.free.is_empty() && victims.is_empty() {
+        if best_missing == u32::MAX || self.free.is_empty() && victims.is_empty() {
             return;
         }
-        let mut by_mip: [Vec<u32>; MIPS as usize] = Default::default();
+        let mut by_priority: Vec<Vec<u32>> = vec![Vec::new(); MIPS as usize + 3];
         for_each_bit(mask, |index| {
             if (index as usize) < TABLE_LEN
                 && self.face_enabled(index / PAGES_PER_FACE)
                 && self.resident[index as usize] == NOT_RESIDENT
             {
-                by_mip[mip_of(index) as usize].push(index);
+                let priority = page_priority(index, bias) as usize;
+                if priority >= by_priority.len() {
+                    by_priority.resize(priority + 1, Vec::new());
+                }
+                by_priority[priority].push(index);
             }
         });
-        victims.sort_by_key(|&page| self.pages[page as usize].last_requested);
-        let mut victims = victims.into_iter();
-        for &index in by_mip.iter().rev().flatten() {
-            let page = match self.free.pop() {
-                Some(page) => page,
-                None => {
-                    let Some(victim) = victims.next() else { break };
-                    self.evict(victim);
-                    self.free.pop().expect("an evicted page is free")
-                }
-            };
-            self.assign(page, index, frame, false);
+        victims.sort_by_key(|&page| {
+            let p = &self.pages[page as usize];
+            let asked = p.last_requested == frame;
+            (asked, if asked { 0 } else { p.last_requested }, std::cmp::Reverse(p.priority))
+        });
+        let mut victims = victims.into_iter().peekable();
+        for (priority, indices) in by_priority.iter().enumerate() {
+            for &index in indices {
+                let page = match self.free.pop() {
+                    Some(page) => page,
+                    None => {
+                        let Some(&victim) = victims.peek() else { return };
+                        let v = &self.pages[victim as usize];
+                        if v.last_requested == frame && v.priority <= priority as u32 {
+                            return;
+                        }
+                        victims.next();
+                        self.evict(victim);
+                        self.free.pop().expect("an evicted page is free")
+                    }
+                };
+                self.assign(page, index, frame, false, priority as u32);
+            }
         }
     }
 
     /// Resident pages still to render: pinned ones (all of them: a face without its coarsest
     /// page has no shadow at all), then up to `budget` others. Pages without a map yet go first,
-    /// coarsest mip first; then invalidated ones, which still show their old map, longest
+    /// most important (`page_priority`) first; then invalidated ones, which still show their old map, longest
     /// unrendered first, so a backlog of them (Osaka: ~500 under swaying curtains) takes turns.
     pub fn pending(&self, budget: usize) -> Vec<(PageKey, u16)> {
         let mut pinned = Vec::new();
@@ -291,7 +340,8 @@ impl VirtualShadows {
         }
         others.sort_by_key(|&(key, page)| {
             let stale = self.table[key.index() as usize] != 0;
-            (stale, if stale { self.pages[page as usize].rendered_frame } else { u64::from(MIPS - key.mip) }, key.index())
+            let p = &self.pages[page as usize];
+            (stale, if stale { p.rendered_frame } else { u64::from(p.priority) }, key.index())
         });
         others.truncate(budget);
         pinned.extend(others);
@@ -338,12 +388,12 @@ impl VirtualShadows {
                 self.free.pop()?
             }
         };
-        self.assign(page, index, frame, pinned);
+        self.assign(page, index, frame, pinned, 0);
         Some(page)
     }
 
-    fn assign(&mut self, page: u16, index: u32, frame: u64, pinned: bool) {
-        self.pages[page as usize] = Physical { owner: Some(index), last_requested: frame, rendered: false, rendered_frame: 0, pinned };
+    fn assign(&mut self, page: u16, index: u32, frame: u64, pinned: bool, priority: u32) {
+        self.pages[page as usize] = Physical { owner: Some(index), last_requested: frame, rendered: false, rendered_frame: 0, pinned, priority };
         self.resident[index as usize] = page;
     }
 
@@ -356,7 +406,7 @@ impl VirtualShadows {
                 self.dirty[(owner / PAGES_PER_FACE) as usize] = true;
             }
         }
-        *p = Physical { owner: None, last_requested: 0, rendered: false, rendered_frame: 0, pinned: false };
+        *p = UNUSED;
         self.free.push(page);
     }
 }
@@ -425,7 +475,7 @@ mod tests {
         assert_eq!(v.pending(0).len(), 6, "every face's coarsest page renders regardless of budget");
         render_all(&mut v);
         let fine = PageKey { face: 2, mip: 0, x: 10, y: 20 }.index();
-        v.request(&mask(&[fine]), 2);
+        v.request(&mask(&[fine]), 2, &[0; MAX_SHADOWED_LIGHTS]);
         assert_eq!(v.table()[fine as usize], 0, "not rendered yet");
         render_all(&mut v);
         assert_ne!(v.table()[fine as usize], 0);
@@ -436,7 +486,7 @@ mod tests {
     fn disabled_faces_ignore_requests() {
         let mut v = VirtualShadows::default();
         v.reset_slot(0, [true, false, true, true, true, true], 1);
-        v.request(&mask(&[PageKey { face: 1, mip: 0, x: 0, y: 0 }.index()]), 2);
+        v.request(&mask(&[PageKey { face: 1, mip: 0, x: 0, y: 0 }.index()]), 2, &[0; MAX_SHADOWED_LIGHTS]);
         assert_eq!(v.resident_counts(), (5, 0));
     }
 
@@ -445,22 +495,49 @@ mod tests {
         let mut v = VirtualShadows::default();
         v.reset_slot(0, [true; 6], 1);
         let fill: Vec<u32> = (0..POOL_PAGES - 6).map(|i| PageKey { face: 0, mip: 0, x: i % 64, y: i / 64 }.index()).collect();
-        v.request(&mask(&fill), 2);
+        v.request(&mask(&fill), 2, &[0; MAX_SHADOWED_LIGHTS]);
         assert_eq!(v.resident_counts(), (6, (POOL_PAGES - 6) as usize));
         // Frame 3 asks for everything but the first page again, plus a new one: the first goes.
         let mut again = fill[1..].to_vec();
         let new = PageKey { face: 3, mip: 0, x: 1, y: 1 }.index();
         again.push(new);
-        v.request(&mask(&again), 3);
+        v.request(&mask(&again), 3, &[0; MAX_SHADOWED_LIGHTS]);
         assert_eq!(v.resident[fill[0] as usize], NOT_RESIDENT);
         assert_ne!(v.resident[new as usize], NOT_RESIDENT);
         // Everything is wanted this frame: a further request finds nothing to evict.
         let another = PageKey { face: 4, mip: 0, x: 2, y: 2 }.index();
         again.push(another);
-        v.request(&mask(&again), 3);
+        v.request(&mask(&again), 3, &[0; MAX_SHADOWED_LIGHTS]);
         assert_eq!(v.resident[another as usize], NOT_RESIDENT);
         // Pinned pages survive it all.
         assert_eq!(v.resident_counts().0, 6);
+    }
+
+    #[test]
+    fn important_lights_take_pages_from_less_important_ones() {
+        let mut v = VirtualShadows::default();
+        v.reset_slot(0, [true; 6], 1);
+        v.reset_slot(1, [true; 6], 1);
+        let mut bias = [0; MAX_SHADOWED_LIGHTS];
+        bias[1] = 2;
+        let minor: Vec<u32> = (0..POOL_PAGES - 12).map(|i| PageKey { face: 6, mip: 1, x: i % 32, y: i / 32 }.index()).collect();
+        v.request(&mask(&minor), 2, &bias);
+        assert_eq!(v.resident_counts(), (12, (POOL_PAGES - 12) as usize));
+        // Slot 0's mip 0 page (priority 6) outranks slot 1's mip 1 pages (5 + 2), all asked for.
+        let important = PageKey { face: 0, mip: 0, x: 5, y: 5 }.index();
+        let mut both = minor.clone();
+        both.push(important);
+        let gone = |v: &VirtualShadows| minor.iter().filter(|&&i| v.resident[i as usize] == NOT_RESIDENT).count();
+        for frame in 3..6 {
+            v.request(&mask(&both), frame, &bias);
+            assert_ne!(v.resident[important as usize], NOT_RESIDENT);
+            assert_eq!(gone(&v), 1, "the page it took stays out: no thrashing");
+        }
+        // Equal priorities don't evict each other.
+        let peer = PageKey { face: 6, mip: 1, x: 31, y: 31 }.index();
+        both.push(peer);
+        v.request(&mask(&both), 6, &bias);
+        assert_eq!(v.resident[peer as usize], NOT_RESIDENT);
     }
 
     #[test]
@@ -470,7 +547,7 @@ mod tests {
         let under = PageKey { face: 1, mip: 0, x: 9, y: 13 }.index();
         let beside = PageKey { face: 1, mip: 0, x: 20, y: 13 }.index();
         let other_face = PageKey { face: 2, mip: 0, x: 9, y: 13 }.index();
-        v.request(&mask(&[under, beside, other_face]), 2);
+        v.request(&mask(&[under, beside, other_face]), 2, &[0; MAX_SHADOWED_LIGHTS]);
         render_all(&mut v);
         let mut cells = [false; (DIRTY_GRID * DIRTY_GRID) as usize];
         cells[(3 * DIRTY_GRID + 2) as usize] = true; // mip 0 pages 8–11 × 12–15
@@ -487,11 +564,11 @@ mod tests {
         v.reset_slot(0, [true; 6], 1);
         let old = PageKey { face: 0, mip: 0, x: 0, y: 0 }.index();
         let newer = PageKey { face: 0, mip: 0, x: 63, y: 63 }.index();
-        v.request(&mask(&[old]), 2);
+        v.request(&mask(&[old]), 2, &[0; MAX_SHADOWED_LIGHTS]);
         for (_, page) in v.pending(usize::MAX) {
             v.rendered(page, 2);
         }
-        v.request(&mask(&[old, newer]), 3);
+        v.request(&mask(&[old, newer]), 3, &[0; MAX_SHADOWED_LIGHTS]);
         for (_, page) in v.pending(usize::MAX) {
             v.rendered(page, 3);
         }
@@ -499,7 +576,7 @@ mod tests {
         all.fill(true);
         v.invalidate(&HashMap::from([(0, all)]));
         let fresh = PageKey { face: 0, mip: 3, x: 1, y: 1 }.index();
-        v.request(&mask(&[old, newer, fresh]), 4);
+        v.request(&mask(&[old, newer, fresh]), 4, &[0; MAX_SHADOWED_LIGHTS]);
         let order: Vec<u32> = v.pending(3).iter().map(|(k, _)| k.index()).collect();
         assert_eq!(order, [PageKey::whole(0).index(), fresh, old, newer], "face 0's pinned page, then the rest");
     }
@@ -510,7 +587,7 @@ mod tests {
         v.reset_slot(3, [true; 6], 1);
         render_all(&mut v);
         let fine = PageKey { face: 3 * 6, mip: 1, x: 3, y: 3 }.index();
-        v.request(&mask(&[fine]), 2);
+        v.request(&mask(&[fine]), 2, &[0; MAX_SHADOWED_LIGHTS]);
         render_all(&mut v);
         v.reset_slot(3, [true; 6], 3);
         assert_eq!(v.table()[fine as usize], 0);

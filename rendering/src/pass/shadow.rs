@@ -496,7 +496,8 @@ impl ShadowPass {
             self.virtual_shadows.invalidate(&dirty);
         }
         if let Some(mask) = self.page_requests.lock().expect("page requests poisoned").take() {
-            self.virtual_shadows.request(&mask, self.frame);
+            let bias = self.rendered.map(|caster| caster.map_or(0, |c| c.page_bias()));
+            self.virtual_shadows.request(&mask, self.frame, &bias);
         }
 
         self.local_params.lod = [pixel_per_depth, 0.0, 0.0, 0.0];
