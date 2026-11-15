@@ -3,17 +3,20 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use bytemuck::{Pod, Zeroable};
-use engine_core::world::{EntityHandle, World};
+use engine_core::{
+    entity::EntityKey,
+    world::{EntityHandle, World},
+};
 use ultraviolet::{Mat4, Vec3, Vec4};
 
 use crate::{
     arena::{Batch, GeometryArena, InstanceList, MeshDraw},
-    bounds::Aabb,
+    bounds::{Aabb, Frustum},
     camera::Camera,
     graph::{NodeId, RenderGraph},
     light::{
         MAX_SHADOWED_LIGHTS, ShadowCaster, SharedShadowCasters, SkyLight,
-        virtual_shadow::{ATLAS_SIZE, PAGE_SIZE, PAGES_PER_FACE, SharedPageRequests, TABLE_LEN, VirtualShadows, page_origin},
+        virtual_shadow::{ATLAS_SIZE, DIRTY_GRID, DirtyCells, PAGE_SIZE, PAGES_PER_FACE, SharedPageRequests, TABLE_LEN, VirtualShadows, page_origin},
     },
     mesh::Mesh,
     pass::{
@@ -93,18 +96,13 @@ pub struct LocalShadowFace {
     pub shape: [f32; 4],
 }
 
+/// Side of the cells (metres) moved meshes' boxes are merged by before lights test them.
+const MOVED_MERGE_CELL: f32 = 1.0;
+
 /// Pages rendered per frame besides the pinned coarse ones, which always render.
 const LOCAL_PAGE_BUDGET: usize = 64;
 /// Page views (`ShadowView`) one frame can render: every pinned page of every slot plus the budget.
 const LOCAL_VIEWS: usize = LOCAL_SHADOW_FACES + LOCAL_PAGE_BUDGET;
-
-/// What a slot's pages are rendered for.
-#[derive(Copy, Clone)]
-struct RenderedSlot {
-    caster: ShadowCaster,
-    /// `ShadowPass::render_local_shadows`' signature of the meshes in the light's range.
-    geometry: u64,
-}
 
 /// Every local light face, slot-major (`slot * 6 + face`). Mirrors `LocalShadowParams` in
 /// `lighting.wgsl`.
@@ -200,7 +198,7 @@ fn draw_glass(
     instances: &mut InstanceList,
     textures: &AlbedoCache,
     geometry: &GeometryArena,
-    glass: &[EntityHandle<'_, Mesh>],
+    glass: &[Caster<'_>],
     view_proj: Mat4,
 ) {
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -221,8 +219,7 @@ fn draw_glass(
     pass.set_bind_group(1, instance_bg, &[]);
     pass.set_vertex_buffer(0, geometry.vertex_buffer().slice(..));
     pass.set_index_buffer(geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-    let draws = visible(glass.iter(), geometry, view_proj).map(|(h, d)| (albedo_key(h.entity), d));
-    for batch in batches(instances, draws) {
+    for batch in batches(instances, visible(glass, &Frustum::new(view_proj))) {
         let Some((_, texture_bg)) = textures.get(&batch.key).or(textures.get(&0)) else {
             continue;
         };
@@ -278,7 +275,11 @@ pub struct ShadowPass {
     /// Clear one atlas tile (`vs_clear`): far depth, and the glass tint clear value.
     clear_depth_pipeline: Option<wgpu::RenderPipeline>,
     clear_tint_pipeline: Option<wgpu::RenderPipeline>,
-    rendered: [Option<RenderedSlot>; MAX_SHADOWED_LIGHTS],
+    /// What each slot's pages are rendered for.
+    rendered: [Option<ShadowCaster>; MAX_SHADOWED_LIGHTS],
+    /// Every caster's `Caster::identity` and world bounds last frame, to find what moved.
+    last_casters: HashMap<EntityKey, (u64, Aabb)>,
+    last_generation: u64,
     frame: u64,
     local_params: LocalShadowParams,
 }
@@ -390,6 +391,8 @@ impl ShadowPass {
                 clear_depth_pipeline: None,
                 clear_tint_pipeline: None,
                 rendered: [None; MAX_SHADOWED_LIGHTS],
+                last_casters: HashMap::new(),
+                last_generation: 0,
                 frame: 0,
                 local_params: LocalShadowParams::zeroed(),
             },
@@ -410,9 +413,9 @@ impl ShadowPass {
         encoder: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
         ctx: &PassContext<'_>,
-        meshes: &[EntityHandle<'_, Mesh>],
-        masked: &[&EntityHandle<'_, Mesh>],
-        glass: &[EntityHandle<'_, Mesh>],
+        opaque: &[Caster<'_>],
+        masked: &[Caster<'_>],
+        glass: &[Caster<'_>],
         pixel_per_depth: f32,
     ) {
         let (Some(&vp_buf), Some(&params_buf), Some(&table_buf)) = (
@@ -447,34 +450,34 @@ impl ShadowPass {
             return;
         };
 
-        // A light's maps only depend on the meshes reaching into its range, so a moving object
-        // resets the lights around it rather than all of them.
-        let mesh_keys: Vec<(u64, Aabb)> = meshes
-            .iter()
-            .chain(glass)
-            .filter_map(|h| {
-                let draw = ctx.geometry.get(h.id)?;
-                let mut hasher = std::hash::DefaultHasher::new();
-                h.id.hash(&mut hasher);
-                for value in h.entity.transform.as_array() {
-                    value.to_bits().hash(&mut hasher);
-                }
-                Some((hasher.finish(), draw.bounds.transformed(h.entity.transform)))
-            })
-            .collect();
-        let generation = ctx.geometry.generation();
-        let signature = |caster: &ShadowCaster| {
-            let reach = caster.range * caster.range;
-            mesh_keys
-                .iter()
-                .filter(|(_, b)| {
-                    let gap = Vec3::zero().max_by_component(b.min - caster.origin).max_by_component(caster.origin - b.max);
-                    !b.is_empty() && gap.mag_sq() <= reach
-                })
-                .fold(generation.wrapping_mul(0x9e37_79b9_7f4a_7c15), |sum, (key, _)| sum.wrapping_add(*key))
-        };
+        // A light's maps only depend on the meshes reaching into its range: where one moves, appears
+        // or goes, only the pages its old and new bounds project onto render again. Resetting the
+        // whole light instead kept Osaka's lights (every one reaching swaying curtains or walking
+        // pedestrians) at their coarsest pages.
+        let mut moved = Vec::new();
+        let mut casters_now = HashMap::with_capacity(self.last_casters.len());
+        for caster in opaque.iter().chain(masked).chain(glass) {
+            match self.last_casters.remove(&caster.id) {
+                Some((identity, _)) if identity == caster.identity => {}
+                Some((_, old)) => moved.push(old.union(&caster.bounds)),
+                None => moved.push(caster.bounds),
+            }
+            casters_now.insert(caster.id, (caster.identity, caster.bounds));
+        }
+        moved.extend(self.last_casters.values().map(|&(_, old)| old));
+        self.last_casters = casters_now;
+        // Merged by the cell their centre falls in, so each light projects tens of boxes, not the
+        // hundreds of meshes (curtain joints, pedestrians' parts) that moved.
+        let mut merged: HashMap<[i32; 3], Aabb> = HashMap::new();
+        for b in moved.into_iter().filter(|b| !b.is_empty()) {
+            let c = (b.min + b.max) * (0.5 / MOVED_MERGE_CELL);
+            merged.entry([c.x.floor() as i32, c.y.floor() as i32, c.z.floor() as i32]).and_modify(|m| *m = m.union(&b)).or_insert(b);
+        }
+        let moved: Vec<Aabb> = merged.into_values().collect();
+        let rebuilt = std::mem::replace(&mut self.last_generation, ctx.geometry.generation()) != ctx.geometry.generation();
 
         self.frame += 1;
+        let mut dirty = HashMap::new();
         let casters = *self.casters.lock().expect("shadow_casters poisoned");
         for (slot, caster) in casters.iter().enumerate() {
             let Some(caster) = caster else {
@@ -483,12 +486,15 @@ impl ShadowPass {
                 }
                 continue;
             };
-            let geometry = signature(caster);
-            let unchanged = self.rendered[slot].is_some_and(|r| r.caster.renders_like(caster) && r.geometry == geometry);
-            if !unchanged {
+            if rebuilt || !self.rendered[slot].is_some_and(|r| r.renders_like(caster)) {
                 self.virtual_shadows.reset_slot(slot, caster.faces_enabled(), self.frame);
+            } else {
+                dirty_cells(&mut dirty, slot, caster, &moved);
             }
-            self.rendered[slot] = Some(RenderedSlot { caster: *caster, geometry });
+            self.rendered[slot] = Some(*caster);
+        }
+        if !dirty.is_empty() {
+            self.virtual_shadows.invalidate(&dirty);
         }
         if let Some(mask) = self.page_requests.lock().expect("page requests poisoned").take() {
             self.virtual_shadows.request(&mask, self.frame);
@@ -498,7 +504,7 @@ impl ShadowPass {
         for (slot, rendered) in self.rendered.iter().enumerate() {
             for face in 0..6 {
                 let index = slot * 6 + face;
-                let Some(RenderedSlot { caster, .. }) = rendered else {
+                let Some(caster) = rendered else {
                     self.local_params.faces[index] = LocalShadowFace::zeroed();
                     continue;
                 };
@@ -517,11 +523,11 @@ impl ShadowPass {
 
         let mut jobs = self.virtual_shadows.pending(LOCAL_PAGE_BUDGET);
         jobs.truncate(LOCAL_VIEWS);
-        // (physical page, view-projection, uniform offset) of every page to render this frame.
-        let mut pages: Vec<(u16, Mat4, u32)> = Vec::with_capacity(jobs.len());
+        // (physical page, view-projection, uniform offset, face) of every page to render this frame.
+        let mut pages: Vec<(u16, Mat4, u32, u32)> = Vec::with_capacity(jobs.len());
         for (i, &(key, page)) in jobs.iter().enumerate() {
             let slot = key.face as usize / 6;
-            let Some(RenderedSlot { caster, .. }) = self.rendered[slot] else { continue };
+            let Some(caster) = self.rendered[slot] else { continue };
             let vp = key.view_proj(face_view_proj(&caster, key.face as usize % 6));
             let cols = vp.cols;
             let view = ShadowView {
@@ -530,7 +536,16 @@ impl ShadowPass {
             };
             let offset = CASCADE_VP_STRIDE * i as u64;
             vp_buf.write_at(queue, offset, bytemuck::bytes_of(&view));
-            pages.push((page, vp, offset as u32));
+            pages.push((page, vp, offset as u32, key.face));
+        }
+        // A page's view lies inside its face's, so pages test only what their face sees.
+        let mut face_casters: HashMap<u32, [Vec<&Caster<'_>>; 2]> = HashMap::new();
+        for &(.., face) in &pages {
+            face_casters.entry(face).or_insert_with(|| {
+                let Some(caster) = self.rendered[face as usize / 6] else { return Default::default() };
+                let frustum = Frustum::new(face_view_proj(&caster, face as usize % 6));
+                [opaque, masked].map(|list| list.iter().filter(|c| !frustum.excludes(&c.bounds)).collect())
+            });
         }
 
         if !pages.is_empty() {
@@ -550,7 +565,9 @@ impl ShadowPass {
                 }),
                 ..Default::default()
             });
-            for &(page, vp, offset) in &pages {
+            for &(page, vp, offset, face) in &pages {
+                let frustum = Frustum::new(vp);
+                let [face_opaque, face_masked] = &face_casters[&face];
                 viewport(&mut pass, page);
                 pass.set_pipeline(clear_depth);
                 pass.draw(0..3, 0..1);
@@ -560,17 +577,15 @@ impl ShadowPass {
                 pass.set_bind_group(1, instance_bg, &[]);
                 pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
                 pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-                let opaque = visible(meshes.iter().filter(|h| !h.entity.is_masked()), ctx.geometry, vp);
-                for batch in batches(&mut self.instances, opaque.map(|(_, draw)| ((), draw))) {
+                for batch in batches(&mut self.instances, visible(face_opaque.iter().copied(), &frustum)) {
                     pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
                 }
 
                 pass.set_pipeline(masked_pipeline);
                 pass.set_bind_group(0, bind_group, &[offset]);
                 pass.set_bind_group(1, instance_bg, &[]);
-                let draws = visible(masked.iter().copied(), ctx.geometry, vp).map(|(h, d)| (albedo_key(h.entity), d));
                 let mut current_texture = None;
-                for batch in batches(&mut self.instances, draws) {
+                for batch in batches(&mut self.instances, visible(face_masked.iter().copied(), &frustum)) {
                     if current_texture != Some(batch.key) {
                         let Some((_, texture_bg)) = self.masked_textures.get(&batch.key).or(self.masked_textures.get(&0)) else {
                             continue;
@@ -593,7 +608,7 @@ impl ShadowPass {
                 })],
                 ..Default::default()
             });
-            for &(page, vp, offset) in &pages {
+            for &(page, vp, offset, _) in &pages {
                 viewport(&mut pass, page);
                 pass.set_pipeline(clear_tint);
                 pass.draw(0..3, 0..1);
@@ -605,8 +620,7 @@ impl ShadowPass {
                 pass.set_bind_group(1, instance_bg, &[]);
                 pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
                 pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-                let draws = visible(glass.iter(), ctx.geometry, vp).map(|(h, d)| (albedo_key(h.entity), d));
-                for batch in batches(&mut self.instances, draws) {
+                for batch in batches(&mut self.instances, visible(glass, &Frustum::new(vp))) {
                     let Some((_, texture_bg)) = self.glass_textures.get(&batch.key).or(self.glass_textures.get(&0)) else {
                         continue;
                     };
@@ -616,13 +630,72 @@ impl ShadowPass {
             }
         }
         for &(page, ..) in &pages {
-            self.virtual_shadows.rendered(page);
+            self.virtual_shadows.rendered(page, self.frame);
         }
 
         for face in self.virtual_shadows.take_dirty_faces() {
             let range = face as usize * PAGES_PER_FACE as usize..(face as usize + 1) * PAGES_PER_FACE as usize;
             let offset = range.start as u64 * 4;
             table_buf.write_at(queue, offset, bytemuck::cast_slice(&self.virtual_shadows.table()[range]));
+        }
+    }
+}
+
+/// Adds to `dirty` the cells of `slot`'s faces that `moved` (world boxes of meshes that moved)
+/// project onto, for `VirtualShadows::invalidate`.
+fn dirty_cells(dirty: &mut HashMap<u32, DirtyCells>, slot: usize, caster: &ShadowCaster, moved: &[Aabb]) {
+    let reach = caster.range * caster.range;
+    let in_range: Vec<&Aabb> = moved
+        .iter()
+        .filter(|b| {
+            let gap = Vec3::zero().max_by_component(b.min - caster.origin).max_by_component(caster.origin - b.max);
+            gap.mag_sq() <= reach
+        })
+        .collect();
+    if in_range.is_empty() {
+        return;
+    }
+    let enabled = caster.faces_enabled();
+    for face in (0..caster.faces()).filter(|&f| enabled[f]) {
+        let view_proj = face_view_proj(caster, face);
+        let frustum = Frustum::new(view_proj);
+        let mut cells: DirtyCells = [false; (DIRTY_GRID * DIRTY_GRID) as usize];
+        let mut any = false;
+        let cols = view_proj.cols;
+        for b in in_range.iter().filter(|b| !frustum.excludes(b)) {
+            let (mut lo, mut hi) = ([1.0f32; 2], [0.0f32; 2]);
+            // The corners' clip positions from the min corner's and the projected edges.
+            let base = view_proj * Vec4::new(b.min.x, b.min.y, b.min.z, 1.0);
+            let size = b.max - b.min;
+            let edges = [cols[0] * size.x, cols[1] * size.y, cols[2] * size.z];
+            for corner in 0..8 {
+                let mut clip = base;
+                for (axis, edge) in edges.iter().enumerate() {
+                    if corner & (1 << axis) != 0 {
+                        clip += *edge;
+                    }
+                }
+                if clip.w <= 1e-4 {
+                    // Reaches behind the light: it may cover any part of the face.
+                    (lo, hi) = ([0.0; 2], [1.0; 2]);
+                    break;
+                }
+                let uv = [(clip.x / clip.w + 1.0) * 0.5, (1.0 - clip.y / clip.w) * 0.5];
+                for i in 0..2 {
+                    lo[i] = lo[i].min(uv[i]);
+                    hi[i] = hi[i].max(uv[i]);
+                }
+            }
+            let cell = |t: f32| ((t * DIRTY_GRID as f32) as i32).clamp(0, DIRTY_GRID as i32 - 1) as usize;
+            for y in cell(lo[1])..=cell(hi[1]) {
+                for x in cell(lo[0])..=cell(hi[0]) {
+                    cells[y * DIRTY_GRID as usize + x] = true;
+                }
+            }
+            any = true;
+        }
+        if any {
+            dirty.insert((slot * 6 + face) as u32, cells);
         }
     }
 }
@@ -646,20 +719,47 @@ fn face_view_proj(caster: &ShadowCaster, face: usize) -> Mat4 {
 }
 
 /// `draws` as instanced draws: meshes sharing geometry and `key` are one.
-fn batches<'d, K: Ord + Copy>(instances: &mut InstanceList, draws: impl Iterator<Item = (K, &'d MeshDraw)>) -> Vec<Batch<K>> {
+fn batches<'d>(instances: &mut InstanceList, draws: impl Iterator<Item = (u64, &'d MeshDraw)>) -> Vec<Batch<u64>> {
     instances.batch(draws.map(|(key, draw)| (key, 0.0, draw)).collect())
 }
 
-/// The meshes with geometry whose bounds reach into the clip volume of `view_proj`.
-fn visible<'m, 'w: 'm, 'g>(
-    meshes: impl Iterator<Item = &'m EntityHandle<'w, Mesh>>,
-    geometry: &'g GeometryArena,
-    view_proj: Mat4,
-) -> impl Iterator<Item = (&'m EntityHandle<'w, Mesh>, &'g MeshDraw)> {
-    meshes.filter_map(move |h| {
-        let draw = geometry.get(h.id)?;
-        (!draw.bounds.outside_clip(view_proj * h.entity.transform)).then_some((h, draw))
-    })
+/// A mesh with geometry as the shadow maps see it this frame. Its world bounds are computed once
+/// and tested against every view's planes: projecting each mesh's corners for every rendered page
+/// (Osaka animated: 229 pages × 1600 meshes) was most of the pass's CPU time.
+struct Caster<'d> {
+    id: EntityKey,
+    bounds: Aabb,
+    draw: &'d MeshDraw,
+    /// The albedo texture (`albedo_key`) for masked meshes and glass, 0 for opaque ones.
+    key: u64,
+    /// Hash of the mesh's id and transform: a change means it moved.
+    identity: u64,
+}
+
+impl<'d> Caster<'d> {
+    fn new(handle: &EntityHandle<'_, Mesh>, geometry: &'d GeometryArena, textured: bool) -> Option<Self> {
+        let draw = geometry.get(handle.id)?;
+        let mut hasher = std::hash::DefaultHasher::new();
+        handle.id.hash(&mut hasher);
+        for value in handle.entity.transform.as_array() {
+            value.to_bits().hash(&mut hasher);
+        }
+        Some(Self {
+            id: handle.id,
+            bounds: draw.bounds.transformed(handle.entity.transform),
+            draw,
+            key: if textured { albedo_key(handle.entity) } else { 0 },
+            identity: hasher.finish(),
+        })
+    }
+}
+
+/// The casters whose bounds reach into `frustum`.
+fn visible<'c, 'd: 'c>(
+    casters: impl IntoIterator<Item = &'c Caster<'d>> + 'c,
+    frustum: &'c Frustum,
+) -> impl Iterator<Item = (u64, &'d MeshDraw)> + 'c {
+    casters.into_iter().filter(|c| !frustum.excludes(&c.bounds)).map(|c| (c.key, c.draw))
 }
 
 fn ortho_rh_wgpu(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) -> Mat4 {
@@ -813,14 +913,17 @@ impl Pass for ShadowPass {
         // passes them through the glass tint maps instead.
         let (glass, meshes): (Vec<_>, Vec<_>) =
             world.get_entity_handles::<Mesh>().into_iter().partition(|h| h.entity.is_blended());
+        let opaque_casters: Vec<_> =
+            meshes.iter().filter(|h| !h.entity.is_masked()).filter_map(|h| Caster::new(h, ctx.geometry, false)).collect();
+        let mut masked_casters: Vec<_> =
+            meshes.iter().filter(|h| h.entity.is_masked()).filter_map(|h| Caster::new(h, ctx.geometry, true)).collect();
+        masked_casters.sort_unstable_by_key(|c| c.key);
+        let glass_casters: Vec<_> = glass.iter().filter_map(|h| Caster::new(h, ctx.geometry, true)).collect();
         let mut scene = Aabb::empty();
-        for handle in meshes.iter().chain(&glass) {
-            if let Some(draw) = ctx.geometry.get(handle.id) {
-                let world_bounds = draw.bounds.transformed(handle.entity.transform);
-                if !world_bounds.is_empty() {
-                    scene.extend(world_bounds.min);
-                    scene.extend(world_bounds.max);
-                }
+        for caster in opaque_casters.iter().chain(&masked_casters).chain(&glass_casters) {
+            if !caster.bounds.is_empty() {
+                scene.extend(caster.bounds.min);
+                scene.extend(caster.bounds.max);
             }
         }
         if scene.is_empty() {
@@ -1139,8 +1242,6 @@ impl Pass for ShadowPass {
         else {
             return;
         };
-        let mut masked: Vec<_> = meshes.iter().filter(|h| h.entity.is_masked()).collect();
-        masked.sort_unstable_by_key(|h| albedo_key(h.entity));
         let inv_cam_view = camera.view_matrix().inversed();
         let (w, h) = ctx.surface_size;
         let aspect = camera.aspect_or(w as f32 / h as f32);
@@ -1187,18 +1288,17 @@ impl Pass for ShadowPass {
             pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
             pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
 
-            let opaque = visible(meshes.iter().filter(|h| !h.entity.is_masked()), ctx.geometry, light_vp);
-            for batch in batches(&mut self.instances, opaque.map(|(_, draw)| ((), draw))) {
+            let frustum = Frustum::new(light_vp);
+            for batch in batches(&mut self.instances, visible(&opaque_casters, &frustum)) {
                 pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
             }
 
-            if !masked.is_empty() {
+            if !masked_casters.is_empty() {
                 pass.set_pipeline(masked_pipeline);
                 pass.set_bind_group(0, bg, &[vp_offset as u32]);
                 pass.set_bind_group(1, instance_bg, &[]);
-                let draws = visible(masked.iter().copied(), ctx.geometry, light_vp).map(|(h, d)| (albedo_key(h.entity), d));
                 let mut current_texture = None;
-                for batch in batches(&mut self.instances, draws) {
+                for batch in batches(&mut self.instances, visible(&masked_casters, &frustum)) {
                     if current_texture != Some(batch.key) {
                         let Some((_, texture_bg)) =
                             self.masked_textures.get(&batch.key).or(self.masked_textures.get(&0))
@@ -1222,13 +1322,13 @@ impl Pass for ShadowPass {
                 &mut self.instances,
                 &self.glass_textures,
                 ctx.geometry,
-                &glass,
+                &glass_casters,
                 light_vp,
             );
         }
 
         let pixel_per_depth = 2.0 * (camera.fovy * 0.5).tan() / ctx.surface_size.1.max(1) as f32;
-        self.render_local_shadows(encoder, queue, ctx, &meshes, &masked, &glass, pixel_per_depth);
+        self.render_local_shadows(encoder, queue, ctx, &opaque_casters, &masked_casters, &glass_casters, pixel_per_depth);
         self.instances.finish(queue);
 
         let params = ShadowParams {

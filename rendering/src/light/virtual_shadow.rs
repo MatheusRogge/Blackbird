@@ -5,6 +5,8 @@
 //! lookup can always fall back to it. This module is the CPU side: page indexing, the physical
 //! pool (least recently requested pages are evicted first) and the page table the shader reads.
 
+use std::collections::HashMap;
+
 use ultraviolet::{Mat4, Vec3, Vec4};
 
 use super::MAX_SHADOWED_LIGHTS;
@@ -24,6 +26,12 @@ pub const POOL_PAGES: u32 = POOL_SIDE * POOL_SIDE;
 pub const TABLE_LEN: usize = MAX_SHADOWED_LIGHTS * 6 * PAGES_PER_FACE as usize;
 /// `u32` words of the page request bit mask (one bit per table entry).
 pub const REQUEST_WORDS: usize = TABLE_LEN.div_ceil(32);
+
+/// Cells per side of a face's invalidation grid (`VirtualShadows::invalidate`): mip 2's pages.
+pub const DIRTY_GRID: u32 = mip_pages(DIRTY_MIP);
+const DIRTY_MIP: u32 = 2;
+/// One face's invalidation grid.
+pub type DirtyCells = [bool; (DIRTY_GRID * DIRTY_GRID) as usize];
 
 const NOT_RESIDENT: u16 = u16::MAX;
 
@@ -114,8 +122,11 @@ struct Physical {
     /// The virtual page it backs (`PageKey::index`).
     owner: Option<u32>,
     last_requested: u64,
-    /// Holds its owner's map; until then the page table doesn't point at it.
+    /// Holds its owner's current map. A new page's table entry waits for it; an invalidated one
+    /// keeps pointing at the old map meanwhile.
     rendered: bool,
+    /// When its map was last rendered.
+    rendered_frame: u64,
     /// A face's coarsest page, never evicted while its slot is shadowed.
     pinned: bool,
 }
@@ -137,7 +148,7 @@ impl Default for VirtualShadows {
         Self {
             table: vec![0; TABLE_LEN],
             resident: vec![NOT_RESIDENT; TABLE_LEN],
-            pages: vec![Physical { owner: None, last_requested: 0, rendered: false, pinned: false }; POOL_PAGES as usize],
+            pages: vec![Physical { owner: None, last_requested: 0, rendered: false, rendered_frame: 0, pinned: false }; POOL_PAGES as usize],
             free: (0..POOL_PAGES as u16).rev().collect(),
             dirty: vec![false; MAX_SHADOWED_LIGHTS * 6],
             enabled: [[false; 6]; MAX_SHADOWED_LIGHTS],
@@ -177,6 +188,27 @@ impl VirtualShadows {
         }
     }
 
+    /// Marks the resident pages overlapping a set cell of their face's grid in `dirty` (per face
+    /// `slot * 6 + face`: `DIRTY_GRID`² cells, row-major, v down) to render again. Until they do,
+    /// the page table keeps their old map.
+    pub fn invalidate(&mut self, dirty: &HashMap<u32, DirtyCells>) {
+        for p in &mut self.pages {
+            let Some(owner) = p.owner else { continue };
+            let Some(cells) = dirty.get(&(owner / PAGES_PER_FACE)) else { continue };
+            let key = PageKey::from_index(owner);
+            let (lo, hi) = if key.mip <= DIRTY_MIP {
+                let shift = DIRTY_MIP - key.mip;
+                ((key.x >> shift, key.y >> shift), (key.x >> shift, key.y >> shift))
+            } else {
+                let shift = key.mip - DIRTY_MIP;
+                ((key.x << shift, key.y << shift), (((key.x + 1) << shift) - 1, ((key.y + 1) << shift) - 1))
+            };
+            if (lo.1..=hi.1).any(|y| (lo.0..=hi.0).any(|x| cells[(y * DIRTY_GRID + x) as usize])) {
+                p.rendered = false;
+            }
+        }
+    }
+
     /// Applies a page request mask (a bit per table entry): requested resident pages are marked
     /// used at `frame`, and missing ones of enabled faces are allocated, coarsest mip first so a
     /// full pool still serves the fallbacks, evicting the least recently requested page when the
@@ -207,7 +239,9 @@ impl VirtualShadows {
     }
 
     /// Resident pages still to render: pinned ones (all of them: a face without its coarsest
-    /// page has no shadow at all), then up to `budget` others, coarsest mip first.
+    /// page has no shadow at all), then up to `budget` others. Pages without a map yet go first,
+    /// coarsest mip first; then invalidated ones, which still show their old map, longest
+    /// unrendered first, so a backlog of them (Osaka: ~500 under swaying curtains) takes turns.
     pub fn pending(&self, budget: usize) -> Vec<(PageKey, u16)> {
         let mut pinned = Vec::new();
         let mut others = Vec::new();
@@ -216,17 +250,21 @@ impl VirtualShadows {
             let entry = (PageKey::from_index(owner), page as u16);
             if p.pinned { pinned.push(entry) } else { others.push(entry) }
         }
-        others.sort_by_key(|(key, _)| (std::cmp::Reverse(key.mip), key.index()));
+        others.sort_by_key(|&(key, page)| {
+            let stale = self.table[key.index() as usize] != 0;
+            (stale, if stale { self.pages[page as usize].rendered_frame } else { u64::from(MIPS - key.mip) }, key.index())
+        });
         others.truncate(budget);
         pinned.extend(others);
         pinned
     }
 
-    /// Marks `page` rendered: the page table now points its owner at it.
-    pub fn rendered(&mut self, page: u16) {
+    /// Marks `page` rendered at `frame`: the page table now points its owner at it.
+    pub fn rendered(&mut self, page: u16, frame: u64) {
         let p = &mut self.pages[page as usize];
         if let Some(owner) = p.owner {
             p.rendered = true;
+            p.rendered_frame = frame;
             self.table[owner as usize] = u32::from(page) + 1;
             self.dirty[(owner / PAGES_PER_FACE) as usize] = true;
         }
@@ -261,7 +299,7 @@ impl VirtualShadows {
                 self.free.pop()?
             }
         };
-        self.pages[page as usize] = Physical { owner: Some(index), last_requested: frame, rendered: false, pinned };
+        self.pages[page as usize] = Physical { owner: Some(index), last_requested: frame, rendered: false, rendered_frame: 0, pinned };
         self.resident[index as usize] = page;
         Some(page)
     }
@@ -275,7 +313,7 @@ impl VirtualShadows {
                 self.dirty[(owner / PAGES_PER_FACE) as usize] = true;
             }
         }
-        *p = Physical { owner: None, last_requested: 0, rendered: false, pinned: false };
+        *p = Physical { owner: None, last_requested: 0, rendered: false, rendered_frame: 0, pinned: false };
         self.free.push(page);
     }
 }
@@ -294,7 +332,7 @@ mod tests {
 
     fn render_all(v: &mut VirtualShadows) {
         for (_, page) in v.pending(usize::MAX) {
-            v.rendered(page);
+            v.rendered(page, 0);
         }
     }
 
@@ -379,6 +417,47 @@ mod tests {
         assert_eq!(v.resident[another as usize], NOT_RESIDENT);
         // Pinned pages survive it all.
         assert_eq!(v.resident_counts().0, 6);
+    }
+
+    #[test]
+    fn invalidating_re_renders_only_the_pages_under_the_cells() {
+        let mut v = VirtualShadows::default();
+        v.reset_slot(0, [true; 6], 1);
+        let under = PageKey { face: 1, mip: 0, x: 9, y: 13 }.index();
+        let beside = PageKey { face: 1, mip: 0, x: 20, y: 13 }.index();
+        let other_face = PageKey { face: 2, mip: 0, x: 9, y: 13 }.index();
+        v.request(&mask(&[under, beside, other_face]), 2);
+        render_all(&mut v);
+        let mut cells = [false; (DIRTY_GRID * DIRTY_GRID) as usize];
+        cells[(3 * DIRTY_GRID + 2) as usize] = true; // mip 0 pages 8–11 × 12–15
+        v.invalidate(&HashMap::from([(1, cells)]));
+        let pending: Vec<u32> = v.pending(usize::MAX).iter().map(|(k, _)| k.index()).collect();
+        assert!(pending.contains(&under) && pending.contains(&PageKey::whole(1).index()));
+        assert!(!pending.contains(&beside) && !pending.contains(&other_face));
+        assert_ne!(v.table()[under as usize], 0, "keeps its old map until it renders");
+    }
+
+    #[test]
+    fn unmapped_pages_go_before_stale_ones_which_take_turns() {
+        let mut v = VirtualShadows::default();
+        v.reset_slot(0, [true; 6], 1);
+        let old = PageKey { face: 0, mip: 0, x: 0, y: 0 }.index();
+        let newer = PageKey { face: 0, mip: 0, x: 63, y: 63 }.index();
+        v.request(&mask(&[old]), 2);
+        for (_, page) in v.pending(usize::MAX) {
+            v.rendered(page, 2);
+        }
+        v.request(&mask(&[old, newer]), 3);
+        for (_, page) in v.pending(usize::MAX) {
+            v.rendered(page, 3);
+        }
+        let mut all = [false; (DIRTY_GRID * DIRTY_GRID) as usize];
+        all.fill(true);
+        v.invalidate(&HashMap::from([(0, all)]));
+        let fresh = PageKey { face: 0, mip: 3, x: 1, y: 1 }.index();
+        v.request(&mask(&[old, newer, fresh]), 4);
+        let order: Vec<u32> = v.pending(3).iter().map(|(k, _)| k.index()).collect();
+        assert_eq!(order, [PageKey::whole(0).index(), fresh, old, newer], "face 0's pinned page, then the rest");
     }
 
     #[test]
