@@ -132,12 +132,14 @@ async fn request_device(
         .await?;
 
     let timing_features = Features::TIMESTAMP_QUERY | Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+    // `shadow` draws local shadow pages from GPU-culled indirect commands (`pass::shadow_cull`).
+    let indirect_features = Features::MULTI_DRAW_INDIRECT_COUNT | Features::INDIRECT_FIRST_INSTANCE;
     let (device, queue) = adapter
         .request_device(&DeviceDescriptor {
             label: None,
             trace: wgpu::Trace::Off,
             memory_hints: MemoryHints::MemoryUsage,
-            required_features: adapter.features() & timing_features,
+            required_features: (adapter.features() & timing_features) | indirect_features,
             required_limits: adapter.limits(),
             ..Default::default()
         })

@@ -22,6 +22,7 @@ use crate::{
         Pass, PassContext, PassDesc,
         material::albedo_alpha_cutoff,
         mipmap::{MipGenerator, TextureKind},
+        shadow_cull::PageCuller,
     },
     resource::{ResourceDescriptor, ResourceId},
     shader::ShaderAsset,
@@ -246,8 +247,10 @@ pub struct ShadowPass {
     instance_layout: Option<wgpu::BindGroupLayout>,
     /// Keyed by (geometry generation, instance list generation).
     instance_bind_group: Option<((u64, u64), wgpu::BindGroup)>,
-    /// Every view's instanced draws this frame (cascades, local faces, glass tint).
+    /// Every view's instanced draws this frame (cascades, local faces, glass tint), but the
+    /// local pages' opaque ones, which `culler` makes on the GPU.
     instances: InstanceList,
+    culler: Option<PageCuller>,
 
     shadow_map_id: ResourceId,
     shadow_params_id: ResourceId,
@@ -370,6 +373,7 @@ impl ShadowPass {
                 instance_layout: None,
                 instance_bind_group: None,
             instances: InstanceList::default(),
+                culler: None,
                 shadow_map_id,
                 shadow_params_id,
                 cascade_vp_id,
@@ -411,6 +415,7 @@ impl ShadowPass {
     #[allow(clippy::too_many_arguments)]
     fn render_local_shadows(
         &mut self,
+        device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
         ctx: &PassContext<'_>,
@@ -438,6 +443,8 @@ impl ShadowPass {
             Some(clear_tint),
             Some(bind_group),
             Some((_, instance_bg)),
+            Some(instance_layout),
+            Some(culler),
         ) = (
             &self.local_pipeline,
             &self.local_masked_pipeline,
@@ -446,6 +453,8 @@ impl ShadowPass {
             &self.clear_tint_pipeline,
             &self.local_bind_group,
             &self.instance_bind_group,
+            &self.instance_layout,
+            &mut self.culler,
         )
         else {
             return;
@@ -541,14 +550,26 @@ impl ShadowPass {
             pages.push((page, vp, offset as u32, key.face));
         }
         // A page's view lies inside its face's, so pages test only what their face sees.
-        let mut face_casters: HashMap<u32, [Vec<&Caster<'_>>; 2]> = HashMap::new();
+        let mut face_masked: HashMap<u32, Vec<&Caster<'_>>> = HashMap::new();
         for &(.., face) in &pages {
-            face_casters.entry(face).or_insert_with(|| {
-                let Some(caster) = self.rendered[face as usize / 6] else { return Default::default() };
+            face_masked.entry(face).or_insert_with(|| {
+                let Some(caster) = self.rendered[face as usize / 6] else { return Vec::new() };
                 let frustum = Frustum::new(face_view_proj(&caster, face as usize % 6));
-                [opaque, masked].map(|list| list.iter().filter(|c| !frustum.excludes(&c.bounds)).collect())
+                masked.iter().filter(|c| !frustum.excludes(&c.bounds)).collect()
             });
         }
+        let frusta: Vec<Frustum> = pages.iter().map(|&(_, vp, ..)| Frustum::new(vp)).collect();
+        culler.cull(device, queue, encoder, opaque.iter().map(|c| (c.bounds, c.draw)), &frusta);
+        let culled_bg = culler.instance_ids().map(|ids| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shadow_culled_instances"),
+                layout: instance_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: ctx.geometry.instance_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: ids.as_entire_binding() },
+                ],
+            })
+        });
 
         if !pages.is_empty() {
             let viewport = |pass: &mut wgpu::RenderPass<'_>, page: u16| {
@@ -573,27 +594,29 @@ impl ShadowPass {
                 }),
                 ..Default::default()
             });
-            for &(page, vp, offset, face) in &pages {
-                let frustum = Frustum::new(vp);
-                let [face_opaque, face_masked] = &face_casters[&face];
+            for (i, &(page, _, offset, face)) in pages.iter().enumerate() {
                 viewport(&mut pass, page);
                 pass.set_pipeline(clear_depth);
                 pass.draw(0..3, 0..1);
 
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, bind_group, &[offset]);
-                pass.set_bind_group(1, instance_bg, &[]);
                 pass.set_vertex_buffer(0, ctx.geometry.vertex_buffer().slice(..));
                 pass.set_index_buffer(ctx.geometry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-                for batch in batches(&mut self.instances, visible(face_opaque.iter().copied(), &frustum)) {
-                    pass.draw_indexed(batch.indices, batch.base_vertex, batch.instances);
+                if let Some(culled_bg) = &culled_bg {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, bind_group, &[offset]);
+                    pass.set_bind_group(1, culled_bg, &[]);
+                    culler.draw(&mut pass, i);
                 }
 
+                let face_masked = &face_masked[&face];
+                if face_masked.is_empty() {
+                    continue;
+                }
                 pass.set_pipeline(masked_pipeline);
                 pass.set_bind_group(0, bind_group, &[offset]);
                 pass.set_bind_group(1, instance_bg, &[]);
                 let mut current_texture = None;
-                for batch in batches(&mut self.instances, visible(face_masked.iter().copied(), &frustum)) {
+                for batch in batches(&mut self.instances, visible(face_masked.iter().copied(), &frusta[i])) {
                     if current_texture != Some(batch.key) {
                         let Some((_, texture_bg)) = self.masked_textures.get(&batch.key).or(self.masked_textures.get(&0)) else {
                             continue;
@@ -1179,6 +1202,7 @@ impl Pass for ShadowPass {
 
             self.bgl = Some(bgl);
             self.instance_layout = Some(instance_layout);
+            self.culler = Some(PageCuller::new(device));
             self.pipeline = Some(pipeline);
         }
 
@@ -1330,7 +1354,7 @@ impl Pass for ShadowPass {
         }
 
         let pixel_per_depth = 2.0 * (camera.fovy * 0.5).tan() / ctx.surface_size.1.max(1) as f32;
-        self.render_local_shadows(encoder, queue, ctx, &opaque_casters, &masked_casters, &glass_casters, pixel_per_depth);
+        self.render_local_shadows(device, encoder, queue, ctx, &opaque_casters, &masked_casters, &glass_casters, pixel_per_depth);
         self.instances.finish(queue);
 
         let params = ShadowParams {

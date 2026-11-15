@@ -21,6 +21,7 @@ pub mod prev_frame;
 pub mod ssr;
 pub mod ssr_temporal;
 pub mod shadow;
+mod shadow_cull;
 pub mod shadow_pages;
 pub mod transparent;
 

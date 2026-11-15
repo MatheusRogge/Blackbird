@@ -88,6 +88,12 @@ impl Frustum {
         Self { planes: [add(w, x), sub(w, x), add(w, y), sub(w, y), z, sub(w, z)] }
     }
 
+    /// The left, right, bottom, top, near and far planes: (a, b, c, d) with a·x + b·y + c·z + d ≥ 0
+    /// inside.
+    pub fn planes(&self) -> &[[f32; 4]; 6] {
+        &self.planes
+    }
+
     /// Whether `b` is entirely outside one plane: `Aabb::outside_clip` for a box already in world
     /// space.
     pub fn excludes(&self, b: &Aabb) -> bool {
