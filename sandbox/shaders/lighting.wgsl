@@ -853,11 +853,18 @@ fn glass_tint(t: texture_2d_array<f32>, uv: vec2<f32>, layer: u32, depth: f32) -
 }
 
 // `glass_tint` at `atlas_uv` in the local tint atlas (from `vsm_lookup`, which keeps it half a
-// texel inside its page, so the 4 taps stay on that page).
+// texel inside its page, so the 4 taps stay on that page). One gather of their depths first: glass
+// in front of the receiver is rare, and the four Rgba16Float loads everywhere else were 1.4 ms of
+// Osaka's `lighting` and 2.6 of the corridor's with 24 more lights. A glass flag per shadow page
+// saved nothing: page frusta reach far enough that 86 % of that corridor's lookups had one.
 fn local_glass_tint(atlas_uv: vec2<f32>, depth: f32) -> vec3<f32> {
-    let p = atlas_uv * vec2f(textureDimensions(t_local_glass_tint)) - 0.5;
+    let size = vec2f(textureDimensions(t_local_glass_tint));
+    let p = atlas_uv * size - 0.5;
     let base = floor(p);
     let f = p - base;
+    if all(textureGather(3, t_local_glass_tint, probe_sampler, (base + 1.0) / size) >= vec4f(depth)) {
+        return vec3f(1.0);
+    }
     var tint = vec3f(0.0);
     for (var i = 0u; i < 4u; i++) {
         let o = vec2f(f32(i & 1u), f32(i >> 1u));
