@@ -3,12 +3,14 @@ use std::sync::Arc;
 use texture_pool::AliasingReport;
 
 mod frame;
+mod growable;
 mod geometry;
 mod instances;
 mod upload;
 pub mod texture_pool;
 
 pub use frame::{FrameArena, FrameSlice};
+pub use growable::GrowableBuffer;
 pub use geometry::{GeometryArena, GpuModel, MeshDraw};
 pub use instances::{Batch, InstanceList};
 pub use upload::UploadArena;

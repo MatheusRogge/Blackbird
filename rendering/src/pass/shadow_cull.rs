@@ -9,7 +9,10 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::{arena::MeshDraw, bounds::{Aabb, Frustum}};
+use crate::{
+    arena::{GrowableBuffer, MeshDraw},
+    bounds::{Aabb, Frustum},
+};
 
 const SHADER: &str = include_str!("shadow_cull.wgsl");
 /// Mirrors the workgroup size of both entry points.
@@ -43,44 +46,18 @@ struct Params {
     _pad: u32,
 }
 
-/// A buffer replaced by a bigger one when it doesn't fit what a frame needs.
-struct Growable {
-    label: &'static str,
-    usage: wgpu::BufferUsages,
-    buffer: Option<wgpu::Buffer>,
-}
-
-impl Growable {
-    fn new(label: &'static str, usage: wgpu::BufferUsages) -> Self {
-        Self { label, usage, buffer: None }
-    }
-
-    fn fit(&mut self, device: &wgpu::Device, size: u64) -> &wgpu::Buffer {
-        let size = size.max(16);
-        if self.buffer.as_ref().is_none_or(|b| b.size() < size) {
-            self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(self.label),
-                size: size.next_power_of_two(),
-                usage: self.usage,
-                mapped_at_creation: false,
-            }));
-        }
-        self.buffer.as_ref().expect("just created")
-    }
-}
-
 pub(super) struct PageCuller {
     cull: wgpu::ComputePipeline,
     commands: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     params: wgpu::Buffer,
-    casters: Growable,
-    groups: Growable,
-    planes: Growable,
-    counts: Growable,
-    instance_ids: Growable,
-    draws: Growable,
-    draw_counts: Growable,
+    casters: GrowableBuffer,
+    groups: GrowableBuffer,
+    planes: GrowableBuffer,
+    counts: GrowableBuffer,
+    instance_ids: GrowableBuffer,
+    draws: GrowableBuffer,
+    draw_counts: GrowableBuffer,
     /// Groups (draw commands) per page this frame; `None` when nothing was culled.
     page_groups: Option<u32>,
 }
@@ -149,13 +126,13 @@ impl PageCuller {
                 usage: U::UNIFORM | U::COPY_DST,
                 mapped_at_creation: false,
             }),
-            casters: Growable::new("shadow_cull_casters", U::STORAGE | U::COPY_DST),
-            groups: Growable::new("shadow_cull_groups", U::STORAGE | U::COPY_DST),
-            planes: Growable::new("shadow_cull_planes", U::STORAGE | U::COPY_DST),
-            counts: Growable::new("shadow_cull_counts", U::STORAGE | U::COPY_DST),
-            instance_ids: Growable::new("shadow_cull_instance_ids", U::STORAGE),
-            draws: Growable::new("shadow_cull_draws", U::STORAGE | U::INDIRECT),
-            draw_counts: Growable::new("shadow_cull_draw_counts", U::STORAGE | U::INDIRECT | U::COPY_DST),
+            casters: GrowableBuffer::new("shadow_cull_casters", U::STORAGE | U::COPY_DST),
+            groups: GrowableBuffer::new("shadow_cull_groups", U::STORAGE | U::COPY_DST),
+            planes: GrowableBuffer::new("shadow_cull_planes", U::STORAGE | U::COPY_DST),
+            counts: GrowableBuffer::new("shadow_cull_counts", U::STORAGE | U::COPY_DST),
+            instance_ids: GrowableBuffer::new("shadow_cull_instance_ids", U::STORAGE),
+            draws: GrowableBuffer::new("shadow_cull_draws", U::STORAGE | U::INDIRECT),
+            draw_counts: GrowableBuffer::new("shadow_cull_draw_counts", U::STORAGE | U::INDIRECT | U::COPY_DST),
             page_groups: None,
         }
     }
@@ -209,21 +186,18 @@ impl PageCuller {
         self.instance_ids.fit(device, pages_n * casters_n * 4);
         self.draws.fit(device, pages_n * groups_n * DRAW_ARGS_SIZE);
 
-        fn entry(binding: u32, buffer: &Growable) -> wgpu::BindGroupEntry<'_> {
-            wgpu::BindGroupEntry { binding, resource: buffer.buffer.as_ref().expect("fitted above").as_entire_binding() }
-        }
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("shadow_cull"),
             layout: &self.layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: self.params.as_entire_binding() },
-                entry(1, &self.casters),
-                entry(2, &self.groups),
-                entry(3, &self.planes),
-                entry(4, &self.counts),
-                entry(5, &self.instance_ids),
-                entry(6, &self.draws),
-                entry(7, &self.draw_counts),
+                self.casters.entry(1),
+                self.groups.entry(2),
+                self.planes.entry(3),
+                self.counts.entry(4),
+                self.instance_ids.entry(5),
+                self.draws.entry(6),
+                self.draw_counts.entry(7),
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("shadow_cull"), timestamp_writes: None });
@@ -239,13 +213,13 @@ impl PageCuller {
     /// The instance slots `cull` wrote, for the draws' `instance_ids` binding. `None` when nothing
     /// was culled this frame.
     pub(super) fn instance_ids(&self) -> Option<&wgpu::Buffer> {
-        self.page_groups.and(self.instance_ids.buffer.as_ref())
+        self.page_groups.and(self.instance_ids.get())
     }
 
     /// Draws the casters visible from page `index` of `cull`'s `pages`, with the pipeline and
     /// bind groups set (group 1's instance ids being `instance_ids`).
     pub(super) fn draw(&self, pass: &mut wgpu::RenderPass<'_>, index: usize) {
-        let (Some(groups), Some(draws), Some(counts)) = (self.page_groups, &self.draws.buffer, &self.draw_counts.buffer) else {
+        let (Some(groups), Some(draws), Some(counts)) = (self.page_groups, self.draws.get(), self.draw_counts.get()) else {
             return;
         };
         let offset = index as u64 * u64::from(groups) * DRAW_ARGS_SIZE;
